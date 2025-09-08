@@ -1,341 +1,294 @@
-# fa_bot.py
 from __future__ import annotations
 
 import os
 import json
 import logging
 import asyncio
-from dataclasses import dataclass
-from typing import Dict, Optional, List
+from datetime import datetime, timezone
+from typing import Dict, Tuple, Optional
 
-# Telegram
-from telegram import Update, BotCommand
+import gspread
+from telegram import (
+    Update,
+    BotCommand,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
-# Rate limiter (опционально)
-try:
-    from telegram.ext._rate_limiter import AIORateLimiter  # type: ignore
-except Exception:
-    AIORateLimiter = None  # type: ignore
-
-# Google Sheets (опционально)
-try:
-    import gspread
-except Exception:
-    gspread = None  # type: ignore
-
-from llm_client import LLMClient, LLMError
-
+# ====== ЛОГИ ======
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("fund_bot")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-# ===== ENV =====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("No Telegram token: set TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN)")
+# ====== LLM-слой ======
+import llm_client
 
-MASTER_CHAT_ID: Optional[int] = None
-_mc = os.getenv("MASTER_CHAT_ID")
-if _mc:
+
+# ---------- ENV / CONFIG ----------
+def _env_required(name: str) -> str:
+    v = os.environ.get(name, "").strip()
+    return v
+
+
+TELEGRAM_TOKEN = _env_required("TELEGRAM_BOT_TOKEN") or _env_required("TELEGRAM_TOKEN")
+MASTER_CHAT_ID = int(os.environ.get("MASTER_CHAT_ID", "0") or "0")
+
+SHEET_ID = _env_required("SHEET_ID")
+GOOGLE_CREDENTIALS_RAW = _env_required("GOOGLE_CREDENTIALS")
+
+# Модели (с дефолтами)
+LLM_NANO = os.environ.get("LLM_NANO", "gpt-5-nano")
+LLM_MINI = os.environ.get("LLM_MINI", "gpt-5-mini")
+LLM_MAJOR = os.environ.get("LLM_MAJOR", "gpt-5")
+
+DEFAULT_WEIGHTS_ENV = os.environ.get("DEFAULT_WEIGHTS", "").strip()
+if DEFAULT_WEIGHTS_ENV:
     try:
-        MASTER_CHAT_ID = int(_mc)
+        DEFAULT_WEIGHTS = json.loads(DEFAULT_WEIGHTS_ENV)
     except Exception:
-        pass
+        # допускаем формат a=10 b=20 ...
+        DEFAULT_WEIGHTS = {}
+        for tok in DEFAULT_WEIGHTS_ENV.replace(",", " ").split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                try:
+                    DEFAULT_WEIGHTS[k.upper()] = float(v)
+                except:
+                    pass
+else:
+    DEFAULT_WEIGHTS = {"JPY": 40, "AUD": 25, "EUR": 20, "GBP": 15}
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
-SHEET_ID = os.getenv("SHEET_ID") or ""
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS") or ""
+PAIRS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]  # сводка/дайджест по этим тикерам
 
-LLM_NANO = os.getenv("LLM_NANO", "gpt-5-nano")
-LLM_MINI = os.getenv("LLM_MINI", "gpt-5-mini")
-LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-5")
-LLM_DAILY_BUDGET = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or "30000")
 
-DEFAULT_WEIGHTS_ENV = os.getenv("DEFAULT_WEIGHTS", "")
+# ---------- GOOGLE SHEETS ----------
+SHEET_FA_NAME = "FA_Signals"
+SHEET_ALLOC_LOG = "FA_Alloc_Log"
 
-PAIR_ORDER = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
-PAIR_TO_KEY = {"USDJPY": "JPY", "AUDUSD": "AUD", "EURUSD": "EUR", "GBPUSD": "GBP"}
-KEY_TO_PAIR = {v: k for k, v in PAIR_TO_KEY.items()}
-CONFIG_SHEET_NAME = "FA_Config"
+FA_HEADERS = [
+    "pair", "risk", "bias", "ttl", "updated_at",
+    "scan_lock_until", "reserve_off", "dca_scale",
+]
 
-# ===== helpers =====
-def _parse_weights_any(s: str) -> Dict[str, float]:
-    if not s:
-        return {}
-    s = s.strip()
-    out: Dict[str, float] = {}
-    if s.startswith("{"):
+def _ensure_sheets() -> Tuple[bool, str, Optional[gspread.Spreadsheet], Optional[str]]:
+    """
+    Возвращает (ok, msg, sheet, service_email)
+    """
+    if not SHEET_ID:
+        return False, "SHEET_ID не задан", None, None
+    if not GOOGLE_CREDENTIALS_RAW:
+        return False, "GOOGLE_CREDENTIALS не задан", None, None
+
+    try:
+        creds = json.loads(GOOGLE_CREDENTIALS_RAW)
+        svc_email = creds.get("client_email", "")
+    except Exception as e:
+        return False, f"GOOGLE_CREDENTIALS: ошибка парсинга JSON ({e})", None, None
+
+    try:
+        gc = gspread.service_account_from_dict(creds)
+        sh = gc.open_by_key(SHEET_ID)
+    except gspread.exceptions.SpreadsheetNotFound:
+        return False, "Таблица с таким SHEET_ID не найдена. Проверьте ID.", None, svc_email
+    except gspread.exceptions.APIError as e:
+        # Частая причина — нет доступа (не расшарили сервисный аккаунт).
+        return False, f"Нет доступа к таблице (расшарьте на {svc_email}). Детали: {e}", None, svc_email
+    except Exception as e:
+        return False, f"Ошибка при подключении к таблице: {e}", None, svc_email
+
+    # Лист FA_Signals
+    try:
         try:
-            data = json.loads(s)
-            for k, v in data.items():
-                out[str(k).upper()] = float(v)
-            return out
-        except Exception:
-            pass
-    parts = s.replace(",", " ").split()
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
+            ws = sh.worksheet(SHEET_FA_NAME)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=SHEET_FA_NAME, rows=1000, cols=20)
+            ws.append_row(FA_HEADERS)
+        # гарантируем заголовки
+        row1 = ws.row_values(1)
+        if [c.strip().lower() for c in row1] != [c.lower() for c in FA_HEADERS]:
+            # перезапишем как надо, аккуратно
+            ws.delete_rows(1)
+            ws.insert_row(FA_HEADERS, 1)
+    except Exception as e:
+        return False, f"Не удалось создать/проверить лист {SHEET_FA_NAME}: {e}", sh, svc_email
+
+    # Лист лога перекладок (опционально)
+    try:
+        try:
+            sh.worksheet(SHEET_ALLOC_LOG)
+        except gspread.WorksheetNotFound:
+            ws2 = sh.add_worksheet(title=SHEET_ALLOC_LOG, rows=2000, cols=10)
+            ws2.append_row(["ts_utc", "weights_json", "total_bank", "note"])
+    except Exception as e:
+        # не критично
+        log.warning(f"Не удалось создать {SHEET_ALLOC_LOG}: {e}")
+
+    return True, "OK", sh, svc_email
+
+
+async def _alloc_save(sh: gspread.Spreadsheet, weights: Dict[str, float], total: float, note: str = ""):
+    try:
+        ws = sh.worksheet(SHEET_ALLOC_LOG)
+        ws.append_row([
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            json.dumps(weights, ensure_ascii=False),
+            float(total),
+            note
+        ])
+    except Exception as e:
+        log.warning(f"Alloc log append failed: {e}")
+
+
+# ---------- ПАРСИНГ КОМАНД ----------
+def _parse_weights(text: str) -> Dict[str, float]:
+    """
+    /setweights jpy=40 aud=25 eur=20 gbp=15
+    """
+    out: Dict[str, float] = {}
+    for tok in text.strip().split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
             try:
-                out[k.strip().upper()] = float(v.strip().replace("%", ""))
-            except Exception:
-                continue
+                out[k.strip().upper()] = float(v.strip())
+            except:
+                pass
     return out
 
-def _norm_weights(w: Dict[str, float]) -> Dict[str, float]:
-    filtered = {k.upper(): float(v) for k, v in w.items() if k.upper() in ("JPY", "AUD", "EUR", "GBP")}
-    s = sum(max(0.0, v) for v in filtered.values())
-    if s <= 0:
-        return {}
-    return {k: (max(0.0, v) / s) * 100.0 for k, v in filtered.items()}
 
-def _fmt_weights_line(w: Dict[str, float]) -> str:
-    order = ["JPY", "AUD", "EUR", "GBP"]
-    return " / ".join([f"{k} {int(round(w.get(k, 0.0)))}" for k in order])
-
-def _compute_alloc(total_usdt: float, w: Dict[str, float]) -> Dict[str, float]:
-    return {KEY_TO_PAIR[k]: round(total_usdt * (pct / 100.0), 2) for k, pct in w.items()}
-
-def _parse_setweights_args(text: str) -> Dict[str, float]:
-    return _norm_weights(_parse_weights_any(text))
-
-def _read_default_weights_from_env() -> Dict[str, float]:
-    w = _norm_weights(_parse_weights_any(DEFAULT_WEIGHTS_ENV))
-    return w or {"JPY": 40.0, "AUD": 25.0, "EUR": 20.0, "GBP": 15.0}
-
-# ===== storage =====
-@dataclass
-class MasterConfig:
-    total_bank: float = 0.0
-    weights_pct: Dict[str, float] = None
-
-class ConfigStore:
-    def __init__(self):
-        self._cfg = MasterConfig(total_bank=0.0, weights_pct=_read_default_weights_from_env())
-        self._ws = None
-        self._service_email = None
-        if GOOGLE_CREDENTIALS and SHEET_ID and gspread is not None:
-            try:
-                creds = json.loads(GOOGLE_CREDENTIALS)
-                self._service_email = creds.get("client_email")
-                gc = gspread.service_account_from_dict(creds)
-                sh = gc.open_by_key(SHEET_ID)
-                try:
-                    self._ws = sh.worksheet(CONFIG_SHEET_NAME)
-                except Exception:
-                    self._ws = sh.add_worksheet(title=CONFIG_SHEET_NAME, rows=50, cols=10)
-                    self._ws.append_row(["key", "value"])
-                self._read_from_sheet()
-                log.info("Sheets: connected")
-            except Exception as e:
-                log.warning(f"Sheets init failed: {e}")
-
-    def sheet_status_line(self) -> str:
-        if not GOOGLE_CREDENTIALS or not SHEET_ID:
-            return "Sheets: не настроено (нет SHEET_ID/GOOGLE_CREDENTIALS)."
-        if gspread is None:
-            return "Sheets: модуль gspread не установлен."
-        if self._ws is None:
-            if self._service_email:
-                return f"Sheets: нет доступа. Поделитесь таблицей с сервис-аккаунтом <code>{self._service_email}</code>."
-            return "Sheets: нет доступа (проверьте права сервис-аккаунта)."
-        return "Sheets: ок ✅ (лист FA_Config готов)."
-
-    def _read_from_sheet(self):
-        if not self._ws:
-            return
-        try:
-            rows = self._ws.get_all_records()
-            kv = {str(r.get("key")).strip(): str(r.get("value")).strip() for r in rows if r.get("key")}
-            total = float(kv.get("total_bank") or 0.0)
-            weights = _norm_weights(_parse_weights_any(kv.get("weights_pct") or "")) or _read_default_weights_from_env()
-            self._cfg.total_bank = total
-            self._cfg.weights_pct = weights
-        except Exception as e:
-            log.warning(f"Read FA_Config failed: {e}")
-
-    def _write_to_sheet(self):
-        if not self._ws:
-            return
-        try:
-            self._ws.clear()
-            self._ws.append_row(["key", "value"])
-            self._ws.append_row(["total_bank", str(self._cfg.total_bank)])
-            self._ws.append_row(["weights_pct", json.dumps(self._cfg.weights_pct, ensure_ascii=False)])
-        except Exception as e:
-            log.warning(f"Write FA_Config failed: {e}")
-
-    def get(self) -> MasterConfig:
-        return self._cfg
-
-    def set_total(self, total: float):
-        self._cfg.total_bank = max(0.0, float(total))
-        self._write_to_sheet()
-
-    def set_weights(self, w_pct: Dict[str, float]):
-        self._cfg.weights_pct = _norm_weights(w_pct) or self._cfg.weights_pct
-        self._write_to_sheet()
-
-
-store = ConfigStore()
-llm = LLMClient(
-    api_key=OPENAI_API_KEY,
-    model_nano=LLM_NANO,
-    model_mini=LLM_MINI,
-    model_major=LLM_MAJOR,
-    daily_token_budget=LLM_DAILY_BUDGET,
-)
-
-# ===== bot init =====
-async def _post_init(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Проверка/приветствие"),
-        BotCommand("help", "Что умею"),
-        BotCommand("ping", "Проверка связи"),
-        BotCommand("settotal", "Задать общий банк, например: /settotal 2800"),
-        BotCommand("setweights", "Задать веса: /setweights jpy=40 aud=25 eur=20 gbp=15"),
-        BotCommand("weights", "Показать целевые веса"),
-        BotCommand("alloc", "Рассчитать суммы и /setbank для чатов"),
-        BotCommand("digest", "Дайджест по 4 парам"),
-    ])
-    if MASTER_CHAT_ID:
-        try:
-            status = store.sheet_status_line()
-            await app.bot.send_message(
-                MASTER_CHAT_ID,
-                f"Фунд-бот запущен ✅\n{status}",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            log.warning(f"Cannot notify master chat: {e}")
-
-# ===== commands =====
-def _is_master(update: Update) -> bool:
-    if MASTER_CHAT_ID is None:
-        return True
-    try:
-        return update.effective_chat and update.effective_chat.id == MASTER_CHAT_ID
-    except Exception:
-        return False
-
+# ---------- ХЭНДЛЕРЫ ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id if update.effective_chat else None
-    await update.effective_message.reply_html(
-        f"Привет! Я фунд-бот.\nТекущий чат id: <code>{cid}</code>\n\nКоманды: /help"
+    chat_id = update.effective_chat.id
+    ok, msg, _, svc = _ensure_sheets()
+    sheets_line = f"Sheets: {'✅' if ok else f'не настроено ({msg})'}"
+    await update.message.reply_html(
+        f"Привет! Я фунд-бот.\nТекущий чат id: <code>{chat_id}</code>\n\nКоманды: /help\n\n{sheets_line}"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "<b>Что я умею</b>\n"
+    txt = (
+        "Что я умею\n"
         "• <code>/settotal 2800</code> — задать общий банк (только в мастер-чате).\n"
         "• <code>/setweights jpy=40 aud=25 eur=20 gbp=15</code> — выставить целевые веса.\n"
         "• <code>/weights</code> — показать целевые веса.\n"
-        "• <code>/alloc</code> — расчёт сумм и готовые /setbank для торговых чатов.\n"
-        "• <code>/digest</code> — короткий дайджест на русском (USDJPY / AUDUSD / EURUSD / GBPUSD).\n"
+        "• <code>/alloc</code> — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
+        "• <code>/digest</code> — короткий «человеческий» дайджест по USDJPY / AUDUSD / EURUSD / GBPUSD.\n"
         "• <code>/ping</code> — проверить связь.\n\n"
         "<i>Банк по парам задаётся вручную в торговых чатах; я сверяю распределение и даю советы/дайджест.</i>"
     )
-    await update.effective_message.reply_html(text)
+    await update.message.reply_html(txt)
 
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("pong")
-
-async def cmd_settotal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_master(update):
-        await update.effective_message.reply_text("Эта команда доступна только в мастер-чате.")
-        return
-    args = ctx.args or []
-    if not args:
-        await update.effective_message.reply_text("Использование: /settotal 2800")
-        return
-    try:
-        total = float(args[0].replace(",", "."))
-    except Exception:
-        await update.effective_message.reply_text("Неверное число. Пример: /settotal 2800")
-        return
-    store.set_total(total)
-    w = store.get().weights_pct
-    await update.effective_message.reply_html(
-        f"Общий банк: <b>{total:.2f} USDT</b>\nЦелевые веса: {_fmt_weights_line(w)}\n\n"
-        f"Выполните <code>/alloc</code> для расчёта сумм."
-    )
+    await update.message.reply_text("pong")
 
 async def cmd_setweights(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_master(update):
-        await update.effective_message.reply_text("Эта команда доступна только в мастер-чате.")
-        return
-    w = _parse_setweights_args(update.effective_message.text or "")
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        return await update.message.reply_text("Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
+    w = _parse_weights(args[1])
     if not w:
-        await update.effective_message.reply_text("Не распознал веса. Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
-        return
-    store.set_weights(w)
-    await update.effective_message.reply_html(
-        f"Целевые веса обновлены: {_fmt_weights_line(store.get().weights_pct)}\nКоманда: <code>/alloc</code> рассчитает суммы."
-    )
+        return await update.message.reply_text("Не удалось распарсить веса.")
+    ctx.bot_data["target_weights"] = w
+    await update.message.reply_html("Целевые веса обновлены:\n<code>{}</code>".format(json.dumps(w, ensure_ascii=False)))
 
 async def cmd_weights(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cfg = store.get()
-    await update.effective_message.reply_html(
-        f"Целевые веса: {_fmt_weights_line(cfg.weights_pct)}\nТекущий общий банк: <b>{cfg.total_bank:.2f} USDT</b>"
-    )
+    w = ctx.bot_data.get("target_weights") or DEFAULT_WEIGHTS
+    await update.message.reply_html("<b>Целевые веса</b>:\n<code>{}</code>".format(json.dumps(w, ensure_ascii=False)))
+
+async def cmd_settotal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if MASTER_CHAT_ID and update.effective_chat.id != MASTER_CHAT_ID:
+        return await update.message.reply_text("Эта команда доступна только в мастер-чате.")
+    args = (update.message.text or "").split()
+    if len(args) < 2:
+        return await update.message.reply_text("Пример: /settotal 2800")
+    try:
+        total = float(args[1])
+    except:
+        return await update.message.reply_text("Число не распознано.")
+    ctx.bot_data["total_bank"] = total
+    await update.message.reply_text(f"Общий банк установлен: {total:.2f} USDT")
 
 async def cmd_alloc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cfg = store.get()
-    if cfg.total_bank <= 0.0:
-        await update.effective_message.reply_text("Сначала задайте общий банк: /settotal 2800")
-        return
-    if not cfg.weights_pct:
-        await update.effective_message.reply_text("Сначала задайте веса: /setweights jpy=40 aud=25 eur=20 gbp=15")
-        return
-    alloc = _compute_alloc(cfg.total_bank, cfg.weights_pct)
-    header = f"Целевые веса: {_fmt_weights_line(cfg.weights_pct)}\n"
-    lines: List[str] = []
-    for pair in PAIR_ORDER:
-        amt = alloc.get(pair, 0.0)
-        lines.append(f"{pair} → <b>{amt:.2f} USDT</b>  → команда в чат {pair}: <code>/setbank {amt:.2f}</code>")
-    text = header + "\n".join(lines) + "\n\nСтатус рекомендации: <b>APPLIED</b>."
-    await update.effective_message.reply_html(text)
+    total = float(ctx.bot_data.get("total_bank") or 0.0)
+    if total <= 0:
+        return await update.message.reply_text("Сначала задайте общий банк: /settotal <число> (в мастер-чате).")
+    weights = ctx.bot_data.get("target_weights") or DEFAULT_WEIGHTS
+
+    # нормируем на 100
+    s = sum(weights.values()) or 1.0
+    norm = {k: (v * 100.0 / s) for k, v in weights.items()}
+    # расчёт
+    alloc = {k: total * (pct / 100.0) for k, pct in norm.items()}
+    lines = ["<b>Распределение банка</b>:"]
+    # Готовые команды (вы пишете их в соответствующий торговый чат)
+    for k, v in (("JPY", "USDJPY"), ("AUD", "AUDUSD"), ("EUR", "EURUSD"), ("GBP", "GBPUSD")):
+        if k in alloc:
+            amt = alloc[k]
+            lines.append(f"{v} → <b>{amt:.0f} USDT</b>   → команда в чат {v}: <code>/setbank {amt:.0f}</code>")
+    await update.message.reply_html("\n".join(lines))
+
+    # пробуем записать в лог в таблице (если настроено)
+    ok, msg, sh, _ = _ensure_sheets()
+    if ok and sh:
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _alloc_save, sh, norm, total, "manual /alloc")
+        except Exception as e:
+            log.warning(f"Alloc log write error: {e}")
 
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pairs = PAIR_ORDER
+    """
+    Генерирует короткую «человеческую» сводку по четырём парам.
+    """
     try:
-        digest_map = await llm.make_digest_ru(pairs)
-    except LLMError as e:
-        await update.effective_message.reply_text(f"LLM ошибка: {e}")
-        return
-    blocks = ["🧭 <b>Утренний фон</b>\n"]
-    flag = {"USDJPY": "🇺🇸🇯🇵", "AUDUSD": "🇦🇺🇺🇸", "EURUSD": "🇪🇺🇺🇸", "GBPUSD": "🇬🇧🇺🇸"}
-    for p in pairs:
-        t = (digest_map.get(p) or "").strip()
-        if not t:
-            t = "✅ Нейтрально. Существенных поводов не отмечено; работаем по базовому плану."
-        blocks.append(f"<b>{flag.get(p,'•')} {p}</b>\n{t}\n")
-    await update.effective_message.reply_html("\n".join(blocks).strip())
+        txt = await llm_client.make_digest_ru(
+            pairs=PAIRS,
+            model=LLM_MINI,
+            nano_model=LLM_NANO,
+        )
+        await update.message.reply_html(txt, disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("Digest error")
+        await update.message.reply_text(f"LLM ошибка: {e}")
 
-async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Не понимаю. /help — список команд.")
+# ---------- СТАРТ ПРОГРАММЫ ----------
+async def on_start(app: Application):
+    log.info("Fund bot is running…")
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Поприветствовать"),
+            BotCommand("help", "Справка"),
+            BotCommand("settotal", "Задать общий банк (мастер-чат)"),
+            BotCommand("setweights", "Установить целевые веса"),
+            BotCommand("weights", "Показать целевые веса"),
+            BotCommand("alloc", "Рассчитать суммы на чаты"),
+            BotCommand("digest", "Утренний дайджест"),
+            BotCommand("ping", "Проверка связи"),
+        ])
+    except Exception as e:
+        log.warning(f"set_my_commands failed: {e}")
 
 def main():
-    builder = Application.builder().token(TELEGRAM_TOKEN)
-    if AIORateLimiter:
-        builder = builder.rate_limiter(AIORateLimiter())
-    app = builder.post_init(_post_init).build()
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не задана.")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("settotal", cmd_settotal))
     app.add_handler(CommandHandler("setweights", cmd_setweights))
     app.add_handler(CommandHandler("weights", cmd_weights))
+    app.add_handler(CommandHandler("settotal", cmd_settotal))
     app.add_handler(CommandHandler("alloc", cmd_alloc))
     app.add_handler(CommandHandler("digest", cmd_digest))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    log.info("Fund bot is running…")
-    app.run_polling(allowed_updates=["message", "chat_member", "my_chat_member"])
+    app.post_init = on_start
+    app.run_polling(allowed_updates=["message", "edited_message"])
 
 if __name__ == "__main__":
     main()
