@@ -1,111 +1,127 @@
 # llm_client.py
-# Лёгкий клиент к OpenAI Responses API без temperature/max_tokens,
-# чтобы не ловить "unsupported parameter".
-
-from __future__ import annotations
 import os
-import httpx
-import asyncio
-from typing import List
+from typing import Dict, List, Optional
+from openai import OpenAI
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
+# ------- Конфигурация моделей из ENV -------
+LLM_NANO  = os.getenv("LLM_NANO",  "gpt-5-nano")
+LLM_MINI  = os.getenv("LLM_MINI",  "gpt-5-mini")
+LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-5")
 
-HEADERS = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}",
-    "Content-Type": "application/json",
-}
+DEFAULT_TEMPERATURE = 0.3
+# Суточный бюджет токенов можно учитывать снаружи; здесь просто ограничение на один вызов
+DEFAULT_MAX_OUT_TOKENS = 500
 
-class LLMError(RuntimeError):
-    pass
-
-
-async def _post_json(path: str, payload: dict) -> dict:
-    if not OPENAI_API_KEY:
-        raise LLMError("OPENAI_API_KEY is empty")
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{OPENAI_BASE_URL}{path}", headers=HEADERS, json=payload)
-        # Пробуем вытащить тело при ошибке для логов
-        if resp.status_code >= 400:
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"text": await resp.aread()}
-            raise LLMError(f"HTTP {resp.status_code}: {data}")
-        return resp.json()
+_client: Optional[OpenAI] = None
 
 
-def _build_digest_prompt(symbols: List[str]) -> str:
-    pairs_ru = {
-        "USDJPY": "USD/JPY",
-        "AUDUSD": "AUD/USD",
-        "EURUSD": "EUR/USD",
-        "GBPUSD": "GBP/USD",
-    }
-    lines = [
-        "Ты — финансовый аналитик. Дай короткий человеческий дайджест по валютным парам.",
-        "Формат: по одной строке на каждую пару, максимум 20–25 слов.",
-        "Стиль — простой русский, без жаргона. Если явных факторов нет, пиши «фон спокойный; обычный режим».",
-        "Не выдумывай фактов и дат. Если контекст неочевиден — давай нейтральную, осторожную формулировку.",
-        "",
-        "Пары для дайджеста:",
-    ]
-    for s in symbols:
-        lines.append(f"- {pairs_ru.get(s, s)}")
-    lines += [
-        "",
-        "Выводи ТОЛЬКО строки дайджеста без префейсов и пояснений.",
-    ]
-    return "\n".join(lines)
+def _client_singleton() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.environ["OPENAI_API_KEY"]
+        _client = OpenAI(api_key=api_key)
+    return _client
 
 
-def _extract_output_text(data: dict) -> str:
-    """
-    Responses API (2024+): у ответа есть поле output_text.
-    Делаем аккуратный парсинг на случай изменений.
-    """
-    if isinstance(data, dict):
-        if "output_text" in data and isinstance(data["output_text"], str):
-            return data["output_text"].strip()
-
-        # Иногда бывает структура с 'output' -> list of blocks
-        out = data.get("output")
-        if isinstance(out, list):
-            chunks = []
-            for item in out:
-                # text block
-                t = item.get("content") if isinstance(item, dict) else None
-                if isinstance(t, str):
-                    chunks.append(t)
-            if chunks:
-                return "\n".join(chunks).strip()
-
-    # Последняя попытка: весь json строкой
-    return str(data)
-
-
-async def llm_ping() -> bool:
-    """Простой «пинг» — проверяем наличие ключа. Этого достаточно для /diag."""
-    return bool(OPENAI_API_KEY)
-
-
-async def generate_digest(
-    symbols: List[str],
-    model: str = "gpt-5-mini",
-    token_budget: int = 1200,
+def _respond(
+    model: str,
+    system: str,
+    user: str,
+    max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> str:
     """
-    Генерирует короткий дайджест по списку валютных пар.
-    Без temperature и без max_tokens — только max_completion_tokens,
-    чтобы не ловить ошибки «unsupported parameter».
+    Вызов Responses API. ВАЖНО: используем max_output_tokens (а не max_completion_tokens).
     """
-    prompt = _build_digest_prompt(symbols)
-    payload = {
-        "model": model,
-        "input": prompt,
-        # ограничиваем ответ: много не нужно, и это совместимо с Responses API
-        "max_completion_tokens": min(500, max(64, token_budget // 10)),
-    }
-    data = await _post_json("/responses", payload)
-    return _extract_output_text(data)
+    client = _client_singleton()
+
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_output_tokens=max_output_tokens,
+        temperature=temperature,
+    )
+
+    # Новая SDK отдаёт удобное поле output_text
+    text = getattr(resp, "output_text", None)
+    if text:
+        return text.strip()
+
+    # Фолбэк на явную сборку текста (на всякий случай)
+    parts: List[str] = []
+    for item in getattr(resp, "output", []) or []:
+        # item может быть dict с ключом "content" (list с text/output)
+        content = getattr(item, "content", None) or item.get("content") if isinstance(item, dict) else None
+        if content and isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "output_text":
+                    parts.append(c.get("text", ""))
+    return "\n".join(parts).strip()
+
+
+# ---------------- Публичные функции ----------------
+
+def quick_classify(labeling_prompt: str) -> str:
+    """
+    Быстрые короткие классификации/теги — дешёвая nano-модель.
+    """
+    system = (
+        "Ты коротко и точно классифицируешь вход. "
+        "Отвечай одной строкой без лишних слов."
+    )
+    return _respond(
+        model=LLM_NANO,
+        system=system,
+        user=labeling_prompt,
+        max_output_tokens=64,
+        temperature=0.2,
+    )
+
+
+def fx_digest_ru(pairs_state: Dict[str, str]) -> str:
+    """
+    Человеческий краткий дайджест на русском по заданным валютным парам.
+    pairs_state: { 'USDJPY': '<контекст/заметки>', ... }
+    """
+    pairs_list = ", ".join(pairs_state.keys()) if pairs_state else "USDJPY, AUDUSD, EURUSD, GBPUSD"
+
+    system = (
+        "Ты опытный финансовый аналитик. Дай сжатый, понятный человеку текст-дайджест "
+        "по форекс-парам на русском: по каждой паре отдельная строка. "
+        "Без излишних украшательств, максимум пользы. Если контекста мало — напиши 'фон спокойный; обычный режим'."
+    )
+
+    lines = ["Сформируй короткие заметки по парам: " + pairs_list, "", "Данные по парам:"]
+    for p, ctx in pairs_state.items():
+        lines.append(f"- {p}: {ctx or 'нет свежего контекста'}")
+
+    user = "\n".join(lines) + "\n\nФормат ответа строго:\nUSD/JPY — <заметка>\nAUD/USD — <заметка>\nEUR/USD — <заметка>\nGBP/USD — <заметка>"
+
+    return _respond(
+        model=LLM_MINI,
+        system=system,
+        user=user,
+        max_output_tokens=400,
+        temperature=0.3,
+    )
+
+
+def deep_analysis(question: str, context: str = "") -> str:
+    """
+    Глубокий разбор по кнопке — старшая модель.
+    """
+    system = (
+        "Ты аналитик-объяснитель: делай структурированные и практичные выводы. "
+        "Сначала краткий вывод (1–2 предложения), затем маркированные пункты."
+    )
+    user = f"Вопрос:\n{question}\n\nКонтекст:\n{context}".strip()
+    return _respond(
+        model=LLM_MAJOR,
+        system=system,
+        user=user,
+        max_output_tokens=800,
+        temperature=0.4,
+    )
