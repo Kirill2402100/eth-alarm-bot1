@@ -1,299 +1,324 @@
-import os, json, logging, re
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple, List
+# fa_bot.py
+import os
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 import gspread
-import pandas as pd
-from telegram.ext import Application, CommandHandler, AIORateLimiter
 from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, filters,
+)
 
+# --- rate limiter (optional) ---
+try:
+    from telegram.ext import AIORateLimiter
+    _RATE_LIMITER = AIORateLimiter()
+except Exception:
+    AIORateLimiter = None
+    _RATE_LIMITER = None
+
+# наш тонкий клиент к LLM (см. llm_client.py)
+from llm_client import chat as llm_chat
+
+
+# ------------- ENV -------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+SHEET_ID = os.getenv("SHEET_ID")  # Google Sheet ID
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")  # JSON строки
+ALLOWED_CHAT_IDS = {
+    int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
+}
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("fa_bot")
-logging.basicConfig(level=logging.INFO)
 
-SHEET_NAME = "FA_Signals"
-HEADERS = [
+
+# ------------- Google Sheets helpers -------------
+_HEADERS = [
     "pair", "risk", "bias", "ttl", "updated_at",
     "scan_lock_until", "reserve_off", "dca_scale", "notes"
 ]
 
-# ---------- Google Sheets helpers ----------
-
-def _gc_open():
-    creds = os.environ.get("GOOGLE_CREDENTIALS")
-    sid   = os.environ.get("SHEET_ID")
-    if not creds or not sid:
-        raise RuntimeError("GOOGLE_CREDENTIALS or SHEET_ID is missing")
-    gc = gspread.service_account_from_dict(json.loads(creds))
-    sh = gc.open_by_key(sid)
-    return sh
-
-def _ensure_ws(sh) -> gspread.Worksheet:
+def _get_sheet() -> Optional[gspread.Spreadsheet]:
+    if not (SHEET_ID and GOOGLE_CREDENTIALS):
+        return None
     try:
-        ws = sh.worksheet(SHEET_NAME)
+        gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS))
+        return gc.open_by_key(SHEET_ID)
+    except Exception:
+        log.exception("Failed to open Google Sheet")
+        return None
+
+def _ensure_ws(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
+    try:
+        ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_NAME, rows=2000, cols=max(20, len(HEADERS)))
-        ws.append_row(HEADERS)
-    # гарантируем порядок и наличие заголовков
-    row1 = ws.row_values(1)
-    if row1 != HEADERS:
-        ws.delete_rows(1)
-        ws.insert_row(HEADERS, 1)
+        ws = sh.add_worksheet(title=title, rows=2000, cols=max(20, len(_HEADERS)))
+        ws.append_row(_HEADERS)
     return ws
 
-def _find_row_index(ws, pair_upper: str) -> Optional[int]:
-    colA = ws.col_values(1)  # "pair"
-    for i, v in enumerate(colA, start=1):
-        if i == 1:  # headers
-            continue
-        if str(v).upper().strip() == pair_upper:
-            return i
+def _find_row_by_pair(ws: gspread.Worksheet, symbol: str) -> Optional[int]:
+    symbol = (symbol or "").upper().strip()
+    try:
+        col = ws.col_values(1)  # first column: pair
+    except Exception:
+        log.exception("col_values failed")
+        return None
+    for idx, val in enumerate(col, start=1):
+        if idx == 1:
+            continue  # header
+        if (val or "").upper().strip() == symbol:
+            return idx
     return None
 
-def _row_values_for_pair(ws, pair_upper: str) -> Optional[Dict[str, Any]]:
-    idx = _find_row_index(ws, pair_upper)
-    if idx is None:
-        return None
-    values = ws.row_values(idx)
-    values += [""] * (len(HEADERS) - len(values))
-    return {k: values[i] for i, k in enumerate(HEADERS)}
+def upsert_fa_signal(symbol: str, data: dict, notes: str = "") -> Tuple[bool, str]:
+    """Возвращает (ok, msg)."""
+    sh = _get_sheet()
+    if not sh:
+        return False, "Google Sheets is not configured."
 
-def _values_from_dict(d: Dict[str, Any]) -> List[Any]:
-    out = []
-    for k in HEADERS:
-        v = d.get(k, "")
-        if isinstance(v, (int, float)) and pd.notna(v):
-            out.append(v)
-        else:
-            out.append("" if v is None else str(v))
-    return out
+    ws = _ensure_ws(sh, "FA_Signals")
+    symbol = (symbol or "").upper().strip()
+    if not symbol:
+        return False, "Symbol is empty."
 
-def _upsert_policy(pair: str, changes: Dict[str, Any]) -> Dict[str, Any]:
-    pair_u = pair.upper().strip()
-    sh = _gc_open()
-    ws = _ensure_ws(sh)
+    # нормализация/дефолты
+    safe = {
+        "pair": symbol,
+        "risk": (data.get("risk") or "Green").capitalize(),
+        "bias": (data.get("bias") or "neutral").lower(),
+        "ttl": int(data.get("ttl") or 60),
+        "updated_at": data.get("updated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "scan_lock_until": str(data.get("scan_lock_until") or ""),
+        "reserve_off": bool(data.get("reserve_off") or False),
+        "dca_scale": float(data.get("dca_scale") if data.get("dca_scale") is not None else 1.0),
+        "notes": (notes or "")[:1000],
+    }
+    # клипы
+    if safe["risk"] not in ("Green", "Amber", "Red"):
+        safe["risk"] = "Green"
+    if safe["bias"] not in ("neutral", "long-only", "short-only"):
+        safe["bias"] = "neutral"
+    safe["ttl"] = max(5, min(1440, safe["ttl"]))
+    safe["dca_scale"] = max(0.0, min(1.0, safe["dca_scale"]))
 
-    row = _row_values_for_pair(ws, pair_u)
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    if row is None:
-        row = {k: "" for k in HEADERS}
-        row["pair"] = pair_u
+    values = [safe.get(h, "") for h in _HEADERS]
 
-    # применяем изменения
-    row.update(changes)
-    # служебные
-    if "updated_at" not in changes:
-        row["updated_at"] = now_iso
-
-    idx = _find_row_index(ws, pair_u)
-    values = _values_from_dict(row)
-    if idx is None:
-        ws.append_row(values)
-        idx = _find_row_index(ws, pair_u)
-    else:
-        ws.update(f"A{idx}:{chr(ord('A')+len(HEADERS)-1)}{idx}", [values])
-
-    return row
-
-def _clear_pair(pair: str):
-    pair_u = pair.upper().strip()
-    sh = _gc_open()
-    ws = _ensure_ws(sh)
-    idx = _find_row_index(ws, pair_u)
-    if idx is not None:
-        ws.delete_rows(idx)
-
-def _read_all() -> List[Dict[str, Any]]:
-    sh = _gc_open()
-    ws = _ensure_ws(sh)
-    recs = ws.get_all_records()
-    # нормализуем пустые строки к ""
-    for r in recs:
-        for k in HEADERS:
-            if k not in r:
-                r[k] = ""
-            elif r[k] is None:
-                r[k] = ""
-    return recs
-
-# ---------- parsing helpers ----------
-
-def _parse_risk(x: str) -> str:
-    m = str(x or "").strip().lower()
-    if m in ("g", "green"):   return "Green"
-    if m in ("a", "amber", "yellow"): return "Amber"
-    if m in ("r", "red"):     return "Red"
-    raise ValueError("risk must be green|amber|red")
-
-def _parse_bias(x: str) -> str:
-    m = str(x or "").strip().lower()
-    if m in ("n", "neutral"): return "neutral"
-    if m in ("l", "long-only", "long"): return "long-only"
-    if m in ("s", "short-only", "short"): return "short-only"
-    raise ValueError("bias must be neutral|long-only|short-only")
-
-def _parse_minutes(x: str) -> int:
-    i = int(float(x))
-    if i < 0: raise ValueError("ttl must be >= 0")
-    return i
-
-_DUR_RX = re.compile(r"^\s*(\d+)\s*([smhdw]?)\s*$", re.I)
-def _parse_until(arg: str) -> str:
-    """
-    '30m','2h','1d','45' (минуты) или ISO '2025-09-08 14:30:00'
-    → возвращаем строку ISO UTC, которую читает сканер.
-    """
-    s = arg.strip()
     try:
-        # ISO?
-        dt = pd.to_datetime(s, utc=True)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        row = _find_row_by_pair(ws, symbol)
+        if row:
+            rng = f"A{row}:I{row}"
+            ws.update(rng, [values])
+            return True, f"Updated row {row}"
+        else:
+            ws.append_row(values)
+            return True, "Appended new row"
     except Exception:
-        pass
-    m = _DUR_RX.match(s)
-    if not m:
-        raise ValueError("use 30m/2h/1d or ISO datetime")
-    n = int(m.group(1))
-    unit = (m.group(2) or "m").lower()
-    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
-    dt = datetime.now(timezone.utc) + timedelta(seconds=n * mult)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+        log.exception("upsert_fa_signal failed")
+        return False, "Sheets write failed"
 
-def _clamp_scale(x: str) -> float:
-    v = float(x)
-    return max(0.0, min(1.0, v))
 
-# ---------- Bot replies ----------
+# ------------- LLM policy synthesis -------------
+FA_JSON_SCHEMA = """
+Верни ТОЛЬКО валидный JSON-объект со следующими ключами:
+- risk: одна из ["Green","Amber","Red"]
+- bias: одна из ["neutral","long-only","short-only"]
+- ttl: целое кол-во минут (5..1440)
+- scan_lock_until: ISO дата-время в UTC или "" если не нужно
+- reserve_off: boolean
+- dca_scale: число 0..1
+"""
 
-def _fmt_row(r: Dict[str, Any]) -> str:
-    if not r: return "Нет политики."
+async def synthesize_policy_from_text(raw_news: str) -> dict:
+    system = (
+        "Ты риск-офицер FX. На вход — краткие факторы/новости по инструменту. "
+        "Сформируй риск-политику для робота-скальпера. Будь консервативен при высокой неопределённости."
+    )
+    user = f"{FA_JSON_SCHEMA}\n\nНовости и факторы:\n{raw_news}\n"
+    out = await llm_chat(system, user, json_mode=True)
+    try:
+        data = json.loads(out)
+    except Exception:
+        log.warning("LLM returned non-JSON, fallback to defaults. Raw: %s", out[:300])
+        data = {}
+    # дефолты/валидация будут ещё раз на этапе upsert
+    return data
+
+
+# ------------- Telegram helpers -------------
+def _is_allowed(update: Update) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    return (chat_id in ALLOWED_CHAT_IDS)
+
+def _format_policy(symbol: str, data: dict) -> str:
+    risk = (data.get("risk") or "Green").capitalize()
+    bias = (data.get("bias") or "neutral").lower()
+    ttl = int(data.get("ttl") or 60)
+    scan_lock = data.get("scan_lock_until") or ""
+    reserve_off = bool(data.get("reserve_off") or False)
+    dca_scale = float(data.get("dca_scale") if data.get("dca_scale") is not None else 1.0)
+
     lines = [
-        f"Пара: <b>{r.get('pair','')}</b>",
-        f"risk: <b>{r.get('risk','')}</b>, bias: <b>{r.get('bias','')}</b>",
-        f"ttl: {r.get('ttl','')} мин, updated_at: {r.get('updated_at','')}",
-        f"scan_lock_until: {r.get('scan_lock_until','') or '—'}",
-        f"reserve_off: {r.get('reserve_off','') or 'false'}, dca_scale: {r.get('dca_scale','') or '1.0'}",
+        f"📊 <b>FA Policy</b> for <code>{symbol}</code>",
+        f"• risk: <b>{risk}</b>",
+        f"• bias: <b>{bias}</b>",
+        f"• ttl: <b>{ttl}m</b>",
+        f"• reserve_off: <b>{'on' if reserve_off else 'off'}</b>",
+        f"• dca_scale: <b>{dca_scale:.2f}</b>",
     ]
-    if r.get("notes"):
-        lines.append(f"notes: {r.get('notes')}")
+    if scan_lock:
+        lines.append(f"• scan_lock_until: <code>{scan_lock}</code>")
     return "\n".join(lines)
 
-# ---------- Handlers ----------
 
-async def cmd_fa(update: Update, ctx):
-    if not ctx.args:
-        await update.message.reply_html("Использование: <code>/fa EURUSD</code>")
+# ------------- Handlers -------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
-    pair = ctx.args[0].upper()
-    sh = _gc_open(); ws = _ensure_ws(sh)
-    r = _row_values_for_pair(ws, pair) or {}
-    await update.message.reply_html(_fmt_row(r))
+    await update.message.reply_html(
+        "Привет! Я FA-бот. Команды:\n"
+        "<code>/fa &lt;SYMBOL&gt; &lt;текст&gt;</code> — сделать политику из текста и записать в Sheet\n"
+        "<code>/fa SYMBOL</code> в ответ на сообщение — возьму текст из реплая\n"
+        "<code>/fa_test &lt;текст&gt;</code> — только LLM JSON без записи\n"
+        "<code>/status &lt;SYMBOL&gt;</code> — показать текущую политику из листа\n"
+        "<code>/ping</code>"
+    )
 
-async def cmd_setrisk(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/setrisk EURUSD green|amber|red</code>")
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
-    pair, risk = ctx.args[0], _parse_risk(ctx.args[1])
-    r = _upsert_policy(pair, {"risk": risk})
-    await update.message.reply_html("OK\n" + _fmt_row(r))
+    await cmd_start(update, context)
 
-async def cmd_setbias(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/setbias EURUSD neutral|long-only|short-only</code>")
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
-    pair, bias = ctx.args[0], _parse_bias(ctx.args[1])
-    r = _upsert_policy(pair, {"bias": bias})
-    await update.message.reply_html("OK\n" + _fmt_row(r))
+    await update.message.reply_text("pong")
 
-async def cmd_setttl(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/setttl EURUSD 120</code> (минуты)")
+def _extract_symbol_and_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], str]:
+    """Возвращает (SYMBOL, TEXT). TEXT может быть пустым."""
+    symbol = None
+    text = ""
+    if context.args:
+        symbol = (context.args[0] or "").upper()
+        if len(context.args) > 1:
+            text = " ".join(context.args[1:])
+    if not text and update.message and update.message.reply_to_message:
+        text = (update.message.reply_to_message.text or update.message.reply_to_message.caption or "") or text
+    return symbol, (text or "").strip()
+
+async def cmd_fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
-    pair, ttl = ctx.args[0], _parse_minutes(ctx.args[1])
-    r = _upsert_policy(pair, {"ttl": ttl})
-    await update.message.reply_html("OK\n" + _fmt_row(r))
 
-async def cmd_scanlock(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/scanlock EURUSD 2h</code> или ISO")
+    symbol, text = _extract_symbol_and_text(update, context)
+    if not symbol:
+        await update.message.reply_html("Укажи символ: <code>/fa EURUSD ...</code> (можно ответом на сообщение с текстом)")
         return
-    pair, until_iso = ctx.args[0], _parse_until(" ".join(ctx.args[1:]))
-    r = _upsert_policy(pair, {"scan_lock_until": until_iso})
-    await update.message.reply_html("OK (скан заморожен)\n" + _fmt_row(r))
-
-async def cmd_reserve(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/reserve EURUSD on|off</code> "
-                                        "(on = разрешить резерв, off = запретить)")
+    if not text:
+        await update.message.reply_html("Добавь текст факторов после символа или ответь на сообщение с новостью.")
         return
-    pair, flag = ctx.args[0], ctx.args[1].strip().lower()
-    if flag not in ("on","off"):
-        await update.message.reply_html("Аргумент: on|off")
+
+    await update.message.chat.send_action("typing")
+    policy = await synthesize_policy_from_text(text)
+
+    # проставим updated_at
+    policy["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ok, msg = upsert_fa_signal(symbol, policy, notes=text)
+
+    prefix = "✅" if ok else "⚠️"
+    await update.message.reply_html(
+        f"{prefix} {_format_policy(symbol, policy)}\n\n<i>{msg}</i>"
+    )
+    # отладочный JSON блок
+    try:
+        pretty = json.dumps(policy, ensure_ascii=False, indent=2)
+        await update.message.reply_text(f"JSON:\n{pretty}")
+    except Exception:
+        pass
+
+async def cmd_fa_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
-    # в таблице поле называется reserve_off
-    reserve_off = "true" if flag == "off" else "false"
-    r = _upsert_policy(pair, {"reserve_off": reserve_off})
-    await update.message.reply_html("OK\n" + _fmt_row(r))
-
-async def cmd_dca(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/dca EURUSD 0.6</code>")
+    text = " ".join(context.args) if context.args else ""
+    if not text and update.message and update.message.reply_to_message:
+        text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+    if not text:
+        await update.message.reply_html("Дай текст после команды или ответь на сообщение с новостью.")
         return
-    pair, scale = ctx.args[0], _clamp_scale(ctx.args[1])
-    r = _upsert_policy(pair, {"dca_scale": scale})
-    await update.message.reply_html("OK\n" + _fmt_row(r))
+    await update.message.chat.send_action("typing")
+    policy = await synthesize_policy_from_text(text)
+    try:
+        pretty = json.dumps(policy, ensure_ascii=False, indent=2)
+    except Exception:
+        pretty = str(policy)
+    await update.message.reply_text(pretty)
 
-async def cmd_note(update: Update, ctx):
-    if len(ctx.args) < 2:
-        await update.message.reply_html("Использование: <code>/note EURUSD текст</code>")
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
-    pair, note = ctx.args[0], " ".join(ctx.args[1:]).strip()
-    r = _upsert_policy(pair, {"notes": note})
-    await update.message.reply_html("OK\n" + _fmt_row(r))
-
-async def cmd_status(update: Update, ctx):
-    arg = ctx.args[0].upper() if ctx.args else "ALL"
-    rows = _read_all()
-    if arg != "ALL":
-        rows = [r for r in rows if str(r.get("pair","")).upper() == arg]
-    if not rows:
-        await update.message.reply_html("Пусто.")
+    if not context.args:
+        await update.message.reply_html("Использование: <code>/status SYMBOL</code>")
         return
-    lines = []
-    for r in rows:
-        lines.append(f"• <b>{r.get('pair')}</b>: {r.get('risk','')}/{r.get('bias','')}, "
-                     f"dca={r.get('dca_scale','')}, reserve_off={r.get('reserve_off','') or 'false'}, "
-                     f"lock={r.get('scan_lock_until','') or '—'}")
-    await update.message.reply_html("\n".join(lines))
+    symbol = (context.args[0] or "").upper()
 
-async def cmd_clear(update: Update, ctx):
-    if not ctx.args:
-        await update.message.reply_html("Использование: <code>/clear EURUSD</code>")
+    sh = _get_sheet()
+    if not sh:
+        await update.message.reply_text("Sheets не сконфигурирован.")
         return
-    _clear_pair(ctx.args[0])
-    await update.message.reply_html("Сброшено.")
+    ws = _ensure_ws(sh, "FA_Signals")
+    row = _find_row_by_pair(ws, symbol)
+    if not row:
+        await update.message.reply_text("Нет записи для этого символа.")
+        return
 
-# ---------- bootstrap ----------
+    try:
+        values = ws.row_values(row)
+        data = {h: (values[i] if i < len(values) else "") for i, h in enumerate(_HEADERS)}
+        # Типизация
+        data["ttl"] = int(data.get("ttl") or 0)
+        data["reserve_off"] = str(data.get("reserve_off")).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            data["dca_scale"] = float(data.get("dca_scale") or 1.0)
+        except Exception:
+            data["dca_scale"] = 1.0
+    except Exception:
+        log.exception("status read failed")
+        await update.message.reply_text("Ошибка чтения листа.")
+        return
 
+    await update.message.reply_html(_format_policy(symbol, data))
+
+
+# ------------- main -------------
 def main():
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_TOKEN is missing")
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-    app = Application.builder().token(token).rate_limiter(AIORateLimiter()).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if _RATE_LIMITER is not None:
+        builder = builder.rate_limiter(_RATE_LIMITER)
 
-    app.add_handler(CommandHandler("fa",       cmd_fa))
-    app.add_handler(CommandHandler("setrisk",  cmd_setrisk))
-    app.add_handler(CommandHandler("setbias",  cmd_setbias))
-    app.add_handler(CommandHandler("setttl",   cmd_setttl))
-    app.add_handler(CommandHandler("scanlock", cmd_scanlock))
-    app.add_handler(CommandHandler("reserve",  cmd_reserve))
-    app.add_handler(CommandHandler("dca",      cmd_dca))
-    app.add_handler(CommandHandler("note",     cmd_note))
-    app.add_handler(CommandHandler("status",   cmd_status))
-    app.add_handler(CommandHandler("clear",    cmd_clear))
+    app = builder.build()
 
-    log.info("FA bot started")
-    app.run_polling()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler(["fa", "policy"], cmd_fa))
+    app.add_handler(CommandHandler("fa_test", cmd_fa_test))
+    app.add_handler(CommandHandler("status", cmd_status))
+
+    log.info("FA bot starting…")
+    # drop_pending_updates=True, чтобы не перемалывать старую очередь при рестартах
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
