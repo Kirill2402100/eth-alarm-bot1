@@ -1,176 +1,148 @@
 # llm_client.py
-import os, json, logging
-from typing import Dict, List, Any
+from __future__ import annotations
+import os
+from typing import Optional, Dict, Any, List
 
-log = logging.getLogger("fund_bot.llm")
+from openai import OpenAI
 
-# OpenAI SDK v1.x
-try:
-    from openai import OpenAI
-except Exception as e:
-    raise RuntimeError("OpenAI SDK is not installed. Add `openai>=1.30.0` to requirements.") from e
+# --------------- Конфиг ---------------
 
-_CLIENT = None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_NANO  = os.getenv("LLM_NANO",  "gpt-4o-mini")   # твой env может быть gpt-5-nano — оставляю как есть
+LLM_MINI  = os.getenv("LLM_MINI",  "gpt-4o-mini")
+LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-4.1")       # опционально
 
-def _client() -> OpenAI:
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    return _CLIENT
+TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or "30000")
 
-def _is_responses_model(model: str) -> bool:
-    m = (model or "").lower()
-    # эвристика: всё новое (gpt-5*, 4.1*, omni*) чаще требует Responses API
-    return m.startswith("gpt-5") or m.startswith("gpt-4.1") or "omni" in m
+_client: Optional[OpenAI] = None
 
-def _resp_text(resp: Any) -> str:
-    """Достаём текст из Responses API независимо от версии SDK."""
-    # у новых версий есть .output_text
-    txt = getattr(resp, "output_text", None)
-    if txt:
-        return txt
-    # совместимость: достанем руками
-    try:
-        parts = []
-        for item in resp.output:
-            for c in getattr(item, "content", []) or []:
-                if getattr(c, "type", "") == "output_text" and getattr(c, "text", None):
-                    parts.append(c.text)
-        return "".join(parts).strip()
-    except Exception:
-        return ""
+def _client_ok() -> bool:
+    return bool(OPENAI_API_KEY)
 
-def _strip_json(text: str) -> str:
-    """Аккуратно вынимаем JSON из ответа (допускаем обёртки, код-блоки)."""
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    return _client
+
+# --------------- Универсальный вызов ---------------
+
+def _responses_call(model: str, prompt: str, max_output_tokens: Optional[int] = None) -> str:
+    """
+    Без temperature/max_tokens: некоторые 5-е модели кидают 400 на эти поля.
+    Используем Responses API (SDK v1).
+    """
+    if not _client_ok():
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    client = _get_client()
+
+    # Стараемся не слать пустые строки
+    text = (prompt or "").strip()
     if not text:
-        return ""
-    t = text.strip()
-    # ```json ... ```
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-    # вырезаем всё до первой { и после последней }
-    if "{" in t and "}" in t:
-        t = t[t.index("{"): t.rindex("}")+1]
-    return t
+        raise ValueError("LLM prompt is empty")
 
-# ===================== NANO (флаги) =====================
-
-def analyze_headlines_nano(model: str, headlines_by_ccy: Dict[str, List[str]]) -> Dict[str, Any]:
-    """
-    Возвращает JSON вида:
-    {
-      "USDJPY": {"risk":"Green/Amber/Red", "bias":"neutral/long-only/short-only", "horizon_h":12, "confidence":0.0..1.0},
-      ...
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "input": text,
     }
-    """
-    assert headlines_by_ccy, "Empty headlines"
-    client = _client()
+    if max_output_tokens is not None:
+        # у 5-й линейки корректное поле — max_output_tokens
+        kwargs["max_output_tokens"] = int(max_output_tokens)
 
-    ccys = ", ".join(headlines_by_ccy.keys())
-    sys_prompt = (
-        "Ты фунд-ассистент. На входе заголовки новостей по валютам. "
-        "Верни ЧИСТЫЙ JSON без пояснений. Ключи — тикеры (USDJPY, AUDUSD, EURUSD, GBPUSD). "
-        "Для каждой валюты оцени: risk (Green/Amber/Red), bias (neutral/long-only/short-only), "
-        "horizon_h (целое, часы 1..48), confidence (0..1)."
+    try:
+        r = client.responses.create(**kwargs)
+        # Ответ может лежать в output_text, либо в первом контенте
+        if hasattr(r, "output_text") and r.output_text:
+            return r.output_text.strip()
+
+        # fallback разбор
+        for out in getattr(r, "output", []) or []:
+            if getattr(out, "type", "") == "message":
+                parts = getattr(out, "content", []) or []
+                for p in parts:
+                    if getattr(p, "type", "") == "output_text":
+                        val = getattr(p, "text", "") or ""
+                        if val.strip():
+                            return val.strip()
+
+        # ещё один мягкий fallback
+        txt = str(r)
+        return txt.strip() if txt.strip() else ""
+    except Exception as e:
+        # пробрасываем наверх — пусть вызывающая сторона красиво оформит
+        raise
+
+# --------------- Вспомогательные высокоуровневые функции ---------------
+
+def nano_headlines_flags(pair: str, headlines: List[str]) -> Dict[str, Any]:
+    """
+    Анализ заголовков на 'машинном' уровне (дёшево).
+    Возвращает JSON-флаг в виде словаря. Если не получилось — пустой словарь.
+    """
+    prompt = (
+        "Ты помогаешь трейдеру по Форексу. Даны короткие заголовки новостей по инструменту {pair}.\n"
+        "Верни КОМПАКТНЫЙ JSON (без лишнего текста) с ключами:\n"
+        "risk_level: one of [OK, CAUTION, HIGH];\n"
+        "bias: one of [both, long-only, short-only];\n"
+        "horizon_min: int (оценка горизонта в минутах),\n"
+        "confidence: 0..1 (float, два знака);\n"
+        "reasons: короткий массив строк с 1-3 причинами.\n"
+        "Заголовки:\n- " + "\n- ".join(headlines[:12])
+    ).format(pair=pair)
+
+    try:
+        txt = _responses_call(LLM_NANO, prompt, max_output_tokens=450)
+        import json
+        # иногда модель может прислать текст до/после — попытаемся вычленить JSON
+        start = txt.find("{")
+        end = txt.rfind("}")
+        if start != -1 and end > start:
+            j = json.loads(txt[start:end + 1])
+            if isinstance(j, dict):
+                return j
+    except Exception:
+        pass
+    return {}
+
+def mini_digest_ru(pairs: List[str], flags: Dict[str, Dict[str, Any]]) -> str:
+    """
+    «Человеческий» дайджест на русском — коротко и по делу.
+    pairs: список символов вроде ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
+    flags: словарь флагов на пару, как вернул nano_headlines_flags (или пусто).
+    """
+    lines = []
+    for p in pairs:
+        f = flags.get(p, {}) or {}
+        risk = str(f.get("risk_level", "OK")).upper()
+        bias = str(f.get("bias", "both")).lower()
+        conf = f.get("confidence", "")
+        rs = f.get("reasons", []) or []
+        bullet = "• " + "; ".join(str(x) for x in rs[:3]) if rs else "• Без заметных факторов."
+        bias_txt = {
+            "both": "направление не фиксируем",
+            "long-only": "смещение: long-bias",
+            "short-only": "смещение: short-bias",
+        }.get(bias, "направление не фиксируем")
+
+        icon = "✅" if risk == "OK" else ("⚠️" if risk == "CAUTION" else "🚨")
+        head = f"{p} — {icon} {risk}"
+        tail = f"{bullet}\nЧто делаем: {bias_txt}."
+        if conf:
+            tail += f" (уверенность {float(conf):.2f})"
+        lines.append(head)
+        lines.append(tail)
+        lines.append("")  # пустая строка-разделитель
+
+    prompt = (
+        "Собери короткую русскоязычную сводку из следующих пунктов. "
+        "Максимум 6–8 предложений, деловой стиль, без воды, без списков рекомендаций по входам. "
+        "Не добавляй префиксы вроде 'Итог:' — просто текст.\n\n"
+        + "\n".join(lines)
     )
-    user_lines = []
-    for k, items in headlines_by_ccy.items():
-        if not items: 
-            continue
-        items = list(dict.fromkeys(items))[:20]  # дедуп+лимит
-        user_lines.append(f"{k}:\n- " + "\n- ".join(items))
-    user_prompt = f"Валюты: {ccys}\n\nЗаголовки:\n" + "\n\n".join(user_lines) + "\n\nВерни только JSON."
 
-    if _is_responses_model(model):
-        # Responses API — без temperature; max_output_tokens вместо max_tokens
-        try:
-            resp = client.responses.create(
-                model=model,
-                input=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-                max_output_tokens=400,
-            )
-            txt = _resp_text(resp)
-            return json.loads(_strip_json(txt) or "{}")
-        except Exception as e:
-            # повтор без max_output_tokens на случай “unsupported parameter”
-            log.warning("Responses nano: retry without max_output_tokens due to: %s", e)
-            resp = client.responses.create(
-                model=model,
-                input=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-            )
-            txt = _resp_text(resp)
-            return json.loads(_strip_json(txt) or "{}")
-    else:
-        # Chat Completions
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role":"system","content":sys_prompt},
-                    {"role":"user","content":user_prompt},
-                ],
-                max_tokens=400,
-                temperature=0,  # детерминированный JSON
-                response_format={"type":"json_object"},
-            )
-        except TypeError:
-            # если модель не поддерживает response_format — уберём
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role":"system","content":sys_prompt},
-                    {"role":"user","content":user_prompt},
-                ],
-                max_tokens=400,
-                temperature=0,
-            )
-        txt = (resp.choices[0].message.content or "").strip()
-        return json.loads(_strip_json(txt) or "{}")
-
-# ===================== MINI (дайджест) =====================
-
-def daily_digest_mini(model: str, facts: Dict[str, Any]) -> str:
-    """
-    facts: {
-      "USDJPY": {"calendar_today":[...], "notes":[...], "market":{"atr_z":..., "spread_bp":...}},
-      ...
-    }
-    Возвращает короткий русский дайджест по 4 парам.
-    """
-    client = _client()
-
-    sys_prompt = (
-        "Напиши краткий человеческий дайджест на русском по парам USDJPY/AUDUSD/EURUSD/GBPUSD. "
-        "Структура: на каждую пару 2–3 пункта (сильные/слабые факторы), затем строка 'Что делаем: ...' "
-        "на уровне практических мер (окна тишины, смещение bias и т.п.). Без преамбулы и заключения."
-    )
-    user_prompt = "Факты JSON ниже. Если данных по паре мало, пиши нейтрально.\n\n" + json.dumps(facts, ensure_ascii=False)
-
-    if _is_responses_model(model):
-        try:
-            resp = client.responses.create(
-                model=model,
-                input=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-                max_output_tokens=700,
-            )
-            return _resp_text(resp).strip()
-        except Exception as e:
-            log.warning("Responses mini: retry without max_output_tokens due to: %s", e)
-            resp = client.responses.create(
-                model=model,
-                input=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-            )
-            return _resp_text(resp).strip()
-    else:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role":"system","content":sys_prompt},
-                {"role":"user","content":user_prompt},
-            ],
-            max_tokens=700,
-            temperature=0.3,
-        )
-        return (resp.choices[0].message.content or "").strip()
+    try:
+        txt = _responses_call(LLM_MINI, prompt, max_output_tokens=700)
+        return txt.strip() or "Сводка: без существенных изменений."
+    except Exception as e:
+        return f"LLM недоступен: {e}"
