@@ -1,51 +1,52 @@
-# llm_client.py
-import os, asyncio, json
+# llm_client.py — лёгкая обёртка под OpenAI
+import os, httpx, json
 
-PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY","")
+OPENAI_BASE = os.environ.get("OPENAI_BASE","https://api.openai.com/v1")
+MODEL_MINI = os.environ.get("LLM_MINI","gpt-4o-mini")
+MODEL_NANO = os.environ.get("LLM_NANO","gpt-4o-mini")  # можно такой же, если nano нет
 
-# ---------- OpenAI ----------
-if PROVIDER == "openai":
-    from openai import AsyncOpenAI
-    _client = AsyncOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_BASE_URL") or None
+headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
+
+async def summarize_headlines(headlines_by_ccy: dict) -> dict:
+    """
+    headlines_by_ccy = {"JPY": ["headline1", ...], "AUD": [...], ...}
+    Возвращает JSON-флаги по каждой валюте.
+    """
+    if not OPENAI_API_KEY:
+        return {}
+    sys = (
+        "You are an assistant that labels FX news by currency with risk level "
+        "(OK/CAUTION/HIGH), bias (short-bias/long-bias/neutral), horizon (hours) "
+        "and confidence (0..1). Answer JSON."
     )
-    async def chat(system: str, user: str, model: str | None = None, json_mode: bool = False) -> str:
-        model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
-        extra = {"response_format": {"type": "json_object"}} if json_mode else {}
-        resp = await _client.chat.completions.create(
-            model=model,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            **extra
-        )
-        return resp.choices[0].message.content
+    user = "Headlines:\n" + json.dumps(headlines_by_ccy, ensure_ascii=False)
+    body = {
+        "model": MODEL_NANO,
+        "messages": [{"role":"system","content":sys},{"role":"user","content":user}],
+        "temperature": 0.2,
+        "response_format": {"type":"json_object"},
+    }
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        r = await cli.post(f"{OPENAI_BASE}/chat/completions", headers=headers, json=body)
+        r.raise_for_status()
+        out = r.json()
+        try:
+            return json.loads(out["choices"][0]["message"]["content"])
+        except Exception:
+            return {}
 
-# ---------- Gemini ----------
-elif PROVIDER == "gemini":
-    import google.generativeai as genai
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    async def chat(system: str, user: str, model: str | None = None, json_mode: bool = False) -> str:
-        mname = model or os.getenv("LLM_MODEL", "gemini-1.5-flash")
-        mdl = genai.GenerativeModel(mname)
-        prompt = f"{system}\n\nUser:\n{user}"
-        if json_mode: prompt += "\n\nReturn ONLY valid JSON object."
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, lambda: mdl.generate_content(prompt))
-        return res.text or ""
-
-# ---------- Anthropic ----------
-elif PROVIDER == "anthropic":
-    import anthropic
-    _client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    async def chat(system: str, user: str, model: str | None = None, json_mode: bool = False) -> str:
-        model = model or os.getenv("LLM_MODEL", "claude-3-haiku-20240307")
-        msg = await _client.messages.create(
-            model=model, max_tokens=1024, system=system,
-            messages=[{"role":"user","content":user}]
-        )
-        return msg.content[0].text
-
-# ---------- Fallback ----------
-else:
-    async def chat(system: str, user: str, model: str | None = None, json_mode: bool = False) -> str:
-        return '{"risk":"Green","bias":"neutral","ttl":60}'
+async def daily_brief(text: str) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    sys = "Write a concise Russian morning FX brief for 4 pairs (USDJPY, AUDUSD, EURUSD, GBPUSD)."
+    body = {
+        "model": MODEL_MINI,
+        "messages": [{"role":"system","content":sys},{"role":"user","content":text}],
+        "temperature": 0.3,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        r = await cli.post(f"{OPENAI_BASE}/chat/completions", headers=headers, json=body)
+        r.raise_for_status()
+        out = r.json()
+        return out["choices"][0]["message"]["content"].strip()
