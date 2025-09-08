@@ -1,148 +1,93 @@
-# llm_client.py
-from __future__ import annotations
-import os
-from typing import Optional, Dict, Any, List
+import os, asyncio
+from typing import Dict, Any
+from openai import OpenAI, BadRequestError
 
-from openai import OpenAI
+_CLIENT = None
 
-# --------------- Конфиг ---------------
+def _client() -> OpenAI:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _CLIENT
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LLM_NANO  = os.getenv("LLM_NANO",  "gpt-4o-mini")   # твой env может быть gpt-5-nano — оставляю как есть
-LLM_MINI  = os.getenv("LLM_MINI",  "gpt-4o-mini")
-LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-4.1")       # опционально
+LLM_MINI = os.environ.get("LLM_MINI", "gpt-5-mini")
+LLM_NANO = os.environ.get("LLM_NANO", "gpt-5-nano")
+LLM_MAJOR = os.environ.get("LLM_MAJOR", "gpt-5")
 
-TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or "30000")
-
-_client: Optional[OpenAI] = None
-
-def _client_ok() -> bool:
-    return bool(OPENAI_API_KEY)
-
-def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY)
-    return _client
-
-# --------------- Универсальный вызов ---------------
-
-def _responses_call(model: str, prompt: str, max_output_tokens: Optional[int] = None) -> str:
+async def _create_responses(model: str, prompt: str, max_out: int = 600) -> str:
     """
-    Без temperature/max_tokens: некоторые 5-е модели кидают 400 на эти поля.
-    Используем Responses API (SDK v1).
+    Основной путь: Responses API.
+    Без temperature и max_tokens — только max_output_tokens (как требует API).
     """
-    if not _client_ok():
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    client = _get_client()
-
-    # Стараемся не слать пустые строки
-    text = (prompt or "").strip()
-    if not text:
-        raise ValueError("LLM prompt is empty")
-
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "input": text,
-    }
-    if max_output_tokens is not None:
-        # у 5-й линейки корректное поле — max_output_tokens
-        kwargs["max_output_tokens"] = int(max_output_tokens)
-
+    cli = _client()
     try:
-        r = client.responses.create(**kwargs)
-        # Ответ может лежать в output_text, либо в первом контенте
-        if hasattr(r, "output_text") and r.output_text:
-            return r.output_text.strip()
-
-        # fallback разбор
-        for out in getattr(r, "output", []) or []:
-            if getattr(out, "type", "") == "message":
-                parts = getattr(out, "content", []) or []
-                for p in parts:
-                    if getattr(p, "type", "") == "output_text":
-                        val = getattr(p, "text", "") or ""
-                        if val.strip():
-                            return val.strip()
-
-        # ещё один мягкий fallback
-        txt = str(r)
-        return txt.strip() if txt.strip() else ""
+        resp = await asyncio.to_thread(
+            cli.responses.create,
+            model=model,
+            input=prompt,
+            max_output_tokens=max_out,
+        )
+        # у официального SDK у объекта есть удобное свойство
+        out = getattr(resp, "output_text", None)
+        if out is None:
+            # на всякий — соберём вручную
+            if resp.output and len(resp.output) and resp.output[0].content:
+                out = "".join([b.text for b in (chunk.text for chunk in [resp.output[0].content]) if b])
+        return out or ""
+    except BadRequestError as e:
+        # Перебросим наружу — верхний уровень может дать дружелюбный текст
+        raise
     except Exception as e:
-        # пробрасываем наверх — пусть вызывающая сторона красиво оформит
         raise
 
-# --------------- Вспомогательные высокоуровневые функции ---------------
-
-def nano_headlines_flags(pair: str, headlines: List[str]) -> Dict[str, Any]:
+async def _fallback_chat(model: str, prompt: str, max_tokens: int = 600, temperature: float = 0.2) -> str:
     """
-    Анализ заголовков на 'машинном' уровне (дёшево).
-    Возвращает JSON-флаг в виде словаря. Если не получилось — пустой словарь.
+    Фоллбэк на chat.completions, если Responses ругнулся на параметры/модель.
     """
-    prompt = (
-        "Ты помогаешь трейдеру по Форексу. Даны короткие заголовки новостей по инструменту {pair}.\n"
-        "Верни КОМПАКТНЫЙ JSON (без лишнего текста) с ключами:\n"
-        "risk_level: one of [OK, CAUTION, HIGH];\n"
-        "bias: one of [both, long-only, short-only];\n"
-        "horizon_min: int (оценка горизонта в минутах),\n"
-        "confidence: 0..1 (float, два знака);\n"
-        "reasons: короткий массив строк с 1-3 причинами.\n"
-        "Заголовки:\n- " + "\n- ".join(headlines[:12])
-    ).format(pair=pair)
-
-    try:
-        txt = _responses_call(LLM_NANO, prompt, max_output_tokens=450)
-        import json
-        # иногда модель может прислать текст до/после — попытаемся вычленить JSON
-        start = txt.find("{")
-        end = txt.rfind("}")
-        if start != -1 and end > start:
-            j = json.loads(txt[start:end + 1])
-            if isinstance(j, dict):
-                return j
-    except Exception:
-        pass
-    return {}
-
-def mini_digest_ru(pairs: List[str], flags: Dict[str, Dict[str, Any]]) -> str:
-    """
-    «Человеческий» дайджест на русском — коротко и по делу.
-    pairs: список символов вроде ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
-    flags: словарь флагов на пару, как вернул nano_headlines_flags (или пусто).
-    """
-    lines = []
-    for p in pairs:
-        f = flags.get(p, {}) or {}
-        risk = str(f.get("risk_level", "OK")).upper()
-        bias = str(f.get("bias", "both")).lower()
-        conf = f.get("confidence", "")
-        rs = f.get("reasons", []) or []
-        bullet = "• " + "; ".join(str(x) for x in rs[:3]) if rs else "• Без заметных факторов."
-        bias_txt = {
-            "both": "направление не фиксируем",
-            "long-only": "смещение: long-bias",
-            "short-only": "смещение: short-bias",
-        }.get(bias, "направление не фиксируем")
-
-        icon = "✅" if risk == "OK" else ("⚠️" if risk == "CAUTION" else "🚨")
-        head = f"{p} — {icon} {risk}"
-        tail = f"{bullet}\nЧто делаем: {bias_txt}."
-        if conf:
-            tail += f" (уверенность {float(conf):.2f})"
-        lines.append(head)
-        lines.append(tail)
-        lines.append("")  # пустая строка-разделитель
-
-    prompt = (
-        "Собери короткую русскоязычную сводку из следующих пунктов. "
-        "Максимум 6–8 предложений, деловой стиль, без воды, без списков рекомендаций по входам. "
-        "Не добавляй префиксы вроде 'Итог:' — просто текст.\n\n"
-        + "\n".join(lines)
+    cli = _client()
+    resp = await asyncio.to_thread(
+        cli.chat.completions.create,
+        model=model,
+        messages=[{"role":"system","content":"Кратко и по делу, на русском."},
+                  {"role":"user","content":prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
+    return (resp.choices[0].message.content or "").strip()
+
+async def run_mini_digest(flags: Dict[str, Dict[str, Any]]) -> str:
+    """
+    flags: {"USDJPY":{"risk":"CAUTION","bias":"short-bias","notes":[...]}, ...}
+    Возвращает русский дайджест по 4 парам.
+    """
+    def _mk_line(sym: str, f: Dict[str, Any]) -> str:
+        risk = f.get("risk","OK")
+        bias = f.get("bias","both")
+        notes = f.get("notes") or []
+        bullet = "\n".join([f"• {n}" for n in notes[:3]]) if notes else "• Без существенных новостей."
+        lbl = "✅ Нейтрально" if risk=="OK" else ("⚠️ Осторожно" if risk=="CAUTION" else "🚨 Высокий риск")
+        return f"{sym} — {lbl}\n{bullet}\nЧто делаем: режим {bias}."
+    text_blocks = [
+        "🧭 Утренний фон (кратко)",
+        _mk_line("USDJPY", flags.get("USDJPY", {})),
+        _mk_line("AUDUSD", flags.get("AUDUSD", {})),
+        _mk_line("EURUSD", flags.get("EURUSD", {})),
+        _mk_line("GBPUSD", flags.get("GBPUSD", {})),
+    ]
+    prompt = "\n\n".join(text_blocks) + "\n\nСформируй аккуратный, короткий дайджест для трейд-чатов."
 
     try:
-        txt = _responses_call(LLM_MINI, prompt, max_output_tokens=700)
-        return txt.strip() or "Сводка: без существенных изменений."
+        return await _create_responses(LLM_MINI, prompt, max_out=700)
+    except BadRequestError as e:
+        # Частые жалобы: unsupported parameter (если SDK/эндпоинт не совпали)
+        # Пробуем фоллбэк на chat.completions
+        try:
+            return await _fallback_chat(LLM_MINI, prompt, max_tokens=700, temperature=0.2)
+        except Exception as e2:
+            raise RuntimeError(f"LLM (fallback) error: {e2}") from e
     except Exception as e:
-        return f"LLM недоступен: {e}"
+        # общий фоллбэк на чат
+        try:
+            return await _fallback_chat(LLM_MINI, prompt, max_tokens=700, temperature=0.2)
+        except Exception as e2:
+            raise RuntimeError(f"LLM error: {e2}") from e
