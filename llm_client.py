@@ -1,150 +1,133 @@
-# llm_client.py
 from __future__ import annotations
 
 import os
+import json
 import logging
-from typing import Dict, List
+from typing import List, Dict, Optional
 
-try:
-    # асинхронный клиент SDK v1.x
-    from openai import AsyncOpenAI
-except Exception:  # pragma: no cover
-    AsyncOpenAI = None  # type: ignore
+from openai import OpenAI
+from openai.types import CompletionUsage
 
-log = logging.getLogger("llm_client")
+log = logging.getLogger("llm")
 
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY не задан — LLM вызовы упадут.")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-class LLMError(RuntimeError):
-    pass
-
-
-class LLMClient:
-    def __init__(
-        self,
-        api_key: str,
-        model_nano: str = "gpt-5-nano",
-        model_mini: str = "gpt-5-mini",
-        model_major: str = "gpt-5",
-        daily_token_budget: int = 30000,
-    ):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or ""
-        self.model_nano = model_nano
-        self.model_mini = model_mini
-        self.model_major = model_major
-        self.daily_budget = daily_token_budget
-        self._client = None
-        if AsyncOpenAI and self.api_key:
-            try:
-                self._client = AsyncOpenAI(api_key=self.api_key)
-            except Exception as e:
-                log.warning(f"OpenAI client init failed: {e}")
-
-    def _require_client(self):
-        if not self._client:
-            raise LLMError("OpenAI client не инициализирован (проверьте OPENAI_API_KEY).")
-
-    async def _call_mini(self, system: str, user: str, max_tokens: int = 600) -> str:
-        """
-        Универсальный вызов: сначала пробуем Responses API (max_output_tokens),
-        если провал — Chat Completions (max_tokens).
-        """
-        self._require_client()
-        # 1) Responses API
-        try:
-            resp = await self._client.responses.create(  # type: ignore[union-attr]
-                model=self.model_mini,
-                input=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                max_output_tokens=max_tokens,
-                temperature=0.3,
-            )
-            # у Responses удобно вытаскивать сразу текст:
-            out = getattr(resp, "output_text", None)
-            if out:
-                return out.strip()
-            # fallback: собрать текст вручную
-            try:
-                chunks = []
-                for item in resp.output:
-                    if item.type == "message":
-                        for cc in item.message.content:
-                            if cc.type == "text":
-                                chunks.append(cc.text)
-                return "\n".join(chunks).strip()
-            except Exception:
-                pass
-        except Exception as e1:
-            msg = str(e1)
-            log.info(f"Responses API failed, fallback to Chat Completions: {msg}")
-
-        # 2) Chat Completions API
-        try:
-            resp = await self._client.chat.completions.create(  # type: ignore[union-attr]
-                model=self.model_mini,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.3,
-                max_tokens=max_tokens,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e2:
-            raise LLMError(f"Ошибка обращения к LLM: {e2}")
-
-    async def make_digest_ru(self, pairs: List[str]) -> Dict[str, str]:
-        """
-        Возвращает словарь {pair: 'текст на русском'}.
-        """
-        sys = (
-            "Ты финансовый редактор. Пиши кратко на русском, без воды, 2–4 пункта на пару. "
-            "Тон — деловой. Избегай категоричных прогнозов, если уверенности нет — укажи нейтрально."
+# ====== Вспомогательный универсальный вызов ======
+def _try_responses_any(model: str, prompt: str, temperature: float = 0.3, max_new_tokens: int = 700) -> str:
+    """
+    Универсальный вызов, пережёвывающий зоопарк параметров:
+    - сначала Responses API с max_completion_tokens
+    - затем Responses API с max_output_tokens
+    - затем chat.completions с max_tokens
+    Возвращает сырой текст.
+    """
+    # 1) responses + max_completion_tokens
+    try:
+        r = client.responses.create(
+            model=model,
+            input=prompt,
+            temperature=temperature,
+            max_completion_tokens=max_new_tokens,
         )
-        user = (
-            "Сделай короткий дайджест по валютным парам: "
-            f"{', '.join(pairs)}. Для каждой пары: одна строка статуса-иконки "
-            "(например ✅ нейтрально / ⚠️ осторожно / 🚧 риск), затем 2–4 тезиса: "
-            "ключевые риски/события сегодня, на что обратить внимание трейдеру интрадей. "
-            "Если нет конкретных поводов — напиши коротко «Нейтрально, работаем по плану». "
-            "Формат: для КАЖДОЙ пары отдельный блок, сначала тикер, затем текст. "
-            "Аббревиатуры: ISM, CPI, NFP, BoJ, RBA, ECB, BoE можно использовать, но без фантазий."
+        out = getattr(r, "output_text", None)
+        if out:
+            return out.strip()
+        # иногда text в первом item
+        if r.output and len(r.output) and getattr(r.output[0], "content", None):
+            chunks = [c.text for c in r.output[0].content if getattr(c, "text", None)]
+            return "".join(chunks).strip()
+    except Exception as e1:
+        msg = str(e1)
+        log.info(f"responses(max_completion_tokens) not used: {msg}")
+
+    # 2) responses + max_output_tokens
+    try:
+        r = client.responses.create(
+            model=model,
+            input=prompt,
+            temperature=temperature,
+            max_output_tokens=max_new_tokens,
         )
+        out = getattr(r, "output_text", None)
+        if out:
+            return out.strip()
+        if r.output and len(r.output) and getattr(r.output[0], "content", None):
+            chunks = [c.text for c in r.output[0].content if getattr(c, "text", None)]
+            return "".join(chunks).strip()
+    except Exception as e2:
+        msg = str(e2)
+        log.info(f"responses(max_output_tokens) not used: {msg}")
 
-        try:
-            content = await self._call_mini(sys, user, max_tokens=600)
-        except LLMError:
-            # полностью нейтральный дефолт
-            return {p: "✅ Нейтрально. Существенных поводов не отмечено; работаем по базовому плану." for p in pairs}
+    # 3) chat.completions + max_tokens
+    try:
+        r = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e3:
+        raise RuntimeError(f"Ошибка обращения к LLM: {e3}")
 
-        if not content:
-            return {p: "✅ Нейтрально. Существенных поводов не отмечено; работаем по базовому плану." for p in pairs}
+# ====== ЗАДАЧИ ======
 
-        # простая нарезка по тикерам
-        result: Dict[str, str] = {p: "" for p in pairs}
-        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-        cur_key = None
-        acc: Dict[str, List[str]] = {p: [] for p in pairs}
-        for ln in lines:
-            up = ln.upper()
-            matched = None
-            for p in pairs:
-                if p in up:
-                    matched = p
-                    break
-            if matched:
-                cur_key = matched
-                cleaned = ln.replace(matched, "").strip("-: \t")
-                if cleaned:
-                    acc[cur_key].append(cleaned)
-                continue
-            if cur_key:
-                acc[cur_key].append(ln)
+def analyze_headlines_json(
+    pair: str,
+    headlines: List[str],
+    model_nano: str,
+) -> Dict:
+    """
+    Короткий «машинный» анализ: вернуть JSON с полями:
+    level ∈ {OK, CAUTION, HIGH}, bias ∈ {BOTH, LONG, SHORT}, horizon_h, confidence 0..1
+    """
+    prompt = (
+        "Проанализируй заголовки новостей по инструменту {pair} и верни ТОЛЬКО JSON с полями:\n"
+        "level ∈ {OK, CAUTION, HIGH}, bias ∈ {BOTH, LONG, SHORT}, horizon_h (целое), confidence (0..1).\n"
+        "Примеры причин не пиши. Никакого текста вне JSON.\n\n"
+        f"Заголовки:\n- " + "\n- ".join(headlines[:12])
+    )
+    raw = _try_responses_any(model_nano, prompt, temperature=0.1, max_new_tokens=200)
+    try:
+        j = json.loads(raw)
+        return {
+            "level": str(j.get("level", "OK")).upper(),
+            "bias": str(j.get("bias", "BOTH")).upper(),
+            "horizon_h": int(j.get("horizon_h", 12)),
+            "confidence": float(j.get("confidence", 0.5)),
+        }
+    except Exception:
+        # fallback «тихий» если что-то не так
+        return {"level": "OK", "bias": "BOTH", "horizon_h": 12, "confidence": 0.5}
 
-        for p in pairs:
-            block = "\n".join(acc.get(p) or []).strip()
-            if not block:
-                block = "✅ Нейтрально. Существенных поводов не отмечено; работаем по базовому плану."
-            result[p] = block
-        return result
+async def make_digest_ru(
+    pairs: List[str],
+    model: str,
+    nano_model: Optional[str] = None,
+) -> str:
+    """
+    Короткий «человеческий» дайджест на русском для 3–4 валютных пар.
+    """
+    # В реальности сюда подставим факты/календарь/заголовки; сейчас — шаблон.
+    bullet = []
+    for p in pairs:
+        bullet.append(f"{p} — без критичных новостей, режим обычный.")
+
+    prompt = (
+        "Ты — опытный FX-аналитик. Напиши компактный дайджест на русском по инструментам: "
+        f"{', '.join(pairs)}. Формат: для каждой пары 1–2 строки: текущий фон и действие трейд-бота "
+        "(окна тишины/смещение/ограничения или «обычный режим»). Избегай воды, будь конкретным. "
+        "Если фактов нет — пиши аккуратно «без критичных новостей».\n\n"
+        "Верни чистый текст для Telegram (параграфы и маркеры), без Markdown-ссылок."
+    )
+    text = _try_responses_any(model, prompt, temperature=0.4, max_new_tokens=600)
+
+    # Небольшая нормализация (на случай пустого ответа)
+    if not text or len(text) < 10:
+        text = "Ежедневный фон:\n" + "\n".join("• " + s for s in bullet)
+
+    # Telegram HTML безопаснее — но мы просили обычный текст. Вернём как есть.
+    return text.strip()
