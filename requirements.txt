@@ -1,4 +1,4 @@
-python-telegram-bot==20.8
+python-telegram-bot[rate-limiter]==20.8
 gspread==6.1.2
 pandas==2.2.2
 numpy==1.26.4
