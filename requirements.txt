@@ -1,5 +1,5 @@
 python-telegram-bot[rate-limiter]>=20.7,<21
-gspread>=5.10
+gspread>=5.12
 google-auth>=2.29
 pandas>=2.1
 numpy>=1.26
