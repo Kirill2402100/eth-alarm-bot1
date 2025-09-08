@@ -1,5 +1,8 @@
-python-telegram-bot>=20.7,<21
+python-telegram-bot[rate-limiter]>=20.7,<21
 gspread>=5.10
 google-auth>=2.29
 pandas>=2.1
 numpy>=1.26
+openai>=1.40
+google-generativeai>=0.7
+anthropic>=0.34
