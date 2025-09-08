@@ -30,7 +30,7 @@ try:
     import gspread
     from google.oauth2 import service_account
     _GSHEETS_AVAILABLE = True
-except Exception as e:  # pragma: no cover
+except Exception:
     gspread = None
     service_account = None
     _GSHEETS_AVAILABLE = False
@@ -39,7 +39,6 @@ except Exception as e:  # pragma: no cover
 try:
     from llm_client import generate_digest, llm_ping
 except Exception:
-    # Фолбэк: если файла нет, дадим заглушки, чтобы бот не падал
     async def generate_digest(*args, **kwargs) -> str:
         return "⚠️ LLM сейчас недоступен (нет llm_client.py)."
 
@@ -57,9 +56,9 @@ log = logging.getLogger("fund_bot")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_TOKEN", "").strip()
 MASTER_CHAT_ID = int(os.getenv("MASTER_CHAT_ID", "0") or "0")
 
-SHEET_ID = os.getenv("SHEET_ID", "").strip()  # только ID (кусок между /d/ и /edit)
+SHEET_ID = os.getenv("SHEET_ID", "").strip()                       # только ID (между /d/ и /edit)
+SHEET_WS = os.getenv("SHEET_WS", "FUND_BOT").strip() or "FUND_BOT"  # имя листа/вкладки по умолчанию
 
-# Веса по умолчанию — строка JSON или пусто
 _DEFAULT_WEIGHTS_RAW = os.getenv("DEFAULT_WEIGHTS", "").strip()
 if _DEFAULT_WEIGHTS_RAW:
     try:
@@ -86,7 +85,6 @@ def _env(name: str) -> str:
 
 
 def _decode_b64_maybe_padded(s: str) -> str:
-    """Аккуратно декодируем base64, добавляя padding при необходимости."""
     s = s.strip()
     if not s:
         return ""
@@ -95,15 +93,6 @@ def _decode_b64_maybe_padded(s: str) -> str:
 
 
 def load_google_service_info() -> Tuple[Optional[dict], str, Optional[str]]:
-    """
-    Пытаемся вытащить креды из окружения в порядке приоритета:
-      1) GOOGLE_CREDENTIALS_JSON_B64  — base64(JSON)
-      2) GOOGLE_CREDENTIALS_JSON      — raw JSON
-      3) GOOGLE_CREDENTIALS           — raw JSON
-
-    Возвращаем (info|None, source|reason, client_email|None).
-    """
-    # 1) base64(JSON)
     b64 = _env("GOOGLE_CREDENTIALS_JSON_B64")
     if b64:
         try:
@@ -114,7 +103,6 @@ def load_google_service_info() -> Tuple[Optional[dict], str, Optional[str]]:
         except Exception as e:
             return None, f"b64 present but decode/json error: {e}", None
 
-    # 2) raw JSON (варианты имён)
     for name in ("GOOGLE_CREDENTIALS_JSON", "GOOGLE_CREDENTIALS"):
         raw = _env(name)
         if raw:
@@ -129,29 +117,45 @@ def load_google_service_info() -> Tuple[Optional[dict], str, Optional[str]]:
 
 
 def build_sheets_client(sheet_id: str):
-    """
-    Возвращает (spreadsheet|None, meta_text).
-    meta_text — понятное описание источника/ошибки.
-    """
     if not _GSHEETS_AVAILABLE:
         return None, "gsheets libs not installed"
-
     if not sheet_id:
         return None, "sheet_id empty"
 
     info, src, client_email = load_google_service_info()
     if not info:
-        return None, src  # причина уже в тексте
+        return None, src
 
     try:
         creds = service_account.Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(sheet_id)
-        # meta текст — покажем откуда взяли креды и каким сервисным аккаунтом зашли
         sa = client_email or getattr(getattr(gc, "auth", None), "service_account_email", "ok")
         return sh, f"{src} / sa={sa}"
     except Exception as e:
         return None, f"auth/open error: {e}"
+
+
+# ---------- Sheets helpers ----------
+SHEET_HEADERS = ["ts", "chat_id", "action", "total", "weights_json", "note"]
+
+
+def ensure_worksheet(sh, title: str):
+    """Вернёт существующий лист или создаст новый с заголовками."""
+    try:
+        for ws in sh.worksheets():
+            if ws.title == title:
+                return ws, False
+        ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(SHEET_HEADERS)))
+        ws.update("A1", [SHEET_HEADERS])
+        return ws, True
+    except Exception as e:
+        raise RuntimeError(f"ensure_worksheet error: {e}")
+
+
+def append_row(sh, title: str, row: list):
+    ws, _ = ensure_worksheet(sh, title)
+    ws.append_row(row, value_input_option="RAW")
 
 
 # -------------------- УТИЛИТЫ --------------------
@@ -183,6 +187,8 @@ HELP_TEXT = (
     "/weights — показать целевые веса.\n"
     "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
     "/digest — короткий «человеческий» дайджест по USDJPY / AUDUSD / EURUSD / GBPUSD.\n"
+    "/init_sheet — создать/проверить лист в Google Sheets.\n"
+    "/sheet_test — записать тестовую строку в лист.\n"
     "/diag — диагностика LLM и Google Sheets.\n"
     "/ping — проверить связь."
 )
@@ -231,7 +237,6 @@ async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text[len("/setweights"):].strip().lower()
-    # формат: jpy=40 aud=25 eur=20 gbp=15
     new_w = STATE["weights"].copy()
     try:
         for token in text.split():
@@ -275,9 +280,27 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "\n".join(lines)
     await update.message.reply_text(msg)
 
+    # опционально лог в таблицу
+    sh, _src = build_sheets_client(SHEET_ID)
+    if sh:
+        try:
+            append_row(
+                sh,
+                SHEET_WS,
+                [
+                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    str(update.effective_chat.id),
+                    "alloc",
+                    f"{total:.2f}",
+                    json.dumps(w, ensure_ascii=False),
+                    json.dumps(alloc, ensure_ascii=False),
+                ],
+            )
+        except Exception as e:
+            log.warning("append_row alloc failed: %s", e)
+
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Короткий «человеческий» дайджест на русском по 4 парам."""
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         txt = await generate_digest(
@@ -302,11 +325,15 @@ def sheets_diag_text() -> str:
     if sh is None:
         return f"Sheets: ❌ (SID={sid_state}, source={src}, b64_len={b64_len}, raw_len={raw_json_len})"
     else:
-        return f"Sheets: ✅ ok (SID={sid_state}, {src})"
+        try:
+            ws, created = ensure_worksheet(sh, SHEET_WS)
+            mark = "created" if created else "exists"
+            return f"Sheets: ✅ ok (SID={sid_state}, {src}, ws={ws.title}:{mark})"
+        except Exception as e:
+            return f"Sheets: ❌ (open ok, ws error: {e})"
 
 
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # LLM
     try:
         ok = await llm_ping()
         llm_line = "LLM: ✅ ok" if ok else "LLM: ❌ no key"
@@ -314,8 +341,48 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         llm_line = "LLM: ❌ error"
 
     sheets_line = sheets_diag_text()
-    text = f"{llm_line}\n{sheets_line}"
-    await update.message.reply_text(text)
+    await update.message.reply_text(f"{llm_line}\n{sheets_line}")
+
+
+# ---- новые команды для листа ----
+async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not SHEET_ID:
+        await update.message.reply_text("SHEET_ID не задан.")
+        return
+    sh, src = build_sheets_client(SHEET_ID)
+    if not sh:
+        await update.message.reply_text(f"Sheets: ❌ {src}")
+        return
+    try:
+        ws, created = ensure_worksheet(sh, SHEET_WS)
+        await update.message.reply_text(
+            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
+
+
+async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sh, src = build_sheets_client(SHEET_ID)
+    if not sh:
+        await update.message.reply_text(f"Sheets: ❌ {src}")
+        return
+    try:
+        append_row(
+            sh,
+            SHEET_WS,
+            [
+                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                str(update.effective_chat.id),
+                "test",
+                f"{STATE['total']:.2f}",
+                json.dumps(STATE['weights'], ensure_ascii=False),
+                "manual /sheet_test",
+            ],
+        )
+        await update.message.reply_text("Sheets: ✅ записано (test row).")
+    except Exception as e:
+        await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
 
 # -------------------- СТАРТ --------------------
@@ -329,11 +396,13 @@ async def _set_bot_commands(app: Application):
         BotCommand("weights", "Показать целевые веса"),
         BotCommand("alloc", "Рассчитать распределение банка"),
         BotCommand("digest", "Короткий фундаментальный дайджест"),
+        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
+        BotCommand("sheet_test", "Тестовая запись в лист"),
         BotCommand("diag", "Диагностика LLM и Sheets"),
     ]
     try:
         await app.bot.set_my_commands(cmds)
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         log.warning("set_my_commands failed: %s", e)
 
 
@@ -355,6 +424,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("alloc", cmd_alloc))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
+    app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
 
     return app
 
@@ -366,7 +437,6 @@ async def main_async():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    # Блокируемся
     await asyncio.Event().wait()
 
 
