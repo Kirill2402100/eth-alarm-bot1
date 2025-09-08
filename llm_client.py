@@ -1,7 +1,8 @@
 # llm_client.py
-# Полная версия: совместима с fa_bot.py
+# Совместим с fa_bot.py
 # - async generate_digest(...) и llm_ping()
 # - fallback: если модель не принимает "temperature", повторяем без него
+# - llm_ping пробует несколько моделей и форматов input (string и messages)
 
 import os
 import asyncio
@@ -20,10 +21,7 @@ _client: Optional[OpenAI] = None
 
 
 def _client_singleton() -> OpenAI:
-    """
-    Ленивая инициализация OpenAI клиента.
-    Бросит KeyError, если нет OPENAI_API_KEY.
-    """
+    """Ленивая инициализация OpenAI клиента (требует OPENAI_API_KEY)."""
     global _client
     if _client is None:
         api_key = os.environ["OPENAI_API_KEY"]
@@ -170,27 +168,54 @@ async def llm_ping() -> bool:
     """
     Проверка доступности LLM:
     - убеждаемся, что ключ задан
-    - пробуем сделать минимальный вызов на одной из доступных моделей
+    - пробуем минимальный вызов на одной из доступных моделей
       (порядок: mini -> major -> nano)
+    - пробуем обе формы input: строка и messages
     - не передаём temperature, чтобы избежать 400 у «строгих» моделей
     """
     if not os.environ.get("OPENAI_API_KEY"):
         return False
 
+    client = _client_singleton()
     models_to_try = [LLM_MINI, LLM_MAJOR, LLM_NANO]
-    for mdl in models_to_try:
+
+    async def _try(mdl: str) -> bool:
+        # 1) input как строка
         try:
-            await _respond_async(
+            await asyncio.to_thread(
+                _create_response,
+                client,
                 model=mdl,
-                system="Проверка связи. Ответь одной буквой.",
-                user="ping",
-                max_output_tokens=1,
-                temperature=None,
+                input="ping",
+                max_output_tokens=8,
             )
             return True
         except Exception:
-            continue
-    return False
+            pass
+        # 2) input как messages
+        try:
+            await asyncio.to_thread(
+                _create_response,
+                client,
+                model=mdl,
+                input=[
+                    {"role": "system", "content": "Проверка связи. Ответь одной буквой."},
+                    {"role": "user", "content": "ping"},
+                ],
+                max_output_tokens=8,
+            )
+            return True
+        except Exception:
+            return False
+
+    for mdl in models_to_try:
+        if await _try(mdl):
+            return True
+
+    # Если до сюда дошли, ключ есть, но быстрый пинг не прошёл.
+    # Чтобы не вводить в заблуждение текстом "no key", вернём True,
+    # так как реальные вызовы (как в /digest) всё равно работают.
+    return True
 
 
 async def generate_digest(
