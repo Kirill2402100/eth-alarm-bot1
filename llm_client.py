@@ -1,6 +1,6 @@
 # llm_client.py
-# Полная версия с async-функциями generate_digest и llm_ping,
-# совместимыми с вызовами из fa_bot.py.
+# Полная версия с fallback: если модель не поддерживает temperature,
+# повторяем запрос без него. Совместимо с fa_bot.py.
 
 import os
 import asyncio
@@ -21,7 +21,6 @@ _client: Optional[OpenAI] = None
 def _client_singleton() -> OpenAI:
     """
     Ленивая инициализация OpenAI клиента.
-    Бросит KeyError, если нет OPENAI_API_KEY (это поймают снаружи).
     """
     global _client
     if _client is None:
@@ -30,35 +29,54 @@ def _client_singleton() -> OpenAI:
     return _client
 
 
+def _create_response(client: OpenAI, **kwargs):
+    """
+    Обёртка с авто-ретраем: если модель не поддерживает temperature,
+    повторяем без него.
+    """
+    try:
+        return client.responses.create(**kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        if "temperature" in msg and "not supported" in msg:
+            # убрать temperature и повторить
+            kwargs.pop("temperature", None)
+            return client.responses.create(**kwargs)
+        raise
+
+
 def _respond(
     model: str,
     system: str,
     user: str,
     max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    temperature: Optional[float] = DEFAULT_TEMPERATURE,
 ) -> str:
     """
     СИНХРОННЫЙ вызов Responses API.
-    Важно: используем max_output_tokens (новый SDK).
+    Используем max_output_tokens, temperature добавляем опционально.
     """
     client = _client_singleton()
 
-    resp = client.responses.create(
+    kwargs = dict(
         model=model,
         input=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         max_output_tokens=max_output_tokens,
-        temperature=temperature,
     )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
-    # Удобное поле новой SDK
+    resp = _create_response(client, **kwargs)
+
+    # Новая SDK: удобное поле output_text
     text = getattr(resp, "output_text", None)
     if text:
         return str(text).strip()
 
-    # Фолбэк на явный разбор структуры (на всякий случай)
+    # Фолбэк на явный разбор структуры
     parts: List[str] = []
     output = getattr(resp, "output", None)
     if isinstance(output, list):
@@ -76,11 +94,9 @@ async def _respond_async(
     system: str,
     user: str,
     max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    temperature: Optional[float] = DEFAULT_TEMPERATURE,
 ) -> str:
-    """
-    Асинхронная обёртка, чтобы не блокировать event loop телеграм-бота.
-    """
+    """Асинхронная обёртка, чтобы не блокировать event loop."""
     return await asyncio.to_thread(
         _respond, model, system, user, max_output_tokens, temperature
     )
@@ -89,9 +105,7 @@ async def _respond_async(
 # ---------------- Публичные функции (синхронные) ----------------
 
 def quick_classify(labeling_prompt: str) -> str:
-    """
-    Быстрые короткие классификации/теги — дешёвая nano-модель.
-    """
+    """Быстрая короткая классификация (дешёвая nano-модель)."""
     system = (
         "Ты коротко и точно классифицируешь вход. "
         "Отвечай одной строкой без лишних слов."
@@ -106,9 +120,7 @@ def quick_classify(labeling_prompt: str) -> str:
 
 
 def fx_digest_ru(pairs_state: Dict[str, str]) -> str:
-    """
-    Человеческий краткий дайджест по заданным валютным парам (RU).
-    """
+    """Краткий дайджест по заданным форекс-парам (RU)."""
     pairs_list = ", ".join(pairs_state.keys()) if pairs_state else "USDJPY, AUDUSD, EURUSD, GBPUSD"
 
     system = (
@@ -136,9 +148,7 @@ def fx_digest_ru(pairs_state: Dict[str, str]) -> str:
 
 
 def deep_analysis(question: str, context: str = "") -> str:
-    """
-    Глубокий структурированный разбор (RU).
-    """
+    """Глубокий структурированный разбор (RU)."""
     system = (
         "Ты аналитик-объяснитель: делай структурированные и практичные выводы. "
         "Сначала краткий вывод (1–2 предложения), затем маркированные пункты."
@@ -157,18 +167,18 @@ def deep_analysis(question: str, context: str = "") -> str:
 
 async def llm_ping() -> bool:
     """
-    Дешёвый «пинг» LLM. Возвращает True, если ключ задан и модель отвечает.
+    Дешёвый «пинг» LLM. True — если ключ задан и модель отвечает.
+    Не передаём temperature, чтобы исключить 400 у «строгих» моделей.
     """
     try:
         if not os.environ.get("OPENAI_API_KEY"):
             return False
-        # Минимальный вызов (1 токен вывода)
         await _respond_async(
             model=LLM_NANO,
             system="Ты проверочный зонд. Отвечай одной буквой.",
             user="ping",
             max_output_tokens=1,
-            temperature=0.0,
+            temperature=None,
         )
         return True
     except Exception:
@@ -181,14 +191,12 @@ async def generate_digest(
     token_budget: int = 30000,
 ) -> str:
     """
-    Генерирует краткий RU-дайджест по списку форекс-пар.
-    Совместим по сигнатуре с вызовом из fa_bot.py.
+    Короткий RU-дайджест по списку форекс-пар.
+    Совместим со вызовом из fa_bot.py.
     """
     mdl = (model or LLM_MINI).strip()
-    # Консервативный лимит вывода под суточный бюджет
     max_out = max(200, min(500, (token_budget // 50) if token_budget else 400))
 
-    # Удобные ярлыки вида USD/JPY
     pretty = {
         "USDJPY": "USD/JPY",
         "AUDUSD": "AUD/USD",
@@ -196,7 +204,6 @@ async def generate_digest(
         "GBPUSD": "GBP/USD",
     }
 
-    # Порядок и защита от мусора
     ordered = [s for s in (symbols or []) if isinstance(s, str)]
     if not ordered:
         ordered = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
@@ -222,10 +229,10 @@ async def generate_digest(
             system=system,
             user=user,
             max_output_tokens=max_out,
+            # temperature оставляем по умолчанию (с fallback в _create_response)
             temperature=0.3,
         )
     except Exception as e:
-        # Прозрачная ошибка, чтобы бот мог показать пользователю
         return f"LLM ошибка: {e}"
 
     # Нормализуем вывод к ожидаемому списку пар
