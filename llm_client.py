@@ -1,6 +1,7 @@
 # llm_client.py
-# Полная версия с fallback: если модель не поддерживает temperature,
-# повторяем запрос без него. Совместимо с fa_bot.py.
+# Полная версия: совместима с fa_bot.py
+# - async generate_digest(...) и llm_ping()
+# - fallback: если модель не принимает "temperature", повторяем без него
 
 import os
 import asyncio
@@ -21,6 +22,7 @@ _client: Optional[OpenAI] = None
 def _client_singleton() -> OpenAI:
     """
     Ленивая инициализация OpenAI клиента.
+    Бросит KeyError, если нет OPENAI_API_KEY.
     """
     global _client
     if _client is None:
@@ -32,14 +34,13 @@ def _client_singleton() -> OpenAI:
 def _create_response(client: OpenAI, **kwargs):
     """
     Обёртка с авто-ретраем: если модель не поддерживает temperature,
-    повторяем без него.
+    повторяем запрос без этого параметра.
     """
     try:
         return client.responses.create(**kwargs)
     except Exception as e:
         msg = str(e).lower()
         if "temperature" in msg and "not supported" in msg:
-            # убрать temperature и повторить
             kwargs.pop("temperature", None)
             return client.responses.create(**kwargs)
         raise
@@ -54,7 +55,7 @@ def _respond(
 ) -> str:
     """
     СИНХРОННЫЙ вызов Responses API.
-    Используем max_output_tokens, temperature добавляем опционально.
+    Используем max_output_tokens; temperature опционален.
     """
     client = _client_singleton()
 
@@ -167,22 +168,29 @@ def deep_analysis(question: str, context: str = "") -> str:
 
 async def llm_ping() -> bool:
     """
-    Дешёвый «пинг» LLM. True — если ключ задан и модель отвечает.
-    Не передаём temperature, чтобы исключить 400 у «строгих» моделей.
+    Проверка доступности LLM:
+    - убеждаемся, что ключ задан
+    - пробуем сделать минимальный вызов на одной из доступных моделей
+      (порядок: mini -> major -> nano)
+    - не передаём temperature, чтобы избежать 400 у «строгих» моделей
     """
-    try:
-        if not os.environ.get("OPENAI_API_KEY"):
-            return False
-        await _respond_async(
-            model=LLM_NANO,
-            system="Ты проверочный зонд. Отвечай одной буквой.",
-            user="ping",
-            max_output_tokens=1,
-            temperature=None,
-        )
-        return True
-    except Exception:
+    if not os.environ.get("OPENAI_API_KEY"):
         return False
+
+    models_to_try = [LLM_MINI, LLM_MAJOR, LLM_NANO]
+    for mdl in models_to_try:
+        try:
+            await _respond_async(
+                model=mdl,
+                system="Проверка связи. Ответь одной буквой.",
+                user="ping",
+                max_output_tokens=1,
+                temperature=None,
+            )
+            return True
+        except Exception:
+            continue
+    return False
 
 
 async def generate_digest(
@@ -192,7 +200,7 @@ async def generate_digest(
 ) -> str:
     """
     Короткий RU-дайджест по списку форекс-пар.
-    Совместим со вызовом из fa_bot.py.
+    Совместим по сигнатуре с вызовом из fa_bot.py.
     """
     mdl = (model or LLM_MINI).strip()
     max_out = max(200, min(500, (token_budget // 50) if token_budget else 400))
@@ -229,7 +237,8 @@ async def generate_digest(
             system=system,
             user=user,
             max_output_tokens=max_out,
-            # temperature оставляем по умолчанию (с fallback в _create_response)
+            # temperature можно передать; если модель «строгая»,
+            # _create_response автоматически повторит без него
             temperature=0.3,
         )
     except Exception as e:
