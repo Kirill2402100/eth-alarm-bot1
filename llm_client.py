@@ -1,124 +1,111 @@
 # llm_client.py
-# ----------------
-# Клиент LLM для дайджеста. Использует OpenAI Responses API.
-# Работает только с поддерживаемыми параметрами (model, input, max_output_tokens).
+# Лёгкий клиент к OpenAI Responses API без temperature/max_tokens,
+# чтобы не ловить "unsupported parameter".
 
+from __future__ import annotations
 import os
-from typing import List, Dict
+import httpx
+import asyncio
+from typing import List
 
-try:
-    from openai import OpenAI
-except Exception:  # библиотека не установлена — дадим мягкий фолбэк
-    OpenAI = None  # type: ignore
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
 
-# Модели из переменных окружения
-MODEL_MINI = os.environ.get("LLM_MINI", "gpt-5-mini").strip()
-MODEL_NANO = os.environ.get("LLM_NANO", "gpt-5-nano").strip()
-
-# Ограничение длины вывода; примерно ~4 слова на 1 токен
-MAX_OUT = int(os.environ.get("LLM_MAX_OUT", "700"))  # хватает на 4 пары по 2–3 пункта
-
-PAIR_NAMES: Dict[str, str] = {
-    "USDJPY": "USD/JPY",
-    "AUDUSD": "AUD/USD",
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
+HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}",
+    "Content-Type": "application/json",
 }
 
-
-def llm_ready() -> tuple[bool, str]:
-    """Лёгкая проверка наличия ключа и клиента."""
-    if not os.environ.get("OPENAI_API_KEY"):
-        return False, "OPENAI_API_KEY not set"
-    if OpenAI is None:
-        return False, "openai SDK is not installed"
-    return True, "ok"
+class LLMError(RuntimeError):
+    pass
 
 
-def _client() -> OpenAI:
-    key = os.environ.get("OPENAI_API_KEY", "")
-    return OpenAI(api_key=key)
+async def _post_json(path: str, payload: dict) -> dict:
+    if not OPENAI_API_KEY:
+        raise LLMError("OPENAI_API_KEY is empty")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(f"{OPENAI_BASE_URL}{path}", headers=HEADERS, json=payload)
+        # Пробуем вытащить тело при ошибке для логов
+        if resp.status_code >= 400:
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"text": await resp.aread()}
+            raise LLMError(f"HTTP {resp.status_code}: {data}")
+        return resp.json()
 
 
-def _pair_list_for_prompt(symbols: List[str]) -> str:
-    lines = []
+def _build_digest_prompt(symbols: List[str]) -> str:
+    pairs_ru = {
+        "USDJPY": "USD/JPY",
+        "AUDUSD": "AUD/USD",
+        "EURUSD": "EUR/USD",
+        "GBPUSD": "GBP/USD",
+    }
+    lines = [
+        "Ты — финансовый аналитик. Дай короткий человеческий дайджест по валютным парам.",
+        "Формат: по одной строке на каждую пару, максимум 20–25 слов.",
+        "Стиль — простой русский, без жаргона. Если явных факторов нет, пиши «фон спокойный; обычный режим».",
+        "Не выдумывай фактов и дат. Если контекст неочевиден — давай нейтральную, осторожную формулировку.",
+        "",
+        "Пары для дайджеста:",
+    ]
     for s in symbols:
-        name = PAIR_NAMES.get(s.upper(), f"{s[:3]}/{s[3:]}")
-        lines.append(f"- {name}")
+        lines.append(f"- {pairs_ru.get(s, s)}")
+    lines += [
+        "",
+        "Выводи ТОЛЬКО строки дайджеста без префейсов и пояснений.",
+    ]
     return "\n".join(lines)
 
 
-def _postprocess_blocks(raw_text: str, ordered_symbols: List[str]) -> str:
+def _extract_output_text(data: dict) -> str:
     """
-    Аккуратно собираем куски в порядке запрошенных символов.
-    Если по паре ничего не нашлось — вставляем нейтральный фолбэк.
+    Responses API (2024+): у ответа есть поле output_text.
+    Делаем аккуратный парсинг на случай изменений.
     """
-    text = (raw_text or "").strip()
-    if not text:
-        return ""
+    if isinstance(data, dict):
+        if "output_text" in data and isinstance(data["output_text"], str):
+            return data["output_text"].strip()
 
-    blocks: list[str] = []
+        # Иногда бывает структура с 'output' -> list of blocks
+        out = data.get("output")
+        if isinstance(out, list):
+            chunks = []
+            for item in out:
+                # text block
+                t = item.get("content") if isinstance(item, dict) else None
+                if isinstance(t, str):
+                    chunks.append(t)
+            if chunks:
+                return "\n".join(chunks).strip()
 
-    # Простая стратегия: ищем по подстроке "<b>PAIR</b>"
-    for sym in ordered_symbols:
-        name = PAIR_NAMES.get(sym, f"{sym[:3]}/{sym[3:]}")
-        marker = f"<b>{name}</b>"
-        ix = text.find(marker)
-        if ix == -1:
-            blocks.append(f"<b>{name}</b> — фон спокойный; обычный режим.")
-            continue
-        # граница следующего блока — следующее появление "<b>"
-        jx = text.find("<b>", ix + 3)
-        if jx == -1:
-            seg = text[ix:].strip()
-        else:
-            seg = text[ix:jx].strip()
-        if not seg:
-            seg = f"<b>{name}</b> — фон спокойный; обычный режим."
-        blocks.append(seg)
-
-    return "\n\n".join(blocks)
+    # Последняя попытка: весь json строкой
+    return str(data)
 
 
-async def make_digest_for_pairs(symbols: List[str]) -> str:
+async def llm_ping() -> bool:
+    """Простой «пинг» — проверяем наличие ключа. Этого достаточно для /diag."""
+    return bool(OPENAI_API_KEY)
+
+
+async def generate_digest(
+    symbols: List[str],
+    model: str = "gpt-5-mini",
+    token_budget: int = 1200,
+) -> str:
     """
-    Возвращает короткий дайджест по 1 или нескольким парам на русском.
-    Формат (на пару):
-      <b>PAIR</b> — заголовок (1 строка)
-      • Факт 1
-      • Факт 2
-      • Факт 3 (если есть)
-      Что делаем: короткое правило.
+    Генерирует короткий дайджест по списку валютных пар.
+    Без temperature и без max_tokens — только max_completion_tokens,
+    чтобы не ловить ошибки «unsupported parameter».
     """
-    ok, msg = llm_ready()
-    if not ok:
-        raise RuntimeError(f"LLM not ready: {msg}")
-
-    syms = [s.upper() for s in symbols]
-    prompt = f"""
-Ты — макро/FX аналитик. Напиши краткий русскоязычный дайджест по парам:
-{_pair_list_for_prompt(syms)}
-
-Формат для КАЖДОЙ пары строго такой (без лишних префиксов/подзаголовков между парами):
-
-<b>PAIR</b> — краткий заголовок (1 строка)
-• Факт 1 (макро/ЦБ/доходности/сырьё/спрэд/вола)
-• Факт 2
-• Факт 3 (если есть)
-Что делаем: короткое правило (напр. «окна тишины к CPI 12:30 UTC», «резерв OFF», «обычный режим»).
-
-Пиши по делу, 2–3 маркера на пару. Если по паре нет важных событий — так и напиши «фон спокойный; обычный режим».
-    """.strip()
-
-    client = _client()
-    # Responses API — только поддерживаемые поля
-    resp = client.responses.create(
-        model=MODEL_MINI,
-        input=prompt,
-        max_output_tokens=MAX_OUT,
-    )
-    raw = (resp.output_text or "").strip()
-
-    # Приводим к стабильно читаемому формату
-    final_text = _postprocess_blocks(raw, syms)
-    return final_text or raw or ""
+    prompt = _build_digest_prompt(symbols)
+    payload = {
+        "model": model,
+        "input": prompt,
+        # ограничиваем ответ: много не нужно, и это совместимо с Responses API
+        "max_completion_tokens": min(500, max(64, token_budget // 10)),
+    }
+    data = await _post_json("/responses", payload)
+    return _extract_output_text(data)
