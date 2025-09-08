@@ -4,7 +4,7 @@ __pycache__/
 .venv/
 venv/
 env/
-
+*.log
 # secrets
 .env
 service_account.json
