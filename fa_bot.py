@@ -9,14 +9,14 @@
 #   /alloc                  — расчёт сумм и готовые /setbank для чатов
 #   /digest                 — «человеческий» дайджест (по всем парам в мастере, по одной — в профильных чатах)
 #   /ping                   — проверка ответа
-#   /check_sheets           — диагностика подключения Google Sheets (создаёт лист FA_Signals при необходимости)
+#   /check_sheets           — диагностика подключения Google Sheets (создаёт лист FA_Signals)
+#   /diag                   — короткая диагностика окружения (LLM / Sheets / переменные)
 
 import asyncio
 import base64
 import json
 import logging
 import os
-from datetime import datetime
 from typing import Dict, List, Tuple
 
 import gspread
@@ -31,7 +31,7 @@ from telegram.ext import (
 # Rate limiter (если установлен)
 try:
     from telegram.ext import AIORateLimiter
-except Exception:  # библиотека без экстры
+except Exception:
     AIORateLimiter = None  # type: ignore
 
 import llm_client
@@ -79,6 +79,7 @@ log = logging.getLogger("fund_bot")
 # -----------------------
 
 def _read_creds_any():
+    """Читаем сервисный JSON из GOOGLE_CREDENTIALS / GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS_B64."""
     raw = os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not raw:
         b64 = os.environ.get("GOOGLE_CREDENTIALS_B64")
@@ -130,7 +131,6 @@ def pairs_for_chat(chat_id: int) -> List[str]:
     """Мастер-чат → все пары; профильный чат → своя пара; иначе USDJPY."""
     if MASTER_CHAT_ID and chat_id == MASTER_CHAT_ID:
         return ALL_PAIRS[:]
-    # поиск по маппингу
     for sym, cid in SYMBOL_CHAT_MAP.items():
         if int(cid) == int(chat_id):
             return [sym.upper()]
@@ -148,7 +148,6 @@ def compute_allocation(total: float, weights: Dict[str, float]) -> Dict[str, flo
         "EURUSD": total * (weights.get("EUR", 0) / 100.0),
         "GBPUSD": total * (weights.get("GBP", 0) / 100.0),
     }
-    # Округляем до целого USDT для красоты
     return {k: round(v) for k, v in parts.items()}
 
 
@@ -187,17 +186,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Sheets статус
     sheet_mark = "❌"
     try:
-        _ = os.environ.get("SHEET_ID")
-        data, err = _read_creds_any()
-        if _ and not err:
+        _sid = os.environ.get("SHEET_ID")
+        _data, err = _read_creds_any()
+        if _sid and not err:
             sheet_mark = "✅"
-        else:
-            sheet_mark = "❌"
     except Exception:
         sheet_mark = "❌"
 
     txt = (
-        f"Фунд-бот запущен { '✅' }  LLM: {llm_mark}  Sheets: {sheet_mark}.\n\n"
+        f"Фунд-бот запущен ✅  LLM: {llm_mark}  Sheets: {sheet_mark}.\n\n"
         f"Привет! Я фунд-бот.\nТекущий чат id: <code>{chat_id}</code>\n\n"
         f"Команды: /help"
     )
@@ -213,7 +210,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/alloc</code> — расчёт сумм и готовые команды <code>/setbank</code> для торговых чатов.\n"
         "• <code>/digest</code> — короткий «человеческий» дайджест по USDJPY / AUDUSD / EURUSD / GBPUSD.\n"
         "• <code>/ping</code> — проверить связь.\n"
-        "• <code>/check_sheets</code> — диагностика подключения к Google Sheets.\n\n"
+        "• <code>/check_sheets</code> — проверка Google Sheets (создаст лист FA_Signals).\n"
+        "• <code>/diag</code> — диагностика окружения (LLM/Sheets/переменные).\n\n"
         "Банк по парам задаётся вручную в торговых чатах; я сверяю распределение и даю советы/дайджест."
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -286,7 +284,6 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await llm_client.make_digest_for_pairs(syms)
         if not text or not text.strip():
-            # надёжный фолбэк
             blocks = []
             for s in syms:
                 pretty = f"{s[:3]}/{s[3:]}"
@@ -325,6 +322,38 @@ async def cmd_check_sheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=f"Sheets: ❌ {e}")
 
 
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Короткая диагностика окружения."""
+    chat_id = update.effective_chat.id
+
+    # LLM
+    llm_ok, llm_msg = llm_client.llm_ready()
+    llm_line = f"LLM: {'✅ ok' if llm_ok else '❌ ' + llm_msg}"
+
+    # Sheets
+    sid = os.environ.get("SHEET_ID") or ""
+    creds_msg = "not set"
+    ce = ""
+    try:
+        data, err = _read_creds_any()
+        if err:
+            creds_msg = err
+        else:
+            ce = str(data.get("client_email", ""))
+            creds_msg = "loaded"
+    except Exception as e:
+        creds_msg = f"error: {e}"
+
+    sheet_line = f"Sheets: SID={'set' if sid else 'missing'}, CREDS={creds_msg}"
+    svc_line = f"Service account: <code>{ce or 'n/a'}</code>"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{llm_line}\n{sheet_line}\n{svc_line}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # -----------------------
 # Инициализация и запуск
 # -----------------------
@@ -341,22 +370,13 @@ def add_handlers(app: Application):
 
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("check_sheets", cmd_check_sheets))
+    app.add_handler(CommandHandler("diag", cmd_diag))
 
 
-def build_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-
-    builder = Application.builder().token(BOT_TOKEN)
-    if AIORateLimiter is not None:
-        builder = builder.rate_limiter(AIORateLimiter())
-
-    app = builder.build()
-    add_handlers(app)
-
-    # Команды в меню бота
+async def _post_init(application: Application):
+    """Установим команды в меню (корректный await, без предупреждений)."""
     try:
-        app.bot.set_my_commands([
+        await application.bot.set_my_commands([
             BotCommand("help", "что умею"),
             BotCommand("digest", "дайджест по парам"),
             BotCommand("weights", "показать веса"),
@@ -364,17 +384,29 @@ def build_app() -> Application:
             BotCommand("settotal", "задать общий банк (только мастер)"),
             BotCommand("alloc", "рассчитать распределение"),
             BotCommand("check_sheets", "проверка Google Sheets"),
+            BotCommand("diag", "диагностика окружения"),
             BotCommand("ping", "проверка связи"),
         ])
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+
+
+def build_app() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    builder = Application.builder().token(BOT_TOKEN).post_init(_post_init)
+    if AIORateLimiter is not None:
+        builder = builder.rate_limiter(AIORateLimiter())
+
+    app = builder.build()
+    add_handlers(app)
     return app
 
 
 def main():
     log.info("Fund bot is running…")
     app = build_app()
-    # webhooks не включаем, работаем на getUpdates
     app.run_polling(close_loop=False)
 
 
