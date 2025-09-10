@@ -1,628 +1,563 @@
 # calendar_collector.py
-# Вытягивает:
-#  A) Календарь (запланированное — FOMC/ECB/BoE/BoJ + источники)
-#  B) Новости (пресс-релизы ЦБ/Минфинов, без «мусора» навигации)
-#  C) Лёгкую FA-оценку и агрегированную выжимку для INVESTOR_DIGEST
-#
-# Требуемые ENV:
-#   SHEET_ID
-#   GOOGLE_CREDENTIALS_JSON_B64 (или GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS)
-#   CAL_WS_OUT=CALENDAR
-#   CAL_WS_RAW=NEWS
-#   FREE_LOOKBACK_DAYS=7
-#   FREE_LOOKAHEAD_DAYS=30
-#   COLLECT_EVERY_MIN=120   (если RUN_FOREVER=1)
-#   RUN_FOREVER=1|0
-#   JINA_PROXY=1|0
-#   LOCAL_TZ=Europe/Belgrade
-#
-# Дополнительно (необязательные): QUIET_BEFORE_MIN, QUIET_AFTER_MIN
-
 from __future__ import annotations
 
-import os, json, time, re, logging
+import os, re, json, base64, time, logging
 from dataclasses import dataclass
+from typing import Optional, List, Dict, Iterable
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
-from urllib.parse import urljoin
 
-# --- logging ---
+# --- TZ ---
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else None
+
+# --- HTTP ---
+import httpx
+
+# --- Google Sheets ---
+try:
+    import gspread
+    from google.oauth2 import service_account
+    _GSHEETS_AVAILABLE = True
+except Exception:
+    gspread = None
+    service_account = None
+    _GSHEETS_AVAILABLE = False
+
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("calendar_collector")
 
-# --- tz ---
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
-LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else None
-
-# --- http ---
-try:
-    import httpx
-except Exception:
-    httpx = None
-
-# --- parsing ---
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-# --- sheets ---
-try:
-    import gspread
-    from google.oauth2 import service_account
-    _GSHEETS = True
-except Exception:
-    gspread = None
-    service_account = None
-    _GSHEETS = False
-
-# ----------------- ENV -----------------
+# ---------------- ENV ----------------
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
-CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
-CAL_WS_RAW = os.getenv("CAL_WS_RAW", "NEWS").strip() or "NEWS"
 
-RUN_FOREVER = os.getenv("RUN_FOREVER", "1").lower() in ("1", "true", "yes", "on")
-COLLECT_EVERY_MIN = int(os.getenv("COLLECT_EVERY_MIN", "180") or "180")
+CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
+CAL_WS_RAW = os.getenv("CAL_WS_RAW", "CALENDAR_RAW").strip() or "CALENDAR_RAW"  # не обязателен; можно не использовать
+
+RUN_FOREVER = (os.getenv("RUN_FOREVER", "1").lower() in ("1","true","yes","on"))
+COLLECT_EVERY_MIN = int(os.getenv("COLLECT_EVERY_MIN", "20") or "20")
 
 FREE_LOOKBACK_DAYS = int(os.getenv("FREE_LOOKBACK_DAYS", "7") or "7")
 FREE_LOOKAHEAD_DAYS = int(os.getenv("FREE_LOOKAHEAD_DAYS", "30") or "30")
 
-QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45") or "45")
-QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45") or "45")
+JINA_PROXY = os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/"
 
-USE_JINA = os.getenv("JINA_PROXY", "1").lower() in ("1","true","yes","on")
+# --- Strict FA from NEWS (патч) ---
+ALLOWED_SOURCES = {
+    s.strip().upper() for s in os.getenv(
+        "FA_NEWS_SOURCES",
+        "US_FED_PR,ECB_PR,BOE_PR,BOJ_PR,RBA_MR,US_TREASURY,JP_MOF_FX"
+    ).split(",") if s.strip()
+}
+KW_RE = re.compile(os.getenv(
+    "FA_NEWS_KEYWORDS",
+    "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|intervention|FX intervention"
+), re.I)
+FA_NEWS_RECENT_MIN = int(os.getenv("FA_NEWS_RECENT_MIN", "30"))
+FA_NEWS_MIN_COUNT  = int(os.getenv("FA_NEWS_MIN_COUNT", "2"))
+FA_NEWS_LOCK_MIN   = int(os.getenv("FA_NEWS_LOCK_MIN",  "30"))
+FA_NEWS_TTL_MIN    = int(os.getenv("FA_NEWS_TTL_MIN",  "120"))
 
-# ----------------- CONSTANTS -----------------
-CAL_HEADERS = ["utc_iso","local_time","country","currency","title","impact","source","url"]
-NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
-FA_HEADERS = ["pair","risk","bias","ttl","updated_at","scan_lock_until","reserve_off","dca_scale","reason","risk_pct"]
-
-PAIR_LIST = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
+SYMBOLS = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
 PAIR_COUNTRIES = {
     "USDJPY": {"united states", "japan"},
     "AUDUSD": {"australia", "united states"},
     "EURUSD": {"euro area", "united states"},
     "GBPUSD": {"united kingdom", "united states"},
 }
-PAIR_CCY = {"USDJPY":"JPY","AUDUSD":"AUD","EURUSD":"EUR","GBPUSD":"GBP"}
 
-# ----------------- UTILS -----------------
-def _decode_b64_json(s: str) -> Optional[dict]:
+# ---------------- Sheets helpers ----------------
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def _decode_b64_to_json(s: str) -> Optional[dict]:
     s = (s or "").strip()
-    if not s:
-        return None
-    import base64
+    if not s: return None
     s += "=" * ((4 - len(s) % 4) % 4)
     try:
-        return json.loads(base64.b64decode(s).decode("utf-8", "strict"))
+        return json.loads(base64.b64decode(s).decode("utf-8","strict"))
     except Exception:
         return None
 
-def _sheets_client():
-    if not _GSHEETS:
+def _load_service_info() -> Optional[dict]:
+    info = _decode_b64_to_json(os.getenv("GOOGLE_CREDENTIALS_JSON_B64",""))
+    if info:
+        return info
+    for k in ("GOOGLE_CREDENTIALS_JSON","GOOGLE_CREDENTIALS"):
+        raw = os.getenv(k, "").strip()
+        if raw:
+            try:
+                return json.loads(raw)
+            except Exception:
+                pass
+    return None
+
+def build_sheets_client(sheet_id: str):
+    if not _GSHEETS_AVAILABLE:
         return None, "gsheets libs not installed"
-    info = _decode_b64_json(os.getenv("GOOGLE_CREDENTIALS_JSON_B64", "")) \
-           or _decode_b64_json(os.getenv("GOOGLE_CREDENTIALS_B64", ""))
-
+    if not sheet_id:
+        return None, "SHEET_ID empty"
+    info = _load_service_info()
     if not info:
-        # прямой JSON в переменной
-        for k in ("GOOGLE_CREDENTIALS_JSON","GOOGLE_CREDENTIALS"):
-            raw = os.getenv(k, "").strip()
-            if raw:
-                try:
-                    info = json.loads(raw)
-                    break
-                except Exception:
-                    pass
-    if not info:
-        return None, "no credentials in env"
-
+        return None, "no service account json"
     try:
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
         gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SHEET_ID)
+        sh = gc.open_by_key(sheet_id)
         return sh, "ok"
     except Exception as e:
         return None, f"auth/open error: {e}"
 
-def _ensure_ws(sh, title: str, headers: List[str]):
-    try:
-        ws = sh.worksheet(title)
-        # сверим шапку
-        cur = ws.get_values("A1:Z1") or [[]]
-        if (cur and cur[0] != headers):
-            ws.update(range_name="A1", values=[headers])
-        return ws
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=1000, cols=max(10, len(headers)))
-        ws.update(range_name="A1", values=[headers])
-        return ws
+def ensure_worksheet(sh, title: str, headers: List[str]):
+    for ws in sh.worksheets():
+        if ws.title == title:
+            try:
+                cur = ws.get_values("A1:Z1") or [[]]
+                if not cur or cur[0] != headers:
+                    ws.update(range_name="A1", values=[headers])
+            except Exception:
+                pass
+            return ws, False
+    ws = sh.add_worksheet(title=title, rows=200, cols=max(10, len(headers)))
+    ws.update(range_name="A1", values=[headers])
+    return ws, True
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def _to_utc_iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _fmt_local(dt_utc: datetime) -> str:
-    if not dt_utc: return ""
+def _localize(dt: datetime) -> datetime:
     if LOCAL_TZ:
-        return dt_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-    return dt_utc.strftime("%Y-%m-%d %H:%M")
+        return dt.astimezone(LOCAL_TZ)
+    return dt
 
-# ----------------- HTTP -----------------
-def fetch(url: str, timeout: float = 20.0) -> str:
-    if not httpx:
-        return ""
+# ---------------- HTTP helpers ----------------
+def fetch_text(url: str, timeout=15.0) -> tuple[str, int, str]:
+    """
+    Возвращает (text, status_code, final_url). При 403/404 пытается через Jina proxy.
+    """
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        }) as cli:
+        with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent":"Mozilla/5.0 (compatible; LPBot/1.0)"}) as cli:
             r = cli.get(url)
-            if r.status_code == 200:
-                return r.text
-            # fallback на r.jina.ai при запрете/редиректе
-            if USE_JINA and r.status_code in (301,302,403,404):
-                proxy = "https://r.jina.ai/http://" + url.replace("https://","").replace("http://","")
-                r2 = cli.get(proxy)
-                if r2.status_code == 200:
-                    return r2.text
+            if r.status_code in (403,404):
+                # proxy
+                pr = cli.get(JINA_PROXY + url.replace("://", "://"))
+                return pr.text, pr.status_code, pr.url.__str__()
+            return r.text, r.status_code, r.url.__str__()
+    except Exception as e:
+        log.warning("fetch failed %s: %s", url, e)
+        return "", 0, url
+
+# ---------------- Models ----------------
+@dataclass
+class CalEvent:
+    utc: datetime             # UTC datetime
+    country: str              # 'united states'
+    currency: str             # 'USD' (может быть пусто)
+    title: str                # 'FOMC Meeting / Rate Decision'
+    impact: str               # 'high'
+    source: str               # 'FOMC'
+    url: str
+
+    def to_row(self) -> List[str]:
+        local = _localize(self.utc)
+        return [
+            _to_utc_iso(self.utc),
+            local.strftime("%Y-%m-%d %H:%M"),
+            self.country, self.currency, self.title, self.impact, self.source, self.url
+        ]
+
+CAL_HEADERS = ["utc_iso","local_time","country","currency","title","impact","source","url"]
+
+NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
+
+# ---------------- Calendar scrapers ----------------
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January","February","March","April","May","June","July","August","September","October","November","December"], start=1)}
+
+def _parse_month_day_year(s: str) -> Optional[datetime]:
+    """
+    Парсит строки вида 'September 11, 2025' | 'Sep 11, 2025' | 'Sept 11, 2025'
+    """
+    s = s.strip()
+    m = re.search(r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:–\d{1,2})?,\s*(20\d{2})", s, re.I)
+    if not m:
+        return None
+    mon = m.group(1).lower()[:3]
+    month = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}.get(mon)
+    if not month:
+        return None
+    day = int(m.group(2))
+    year = int(m.group(3))
+    # время для решения: 18:00Z / 14:00Z очень плавает; ставим 14:00Z как безопасную «середину»
+    return datetime(year, month, day, 14, 0, 0, tzinfo=timezone.utc)
+
+def parse_fomc_calendar(text: str, url: str) -> List[CalEvent]:
+    """
+    Простая эвристика: собираем все 'Month DD, YYYY' возле слов 'Meeting'/'FOMC'
+    """
+    out: List[CalEvent] = []
+    for m in re.finditer(r"(?:FOMC|Meeting)[^<>\n]{0,80}?(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:–\d{1,2})?,\s*20\d{2}", text, re.I):
+        dt = _parse_month_day_year(m.group(0))
+        if dt:
+            out.append(CalEvent(
+                utc=dt, country="united states", currency="USD",
+                title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
+            ))
+    # Дедуп по дате
+    uniq = {}
+    for ev in out:
+        uniq[ev.utc.date()] = ev
+    return list(uniq.values())
+
+def parse_boj_calendar(text: str, url: str) -> List[CalEvent]:
+    """
+    BoJ: ищем шаблоны yyyy.mm.dd вокруг 'Monetary Policy Meeting'.
+    """
+    out: List[CalEvent] = []
+    for m in re.finditer(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2}).{0,64}?Monetary Policy Meeting", text, re.I):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        dt = datetime(y, mo, d, 3, 0, 0, tzinfo=timezone.utc)  # утро по Токио ≈ 03:00Z
+        out.append(CalEvent(
+            utc=dt, country="japan", currency="JPY",
+            title="BoJ Monetary Policy Meeting", impact="high", source="BoJ", url=url
+        ))
+    # иногда страница без «Meeting» — соберём явные yyyy.mm.dd в таблицах, но ограничим кол-во
+    if not out:
+        for m in re.finditer(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", text):
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                dt = datetime(y, mo, d, 3, 0, 0, tzinfo=timezone.utc)
+                out.append(CalEvent(
+                    utc=dt, country="japan", currency="JPY",
+                    title="BoJ Monetary Policy Meeting", impact="high", source="BoJ", url=url
+                ))
+            except Exception:
+                pass
+    # дедуп
+    uniq = {}
+    for ev in out:
+        uniq[ev.utc.date()] = ev
+    return list(uniq.values())[:20]
+
+def collect_calendar() -> List[CalEvent]:
+    events: List[CalEvent] = []
+
+    # FOMC
+    url_fomc = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+    txt, code, f_url = fetch_text(url_fomc)
+    if code:
+        ev = parse_fomc_calendar(txt, f_url)
+        log.info("FOMC parsed: %d", len(ev))
+        events += ev
+
+    # BoJ
+    url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
+    txt, code, f_url = fetch_text(url_boj)
+    if code:
+        ev = parse_boj_calendar(txt, f_url)
+        log.info("BoJ parsed: %d", len(ev))
+        events += ev
+
+    # ECB / BoE заглушки (не падаем)
+    try:
+        url_ecb = "https://www.ecb.europa.eu/press/calendars/mgc/html/index.en.html"
+        txt, code, f_url = fetch_text(url_ecb)
+        if code and "Governing Council" in txt:
+            # можно доработать при необходимости
+            log.info("ECB parsed: heuristic=0")
     except Exception:
         pass
-    return ""
 
-# ----------------- CALENDAR PARSERS (минимально необходимые) -----------------
-def parse_fomc_calendar(html: str) -> List[dict]:
-    """Грубый парсер страницы FOMC calendars; возвращает «событие заседание/решение»."""
-    out = []
-    if not html:
-        return out
-    soup = BeautifulSoup(html, "html.parser") if BeautifulSoup else None
-    if not soup:
-        return out
-
-    # Ищем блоки таблиц с датами заседаний
-    txt = soup.get_text("\n", strip=True).lower()
-    # по ключевым словам формируем одно «опорное» событие в середине дня
-    # (точного часа нет на этой странице)
-    for m in re.finditer(r"fomc\s+meeting", txt):
-        # просто добавим placeholder на ближайшую середину дня сегодняшнего
-        dt = _now_utc().replace(hour=12, minute=0, second=0, microsecond=0)
-        out.append({
-            "utc": dt,
-            "country": "united states",
-            "currency": "USD",
-            "title": "FOMC Meeting / Rate Decision",
-            "impact": "high",
-            "source": "FOMC",
-            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-        })
-        break
-    return out
-
-def parse_ecb_govc(html: str) -> List[dict]:
-    out = []
-    if not html or not BeautifulSoup: return out
-    soup = BeautifulSoup(html, "html.parser")
-    # Говернинг каунсил: ищем govc / monetary policy meetings
-    for a in soup.select('a[href*="/press/calendars/"], a[href*="/press/govcdec/"]'):
-        title = (a.get_text(" ", strip=True) or "").strip()
-        if not title: continue
-        url = urljoin("https://www.ecb.europa.eu", a.get("href",""))
-        dt = _now_utc().replace(hour=11, minute=0, second=0, microsecond=0)
-        out.append({
-            "utc": dt, "country":"euro area","currency":"EUR",
-            "title": "ECB Governing Council / Decision",
-            "impact":"high","source":"ECB","url":url
-        })
-        break
-    return out
-
-def parse_boe_mpc(html: str) -> List[dict]:
-    out = []
-    if not html or not BeautifulSoup: return out
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.select('a[href*="/monetary-policy-summary"]'):
-        url = urljoin("https://www.bankofengland.co.uk", a.get("href",""))
-        dt = _now_utc().replace(hour=11, minute=0, second=0, microsecond=0)
-        out.append({
-            "utc": dt,"country":"united kingdom","currency":"GBP",
-            "title":"BoE Monetary Policy Summary / Decision",
-            "impact":"high","source":"BoE","url":url
-        })
-        break
-    return out
-
-def parse_boj_mpm(html: str) -> List[dict]:
-    out = []
-    if not html or not BeautifulSoup: return out
-    soup = BeautifulSoup(html, "html.parser")
-    if soup.find(string=re.compile(r"Monetary Policy Meeting", re.I)):
-        dt = _now_utc().replace(hour=3, minute=0, second=0, microsecond=0)
-        out.append({
-            "utc": dt, "country":"japan","currency":"JPY",
-            "title": "BoJ Monetary Policy Meeting",
-            "impact":"high","source":"BoJ",
-            "url":"https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm/"
-        })
-    return out
-
-# ----------------- NEWS PARSERS (чистые) -----------------
-def _clean_text(node) -> str:
-    if not node:
-        return ""
-    txt = node.get_text(" ", strip=True)
-    txt = re.sub(r"\s+", " ", txt)
-    blacklist = {"skip to main content", "back to home"}
-    return "" if txt.lower() in blacklist else txt
-
-def _guess_importance(title: str) -> str:
-    t = (title or "").lower()
-    hi = [
-        "emergency", "unscheduled", "intervention", "fx intervention",
-        "rate decision", "policy decision", "statement", "press conference",
-        "bank rate", "surprise", "guidance", "hike", "cut", "stability"
-    ]
-    md = ["minutes", "speech", "remarks", "testimony", "q&a", "fireside"]
-    if any(k in t for k in hi): return "high"
-    if any(k in t for k in md): return "medium"
-    return "low"
-
-def parse_fed_news(html: str) -> list[dict]:
-    if not html or not BeautifulSoup: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select('a[href*="/newsevents/pressreleases/"]'):
-        href = a.get("href", "")
-        title = _clean_text(a)
-        if not title or not href:
-            continue
-        url = urljoin("https://www.federalreserve.gov", href)
-        out.append({
-            "source": "US_FED_PR", "title": title, "url": url,
-            "countries": "united states", "ccy": "USD",
-            "importance_guess": _guess_importance(title)
-        })
-    return out
-
-def parse_ust_news(html: str) -> list[dict]:
-    if not html or not BeautifulSoup: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select('a[href*="/news/press-releases/"]'):
-        href = a.get("href", "")
-        title = _clean_text(a)
-        if not title or not href:
-            continue
-        url = urljoin("https://home.treasury.gov", href)
-        out.append({
-            "source": "US_TREASURY", "title": title, "url": url,
-            "countries": "united states", "ccy": "USD",
-            "importance_guess": _guess_importance(title)
-        })
-    return out
-
-def parse_boe_news(html: str) -> list[dict]:
-    if not html or not BeautifulSoup: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select('a[href^="/news/"]'):
-        href = a.get("href", "")
-        if not re.search(r"/news/\d{4}/", href or ""):
-            continue
-        title = _clean_text(a)
-        if not title:
-            continue
-        url = urljoin("https://www.bankofengland.co.uk", href)
-        out.append({
-            "source": "BOE_NEWS", "title": title, "url": url,
-            "countries": "united kingdom", "ccy": "GBP",
-            "importance_guess": _guess_importance(title)
-        })
-    return out
-
-def parse_ecb_pr(html: str) -> list[dict]:
-    if not html or not BeautifulSoup: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select('a[href*="/press/pr/"], a[href*="/press/govcdec/"]'):
-        href = a.get("href", "")
-        title = _clean_text(a)
-        if not title or not href:
-            continue
-        url = urljoin("https://www.ecb.europa.eu", href)
-        out.append({
-            "source": "ECB_PR", "title": title, "url": url,
-            "countries": "euro area", "ccy": "EUR",
-            "importance_guess": _guess_importance(title)
-        })
-    return out
-
-def parse_rba_media(html: str) -> list[dict]:
-    if not html or not BeautifulSoup: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select('a[href*="/media-releases/"]'):
-        href = a.get("href", "")
-        title = _clean_text(a)
-        if not title or not href:
-            continue
-        url = urljoin("https://www.rba.gov.au", href)
-        out.append({
-            "source": "RBA_MR", "title": title, "url": url,
-            "countries": "australia", "ccy": "AUD",
-            "importance_guess": _guess_importance(title)
-        })
-    return out
-
-def parse_mof_fx(html: str) -> list[dict]:
-    if not html or not BeautifulSoup: return []
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select('a[href], h2, h3'):
-        title = _clean_text(a)
-        if not title:
-            continue
-        t = title.lower()
-        if "intervention" in t or "foreign exchange" in t:
-            href = a.get("href", "")
-            url = urljoin("https://www.mof.go.jp", href) if href else "https://www.mof.go.jp/english/"
-            out.append({
-                "source": "JPN_MOF", "title": title, "url": url,
-                "countries": "japan", "ccy": "JPY",
-                "importance_guess": "high"
-            })
-    return out
-
-def collect_news_all(html_map: dict[str,str]) -> list[dict]:
-    items = []
-    items += parse_fed_news(html_map.get("fed",""))
-    items += parse_ust_news(html_map.get("ust",""))
-    items += parse_boe_news(html_map.get("boe",""))
-    items += parse_ecb_pr(html_map.get("ecb",""))
-    items += parse_rba_media(html_map.get("rba",""))
-    items += parse_mof_fx(html_map.get("mof",""))
-
-    # важность
-    items = [x for x in items if x.get("importance_guess") in ("high","medium")]
-    # хеш
-    for x in items:
-        x["hash"] = f'{x.get("source","")}|{x.get("title","")}'
-    # дедуп внутри батча
-    seen = set()
-    out = []
-    for x in items:
-        h = x["hash"]
-        if h in seen: 
-            continue
-        seen.add(h)
-        out.append(x)
-    return out
-
-# ----------------- SHEETS IO -----------------
-def _read_existing_hashes(ws, hash_col_letter="I") -> set:
     try:
-        vals = ws.col_values(ord(hash_col_letter)-ord("A")+1)[1:]  # без хедера
-        return set(v.strip() for v in vals if v.strip())
+        url_boe = "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes"
+        txt, code, f_url = fetch_text(url_boe)
+        log.info("BoE parsed: heuristic=0")
+    except Exception:
+        pass
+
+    return events
+
+# ---------------- NEWS scrapers ----------------
+@dataclass
+class NewsItem:
+    ts_utc: datetime
+    source: str
+    title: str
+    url: str
+    countries: str
+    ccy: str
+    tags: str
+    importance_guess: str
+
+    def key_hash(self) -> str:
+        base = f"{self.source}|{self.title}"
+        return re.sub(r"\s+", " ", base.strip())[:180]
+
+    def to_row(self) -> List[str]:
+        return [
+            _to_utc_iso(self.ts_utc),
+            self.source,
+            self.title,
+            self.url,
+            self.countries,
+            self.ccy,
+            self.tags,
+            self.importance_guess,
+            self.key_hash()
+        ]
+
+def _parse_time_attr(html: str) -> Optional[datetime]:
+    # простая попытка вытащить datetime из <time datetime="...">
+    m = re.search(r'<time[^>]+datetime="([^"]+)"', html, re.I)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1).replace("Z","+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def collect_news() -> List[NewsItem]:
+    items: List[NewsItem] = []
+    now = datetime.now(timezone.utc)
+
+    # --- FED PR
+    txt, code, url = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
+    if code:
+        # Берём первые 10 ссылок из списка
+        for m in re.finditer(r'<a[^>]+href="(/newsevents/pressreleases/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.federalreserve.gov" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            ts = _parse_time_attr(txt) or now
+            items.append(NewsItem(ts,"US_FED_PR",t,u,"united states","USD","policy","high"))
+
+    # --- US Treasury
+    txt, code, url = fetch_text("https://home.treasury.gov/news/press-releases")
+    if code:
+        for m in re.finditer(r'<a[^>]+href="(/news/press-releases/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://home.treasury.gov" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            ts = _parse_time_attr(txt) or now
+            items.append(NewsItem(ts,"US_TREASURY",t,u,"united states","USD","treasury","medium"))
+
+    # --- ECB PR
+    txt, code, url = fetch_text("https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release")
+    if code:
+        for m in re.finditer(r'<a[^>]+href="(/press/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.ecb.europa.eu" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            ts = _parse_time_attr(txt) or now
+            items.append(NewsItem(ts,"ECB_PR",t,u,"euro area","EUR","ecb","high" if KW_RE.search(t) else "medium"))
+
+    # --- BoE News
+    txt, code, url = fetch_text("https://www.bankofengland.co.uk/news")
+    if code:
+        for m in re.finditer(r'<a[^>]+href="(/news/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.bankofengland.co.uk" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            ts = now
+            items.append(NewsItem(ts,"BOE_PR",t,u,"united kingdom","GBP","boe","high" if KW_RE.search(t) else "medium"))
+
+    # --- RBA media releases
+    txt, code, url = fetch_text("https://www.rba.gov.au/media-releases/")
+    if code:
+        for m in re.finditer(r'<a[^>]+href="(/media-releases/\d{4}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.rba.gov.au" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            ts = now
+            items.append(NewsItem(ts,"RBA_MR",t,u,"australia","AUD","rba","high" if KW_RE.search(t) else "medium"))
+
+    # --- JP MoF FX intervention page (общая страница, без дат — просто флаг)
+    txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.html")
+    if code:
+        # Если на странице появились слова 'intervention'/ 'announcement' — добавим один пункт
+        if re.search(r"intervention|announcement", txt, re.I):
+            items.append(NewsItem(now,"JP_MOF_FX","FX intervention reference page",url,"japan","JPY","mof","high"))
+
+    log.info("NEWS collected: %d items", len(items))
+    return items
+
+# ---------------- NEWS → FA signals (strict) ----------------
+def _news_is_high(row: dict) -> bool:
+    if ALLOWED_SOURCES and row["source"].upper() not in ALLOWED_SOURCES:
+        return False
+    hay = f"{row['title']} {row['tags']}"
+    return bool(KW_RE.search(hay))
+
+def _read_news_rows(sh) -> List[dict]:
+    try:
+        ws = sh.worksheet("NEWS")
+    except Exception:
+        return []
+    rows = ws.get_all_records()
+    out = []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        out.append({
+            "ts_utc": ts,
+            "source": str(r.get("source","")).strip(),
+            "title":  str(r.get("title","")).strip(),
+            "url":    str(r.get("url","")).strip(),
+            "countries": str(r.get("countries","")).strip().lower(),
+            "ccy":    str(r.get("ccy","")).strip().upper(),
+            "tags":   str(r.get("tags","")).strip(),
+        })
+    return out
+
+def compute_fa_from_news(all_news: List[dict], now_utc: datetime) -> Dict[str, dict]:
+    window_start = now_utc - timedelta(minutes=FA_NEWS_RECENT_MIN)
+    recent = [r for r in all_news if r["ts_utc"] >= window_start and _news_is_high(r)]
+
+    # агрегируем по странам
+    cty_hits: dict[str, int] = {}
+    for r in recent:
+        for c in [x.strip() for x in (r["countries"] or "").split(",") if x.strip()]:
+            cty_hits[c] = cty_hits.get(c, 0) + 1
+
+    out: Dict[str, dict] = {}
+    for sym, countries in PAIR_COUNTRIES.items():
+        cnt = sum(cty_hits.get(c, 0) for c in countries)
+        is_red = cnt >= FA_NEWS_MIN_COUNT
+        risk = "Red" if is_red else "Green"
+        bias = "neutral"
+        scan_lock_until = (now_utc + timedelta(minutes=FA_NEWS_LOCK_MIN)).strftime("%Y-%m-%dT%H:%M:%SZ") if is_red else ""
+        out[sym] = {
+            "pair": sym,
+            "risk": risk,
+            "bias": bias,
+            "ttl": FA_NEWS_TTL_MIN,
+            "updated_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "scan_lock_until": scan_lock_until,
+            "reserve_off": 1 if is_red else 0,
+            "dca_scale": 0.5 if is_red else 1.0,
+            "reason": "news-high" if is_red else "base",
+            "risk_pct": 0,
+        }
+    return out
+
+def write_fa_signals(sh, signals: Dict[str, dict]):
+    headers = ["pair","risk","bias","ttl","updated_at","scan_lock_until","reserve_off","dca_scale","reason","risk_pct"]
+    ws, _ = ensure_worksheet(sh, "FA_Signals", headers)
+    order = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
+    values = []
+    for sym in order:
+        s = signals.get(sym, {})
+        values.append([
+            s.get("pair", sym),
+            s.get("risk", "Green"),
+            s.get("bias", "neutral"),
+            s.get("ttl", ""),
+            s.get("updated_at", ""),
+            s.get("scan_lock_until", ""),
+            int(bool(s.get("reserve_off", 0))),
+            float(s.get("dca_scale", 1.0)),
+            s.get("reason", "base"),
+            int(s.get("risk_pct", 0)),
+        ])
+    ws.update(range_name="A2", values=values)
+
+# ---------------- Storage helpers ----------------
+def _read_existing_hashes(ws, hash_col_letter: str) -> set[str]:
+    try:
+        rng = f"{hash_col_letter}2:{hash_col_letter}10000"
+        col = ws.get_values(rng)
+        return {r[0] for r in col if r and r[0]}
     except Exception:
         return set()
 
-def append_calendar(sh, events: List[dict]) -> int:
-    if not events:
-        return 0
-    ws = _ensure_ws(sh, CAL_WS_OUT, CAL_HEADERS)
-    # построим хеш по (utc_iso|title|source)
-    try:
-        existing = ws.get_all_records()
-    except Exception:
-        existing = []
-    existed = set(f"{r.get('utc_iso','')}|{r.get('title','')}|{r.get('source','')}" for r in existing)
-
-    new_rows = []
-    for e in events:
-        key = f"{e['utc'].strftime('%Y-%m-%dT%H:%M:%S%z')}|{e['title']}|{e['source']}"
-        if key in existed:
-            continue
-        new_rows.append([
-            e["utc"].strftime("%Y-%m-%d %H:%M:%S%z"),
-            _fmt_local(e["utc"]),
-            e["country"], e["currency"], e["title"], e["impact"], e["source"], e["url"],
-        ])
-    if not new_rows:
-        return 0
-    ws.append_rows(new_rows, value_input_option="RAW")
-    return len(new_rows)
-
-def append_news(sh, items: List[dict]) -> int:
-    if not items:
-        return 0
-    ws = _ensure_ws(sh, CAL_WS_RAW, NEWS_HEADERS)
-    existed = _read_existing_hashes(ws, "I")
-
-    rows = []
-    now = _now_utc().strftime("%Y-%m-%d %H:%M:%S%z")
-    for x in items:
-        if x["hash"] in existed:
-            continue
-        rows.append([
-            now, x.get("source",""), x.get("title",""), x.get("url",""),
-            x.get("countries",""), x.get("ccy",""), x.get("tags",""),
-            x.get("importance_guess",""), x["hash"]
-        ])
-    if not rows:
-        return 0
-    ws.append_rows(rows, value_input_option="RAW")
-    return len(rows)
-
-# ----------------- SIMPLE FA -----------------
-def fa_policy_from_signals(has_red_event: bool, news_hits: Dict[str,int]) -> dict:
-    # очень простая политика:
-    # если рядом (±60м) high событие — risk=Amber, lock на QUIET окно
-    # если «intervention/decision/statement» в новостях — risk=Red 90 минут
-    if news_hits.get("high", 0) >= 1:
-        return {"risk":"Red","ttl":180, "scan_lock_min":90, "reserve_off":1, "dca_scale":0.5, "reason":"news-high"}
-    if has_red_event:
-        return {"risk":"Amber","ttl":120, "scan_lock_min":QUIET_BEFORE_MIN+QUIET_AFTER_MIN, "reserve_off":0, "dca_scale":0.75, "reason":"calendar-window"}
-    return {"risk":"Green","ttl":180, "scan_lock_min":0, "reserve_off":0, "dca_scale":1.0, "reason":"base"}
-
-def update_fa_sheet(sh, cal_rows: List[dict], news_rows: List[dict]):
-    ws = _ensure_ws(sh, "FA_Signals", FA_HEADERS)
-    now = _now_utc()
-
-    # подмножества для каждой пары
-    per_pair = {}
-    for p in PAIR_LIST:
-        cset = PAIR_COUNTRIES[p]
-        around = []
-        for r in cal_rows:
-            if r.get("country") in cset:
-                around.append(r)
-
-        # «красное событие рядом» — в течении 60 минут
-        red_soon = any(abs((r["utc"] - now).total_seconds())/60.0 <= 60 for r in around)
-
-        # новости по валюте пары (по стране или по ccy)
-        hits = {"high":0, "medium":0}
-        for n in news_rows:
-            if n.get("countries") in cset or n.get("ccy","") == PAIR_CCY[p]:
-                lvl = n.get("importance_guess")
-                if lvl in hits:
-                    hits[lvl] += 1
-
-        pol = fa_policy_from_signals(red_soon, hits)
-        bias = "neutral"  # можно усложнить при необходимости
-        scan_lock_until = ""
-        if pol["scan_lock_min"] > 0:
-            scan_lock_until = (now + timedelta(minutes=pol["scan_lock_min"])).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        per_pair[p] = {
-            "risk": pol["risk"], "bias": bias, "ttl": pol["ttl"],
-            "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scan_lock_until": scan_lock_until,
-            "reserve_off": 1 if pol["reserve_off"] else 0,
-            "dca_scale": pol["dca_scale"], "reason": pol["reason"], "risk_pct": 0
-        }
-
-    # переписываем лист (маленький и простой)
-    values = [FA_HEADERS]
-    for p in PAIR_LIST:
-        row = per_pair[p]
-        values.append([
-            p, row["risk"], row["bias"], row["ttl"], row["updated_at"],
-            row["scan_lock_until"], row["reserve_off"], row["dca_scale"], row["reason"], row["risk_pct"]
-        ])
-    ws.clear()
-    ws.update(range_name="A1", values=values)
-
-def append_digest(sh, per_pair: Dict[str,dict]):
-    ws = _ensure_ws(sh, "INVESTOR_DIGEST", ["ts_utc","text"])
-    # соберём мини-выжимку
-    lines = ["Об-оценка (aggregated):"]
-    for p in PAIR_LIST:
-        row = per_pair.get(p, {})
-        risk = row.get("risk","Green")
-        bias = row.get("bias","neutral")
-        badge = "🟢" if risk.lower()=="green" else "🟡" if risk.lower().startswith("amber") else "🔴"
-        lines.append(f"• {p}: {badge} 0% | {risk}/{bias} | base")
-    text = "\n".join(lines)
-    ws.append_row([_now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"), text], value_input_option="RAW")
-
-# ----------------- PIPELINE -----------------
-def collect_once():
-    if not SHEET_ID:
-        log.error("SHEET_ID is empty")
-        return
-    sh, state = _sheets_client()
-    if not sh:
-        log.error("Sheets error: %s", state)
-        return
-
-    log.info("collector… sheet=%s ws=%s tz=%s window=[-%dd, +%dd]",
-             SHEET_ID, CAL_WS_OUT, (LOCAL_TZ.key if LOCAL_TZ else "UTC"),
-             FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS)
-
-    # -------- CALENDAR --------
-    cal_events: List[dict] = []
-
-    # источники (минимум — FOMC/ECB/BoE/BoJ)
-    html_fomc = fetch("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
-    ev_fomc = parse_fomc_calendar(html_fomc)
-    log.info("FOMC parsed: %d", len(ev_fomc)); cal_events += ev_fomc
-
-    html_ecb = fetch("https://www.ecb.europa.eu/press/calendars/mgc/html/index.en.html")
-    ev_ecb = parse_ecb_govc(html_ecb)
-    log.info("ECB parsed: %d", len(ev_ecb)); cal_events += ev_ecb
-
-    html_boe = fetch("https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes")
-    ev_boe = parse_boe_mpc(html_boe)
-    log.info("BoE parsed: %d", len(ev_boe)); cal_events += ev_boe
-
-    html_boj = fetch("https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm/")
-    ev_boj = parse_boj_mpm(html_boj)
-    log.info("BoJ parsed: %d", len(ev_boj)); cal_events += ev_boj
-
-    # окно дат
-    now = _now_utc()
+def _calendar_window_filter(events: Iterable[CalEvent]) -> List[CalEvent]:
+    now = datetime.now(timezone.utc)
     d1 = now - timedelta(days=FREE_LOOKBACK_DAYS)
     d2 = now + timedelta(days=FREE_LOOKAHEAD_DAYS)
-    cal_events = [e for e in cal_events if d1 <= e["utc"] <= d2]
+    return [e for e in events if d1 <= e.utc <= d2]
 
-    # запись в CALENDAR
-    appended_cal = append_calendar(sh, cal_events)
-    log.info("CALENDAR: %d new rows appended", appended_cal)
+# ---------------- Aggregate short investor text (optional) ----------------
+def write_investor_digest(sh, fa_signals: Dict[str, dict]):
+    ws, _ = ensure_worksheet(sh, "INVESTOR_DIGEST", ["ts_utc","text"])
+    icons = {"Green":"🟢","Amber":"🟡","Yellow":"🟡","Red":"🔴"}
+    lines = ["Об-оценка (aggregated):"]
+    for sym in SYMBOLS:
+        s = fa_signals.get(sym, {"risk":"Green","bias":"neutral"})
+        lines.append(f"• {sym}: {icons.get(s['risk'],'🟢')} 0% | {s['risk']}/{s['bias']} | base")
+    ws.append_row([_to_utc_iso(datetime.now(timezone.utc)),"\n".join(lines)], value_input_option="RAW")
 
-    # -------- NEWS --------
-    html_map = {
-        "fed": fetch("https://www.federalreserve.gov/newsevents/pressreleases.htm"),
-        "ust": fetch("https://home.treasury.gov/news/press-releases"),
-        "ecb": fetch("https://www.ecb.europa.eu/press/pr/html/index.en.html"),
-        "boe": fetch("https://www.bankofengland.co.uk/news"),
-        "rba": fetch("https://www.rba.gov.au/media-releases/"),
-        "mof": fetch("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.html"),
-    }
-    news_items = collect_news_all(html_map)
-    log.info("NEWS collected: %d items", len(news_items))
-    appended_news = append_news(sh, news_items)
-    log.info("NEWS: %d new rows appended", appended_news)
+# ---------------- Main collection pass ----------------
+def collect_once():
+    log.info(
+        "collector… sheet=%s ws=%s tz=%s window=[-%dd, +%dd]",
+        SHEET_ID, CAL_WS_OUT, (LOCAL_TZ.key if LOCAL_TZ else "UTC"),
+        FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS
+    )
+    sh, _ = build_sheets_client(SHEET_ID)
+    if not sh:
+        log.error("Sheets not available — exit")
+        return
 
-    # -------- FA_Signals + DIGEST (лёгкая версия) --------
-    # Для FA используем уже собранные cal_events и news_items
+    # --- CALENDAR
+    cal_events = _calendar_window_filter(collect_calendar())
+    ws_cal, _ = ensure_worksheet(sh, CAL_WS_OUT, CAL_HEADERS)
+    # дедуп по utc_iso+title
     try:
-        update_fa_sheet(sh, cal_events, news_items)
-    except Exception as e:
-        log.warning("FA update failed: %s", e)
+        existing = ws_cal.get_all_records()
+        seen = { (r["utc_iso"], r.get("title","")) for r in existing }
+    except Exception:
+        seen = set()
 
-    # Для INVESTOR_DIGEST берём только что записанные FA-строки обратно (просто соберём ещё раз локально)
-    per_pair: Dict[str,dict] = {}
-    try:
-        ws_fa = _ensure_ws(sh, "FA_Signals", FA_HEADERS)
-        rows = ws_fa.get_all_records()
-        for r in rows:
-            per_pair[str(r.get("pair","")).upper()] = r
-        if per_pair:
-            append_digest(sh, per_pair)
-    except Exception as e:
-        log.warning("INVESTOR_DIGEST append failed: %s", e)
+    new_rows = []
+    for ev in cal_events:
+        key = (_to_utc_iso(ev.utc), ev.title)
+        if key not in seen:
+            new_rows.append(ev.to_row())
+    if new_rows:
+        ws_cal.append_rows(new_rows, value_input_option="RAW")
+    log.info("CALENDAR: %d new rows appended", len(new_rows))
 
+    # --- NEWS
+    news = collect_news()
+    ws_news, _ = ensure_worksheet(sh, "NEWS", NEWS_HEADERS)
+    existing_hash = _read_existing_hashes(ws_news, "I")  # кол. I = hash
+    news_rows = []
+    for n in news:
+        if n.key_hash() not in existing_hash:
+            news_rows.append(n.to_row())
+    if news_rows:
+        ws_news.append_rows(news_rows, value_input_option="RAW")
+    log.info("NEWS: %d new rows appended", len(news_rows))
+
+    # --- FA from NEWS (strict)
+    all_news = _read_news_rows(sh)
+    now = datetime.now(timezone.utc)
+    fa = compute_fa_from_news(all_news, now)
+    write_fa_signals(sh, fa)
+
+    # (опционально) короткий агрегат в INVESTOR_DIGEST — оставлю, чтобы было видно, что живёт
+    write_investor_digest(sh, fa)
+
+    log.info("cycle done.")
+
+# ---------------- Entrypoint ----------------
 def main():
-    try:
+    if not SHEET_ID:
+        raise RuntimeError("SHEET_ID env empty")
+    if RUN_FOREVER:
+        interval = max(1, COLLECT_EVERY_MIN) * 60
         while True:
-            start = time.time()
-            collect_once()
-            if not RUN_FOREVER:
-                break
-            # сон до следующего цикла
-            sleep_sec = max(10.0, COLLECT_EVERY_MIN * 60.0 - (time.time() - start))
-            log.info("cycle done.")
-            time.sleep(sleep_sec)
-    except KeyboardInterrupt:
-        pass
+            try:
+                collect_once()
+            except Exception as e:
+                log.exception("collect_once failed")
+            time.sleep(interval)
+    else:
+        collect_once()
 
 if __name__ == "__main__":
-    print("Starting Container")
     main()
