@@ -1,3 +1,4 @@
+# fa_bot.py
 import os
 import json
 import base64
@@ -106,16 +107,20 @@ BMR_SHEETS = {
 TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
 TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
 TE_KEY = os.getenv("TE_KEY", "guest").strip()
-CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120") or "120")
+
+CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "720"))  # разумный дефолт для дайджеста
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
 CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
-# защита от частой опечатки
-if CAL_PROVIDER == "finhub":
-    CAL_PROVIDER = "finnhub"
-FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()  # ⬅️ новый ключ
+
+FMP_API_KEY      = os.getenv("FMP_API_KEY", "").strip()
+FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "").strip()
+
 CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
+
+# Опциональный «официальный бэкап» — JSON с массивом событий
+OFF_BACKUP_JSON     = os.getenv("OFFICIAL_BACKUP_JSON", "").strip()
+OFF_BACKUP_JSON_B64 = os.getenv("OFFICIAL_BACKUP_JSON_B64", "").strip()
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -124,7 +129,7 @@ COUNTRY_BY_CCY = {
     "GBP": "united kingdom",
     "AUD": "australia",
 }
-# FF country comes as currency codes; map to our canonical country names
+# FF: код → каноническое название
 FF_CODE2NAME = {
     "usd": "united states",
     "jpy": "japan",
@@ -132,14 +137,7 @@ FF_CODE2NAME = {
     "gbp": "united kingdom",
     "aud": "australia",
 }
-# Finnhub может отдавать коды стран (US, JP, EU, GB/UK, AU)
-FINNHUB_CODE2NAME = {
-    "US": "united states", "USA": "united states",
-    "JP": "japan", "JPN": "japan",
-    "EU": "euro area", "EMU": "euro area", "EA": "euro area", "EUR": "euro area",
-    "GB": "united kingdom", "UK": "united kingdom", "GBR": "united kingdom",
-    "AU": "australia", "AUS": "australia",
-}
+
 PAIR_COUNTRIES = {
     "USDJPY": [COUNTRY_BY_CCY["USD"], COUNTRY_BY_CCY["JPY"]],
     "AUDUSD": [COUNTRY_BY_CCY["AUD"], COUNTRY_BY_CCY["USD"]],
@@ -149,7 +147,7 @@ PAIR_COUNTRIES = {
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
 _FF_CACHE = {"at": 0, "data": []}
-_FF_NEG    = {"until": 0}
+_FF_NEG   = {"until": 0}
 
 STATE = {
     "total": 0.0,
@@ -226,7 +224,7 @@ def ensure_worksheet(sh, title: str):
         for ws in sh.worksheets():
             if ws.title == title:
                 return ws, False
-        ws = sh.add_worksheet(title=title, rows=200, cols=max(10, len(SHEET_HEADERS)))
+        ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(SHEET_HEADERS)))
         ws.update("A1", [SHEET_HEADERS])
         return ws, True
     except Exception as e:
@@ -256,34 +254,15 @@ def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, f
 def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
     now = now or datetime.now(timezone.utc)
     sec = int((dt_to - now).total_seconds())
-    sign_is_future = sec >= 0
+    future = sec >= 0
     sec = abs(sec)
     h = sec // 3600
     m = (sec % 3600) // 60
     if h and m:
-        return (f"через {h} ч {m:02d} мин" if sign_is_future else f"{h} ч {m:02d} мин назад")
+        return (f"через {h} ч {m:02d} мин" if future else f"{h} ч {m:02d} мин назад")
     if h:
-        return ("через " if sign_is_future else "") + f"{h} ч" + ("" if sign_is_future else " назад")
-    return ("через " if sign_is_future else "") + f"{m} мин" + ("" if sign_is_future else " назад")
-
-
-def _parse_any_utc(ts: str) -> Optional[datetime]:
-    if not ts:
-        return None
-    s = str(ts).strip().replace(" ", "T")
-    try:
-        dt = datetime.fromisoformat(s)
-    except Exception:
-        # запасной вариант: "YYYY-MM-DDTHH:MM:SS"
-        try:
-            dt = datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
+        return (f"через {h} ч" if future else f"{h} ч назад")
+    return (f"через {m} мин" if future else f"{m} мин назад")
 
 
 def assert_master_chat(update: Update) -> bool:
@@ -420,8 +399,6 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model=LLM_MINI,
                 token_budget=LLM_TOKEN_BUDGET_PER_DAY,
             )
-            if not txt or not str(txt).strip():
-                txt = "⚠️ LLM не вернул текст."
             await update.message.reply_text(txt)
         except Exception as e:
             await update.message.reply_text(f"LLM ошибка: {e}")
@@ -434,8 +411,6 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         msg = build_investor_digest(sh)
-        if not msg.strip():
-            msg = header_ru(datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.utcnow()) + "\n\n(событий High рядом нет)"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
@@ -610,31 +585,28 @@ def importance_is_high(val) -> bool:
     return "high" in s or s == "3"
 
 
-# ---------- Источники календаря ----------
+# -------------------- КАЛЕНДАРИ --------------------
 def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """TradingEconomics API (importance=3 — High)."""
-    if not (_REQUESTS_AVAILABLE and TE_BASE):
+    """TradingEconomics (как правило 403 на гостевом для календаря)."""
+    if not _REQUESTS_AVAILABLE:
         return []
     try:
-        ctry = ",".join(quote(c) for c in countries)
-        url = (
-            f"{TE_BASE}/calendar/country/{ctry}"
-            f"?d1={quote(d1.strftime('%Y-%m-%dT%H:%M'))}"
-            f"&d2={quote(d2.strftime('%Y-%m-%dT%H:%M'))}"
-            f"&importance=3&c={quote(f'{TE_CLIENT}:{TE_KEY}')}&format=json"
-        )
-        r = requests.get(url, timeout=15, headers={"User-Agent": "fund-bot/1.0"})
+        cc = ",".join(quote(c) for c in countries)
+        url = f"{TE_BASE}/calendar/country/{cc}?d1={d1.strftime('%Y-%m-%dT%H:%M')}&d2={d2.strftime('%Y-%m-%dT%H:%M')}&importance=3&c={quote(TE_CLIENT)}:{quote(TE_KEY)}&format=json"
+        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
         r.raise_for_status()
-        raw = r.json() or []
+        arr = r.json() or []
         out = []
-        for it in raw:
-            # в TE есть fields: Country, Event, Date (UTC), Importance
-            dt_raw = it.get("Date")
-            if not dt_raw:
+        for it in arr:
+            dt_s = it.get("DateUtc") or it.get("Date")
+            if not dt_s:
                 continue
-            dt_utc = datetime.fromisoformat(dt_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            try:
+                dt_utc = datetime.fromisoformat(dt_s.replace("Z", "+00:00"))
+            except Exception:
+                continue
             out.append({
-                "utc": dt_utc,
+                "utc": dt_utc.astimezone(timezone.utc),
                 "country": (it.get("Country") or "").strip().lower(),
                 "title": it.get("Event") or "Event",
                 "importance": it.get("Importance") or 3,
@@ -646,42 +618,36 @@ def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -
 
 
 def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """FinancialModelingPrep economic_calendar (High impact)."""
+    """FinancialModelingPrep (часто 403 на бесплатном ключе)."""
     if not (_REQUESTS_AVAILABLE and FMP_API_KEY):
         return []
     try:
-        url = (
-            "https://financialmodelingprep.com/api/v3/economic_calendar"
-            f"?from={d1.date()}&to={d2.date()}&apikey={FMP_API_KEY}"
-        )
-        r = requests.get(url, timeout=15, headers={"User-Agent": "fund-bot/1.0"})
+        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1.date()}&to={d2.date()}&apikey={FMP_API_KEY}"
+        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
         r.raise_for_status()
-        raw = r.json() or []
+        arr = r.json() or []
         out = []
         want = {c.lower() for c in countries}
-        for it in raw:
-            # FMP: fields 'country', 'event', 'date' (YYYY-MM-DD), 'impact' (e.g., "High")
-            c_raw = (it.get("country") or "").strip().lower()
-            if c_raw not in want:
+        for it in arr:
+            cty = (it.get("country") or "").strip().lower()
+            if cty not in want:
                 continue
-            impact = str(it.get("impact") or "").lower()
-            if "high" not in impact and it.get("importance") != 3:
+            dt_s = it.get("date")
+            tm_s = it.get("time")  # "13:30"
+            if not dt_s:
                 continue
-            # время может быть как date или datetime; пробуем оба
-            dt_s = (it.get("date") or it.get("datetime") or "").replace("Z", "+00:00")
             try:
-                if "T" in dt_s:
-                    dt_utc = datetime.fromisoformat(dt_s).astimezone(timezone.utc)
+                if tm_s:
+                    dt_utc = datetime.fromisoformat(f"{dt_s}T{tm_s}+00:00")
                 else:
-                    # если только дата — считаем полдень UTC, лишь бы попало в окно дня
-                    dt_utc = datetime.fromisoformat(dt_s + "T12:00:00+00:00").astimezone(timezone.utc)
+                    dt_utc = datetime.fromisoformat(f"{dt_s}T00:00:00+00:00")
             except Exception:
                 continue
             out.append({
-                "utc": dt_utc,
-                "country": c_raw,
-                "title": it.get("event") or "Event",
-                "importance": "High",
+                "utc": dt_utc.astimezone(timezone.utc),
+                "country": cty,
+                "title": it.get("event") or it.get("title") or "Event",
+                "importance": it.get("impact") or it.get("importance") or "",
             })
         return out
     except Exception as e:
@@ -690,67 +656,116 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
 
 
 def fetch_calendar_events_finnhub(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """Economic calendar via Finnhub: https://finnhub.io/docs/api/economic-calendar
-        Требует FINNHUB_API_KEY. Возвращает события в нашем формате.
-    """
-    if not _REQUESTS_AVAILABLE or not FINNHUB_API_KEY:
+    """Finnhub (экономкалендарь платный; на free обычно 403)."""
+    if not (_REQUESTS_AVAILABLE and FINNHUB_API_KEY):
         return []
-
     try:
-        url = (
-            "https://finnhub.io/api/v1/calendar/economic"
-            f"?from={d1.date():%Y-%m-%d}&to={d2.date():%Y-%m-%d}&token={FINNHUB_API_KEY}"
-        )
+        url = f"https://finnhub.io/api/v1/calendar/economic?from={d1.date()}&to={d2.date()}&token={FINNHUB_API_KEY}"
         r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
         r.raise_for_status()
-        js = r.json() or {}
-        rows = js.get("economicCalendar") or js.get("data") or []
-
+        data = r.json() or {}
+        arr = data.get("economicCalendar") or data.get("events") or []
         want = {c.lower() for c in countries}
-        out: List[dict] = []
-
-        for it in rows:
-            # время
-            utc_dt = _parse_any_utc(it.get("time") or it.get("datetime") or it.get("date"))
-            if not utc_dt:
+        out = []
+        for it in arr:
+            # Finnhub country может быть в ISO2/ISO3/названии — нормализуем по ключевым
+            cty_raw = (it.get("country") or it.get("region") or "").strip().lower()
+            cty = cty_raw
+            if cty in FF_CODE2NAME:
+                cty = FF_CODE2NAME[cty]
+            if cty not in want:
                 continue
-
-            # страна
-            raw_cty = (it.get("country") or it.get("countryCode") or "").strip()
-            cty = FINNHUB_CODE2NAME.get(raw_cty.upper(), raw_cty).lower()
-
-            # фильтрация по нужным странам и окну
-            if cty not in want or not (d1 <= utc_dt <= d2):
+            # datetime
+            dt_s = it.get("time") or it.get("datetime") or it.get("date")
+            dt_utc = None
+            if dt_s:
+                try:
+                    dt_utc = datetime.fromisoformat(str(dt_s).replace("Z", "+00:00"))
+                except Exception:
+                    try:
+                        dt_utc = datetime.fromisoformat(f"{dt_s}T00:00:00+00:00")
+                    except Exception:
+                        pass
+            if not dt_utc:
                 continue
-
-            # важность/impact
-            impact = (it.get("impact") or it.get("importance") or "").strip().lower()
-            # приведение к нашим значениям: high/medium/low → оставляем строку, фильтрация «high» позже
+            imp = it.get("impact") or it.get("importance") or ""
             title = it.get("event") or it.get("title") or "Event"
-
             out.append({
-                "utc": utc_dt,
+                "utc": dt_utc.astimezone(timezone.utc),
                 "country": cty,
                 "title": title,
-                "importance": impact,  # importance_is_high() распознает "high"
+                "importance": imp,
             })
-
-        log.info("Finnhub: loaded %d events in %s..%s", len(out), d1.date(), d2.date())
         return out
     except Exception as e:
         log.warning("calendar fetch (Finnhub) failed: %s", e)
         return []
 
 
+# ---------- Бесплатный источник: ForexFactory weekly JSON ----------
+def _ff_parse_dt(date_s: str, time_s: Optional[str]) -> Optional[datetime]:
+    """
+    Преобразуем связку date/time в UTC.
+    В weekly JSON время иногда даётся в локальном формате сайта; если есть timestamp — используем его.
+    Здесь бэкап: считаем, что время — UTC. Для All Day/Tentative без времени ставим 00:00 UTC.
+    """
+    try:
+        if not date_s:
+            return None
+        date_s = str(date_s).strip()
+        if time_s:
+            t = str(time_s).strip().lower()
+            # Примеры: "8:30am", "14:00", "All Day", "Tentative"
+            if t in ("all day", "allday", "tentative"):
+                dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
+            else:
+                # нормализуем am/pm
+                if "am" in t or "pm" in t:
+                    # "8:30am" → 08:30, "12:00pm" → 12:00
+                    tnum = t.replace(" ", "")
+                    am = tnum.endswith("am")
+                    pm = tnum.endswith("pm")
+                    tnum = tnum[:-2]
+                    hh, mm = tnum.split(":") if ":" in tnum else (tnum, "00")
+                    h = int(hh)
+                    m = int(mm)
+                    if pm and h < 12:
+                        h += 12
+                    if am and h == 12:
+                        h = 0
+                    dt = datetime.fromisoformat(f"{date_s}T{h:02d}:{m:02d}:00+00:00")
+                else:
+                    # уже 24h формат
+                    if ":" in t:
+                        hh, mm = t.split(":", 1)
+                        h = int(hh)
+                        m = int(mm.split()[0])
+                        dt = datetime.fromisoformat(f"{date_s}T{h:02d}:{m:02d}:00+00:00")
+                    else:
+                        dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
+        else:
+            dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def fetch_calendar_events_ff_all() -> list[dict]:
-    """Скачиваем недельный JSON FF с кешом и защитой от 429."""
+    """
+    Тянем недельный JSON FF c кешом/бэкоффом. Поддерживаем:
+      - запись с 'timestamp'
+      - запись с 'date' + 'time' (All Day/Tentative)
+    Поля вывода: utc, country, title, importance
+    """
     if not _REQUESTS_AVAILABLE:
         return _FF_CACHE["data"]
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(tz=timezone.utc).timestamp())
 
+    # локальный негативный кеш на 429
     if _FF_NEG["until"] and now < _FF_NEG["until"]:
         return _FF_CACHE["data"]
 
+    # валидный кеш
     if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
         return _FF_CACHE["data"]
 
@@ -763,21 +778,38 @@ def fetch_calendar_events_ff_all() -> list[dict]:
             return _FF_CACHE["data"]
         r.raise_for_status()
 
-        raw = r.json()
+        raw = r.json() or []
         data = []
-        for it in raw or []:
+        for it in raw:
+            # 1) timestamp (приоритет)
             ts = it.get("timestamp")
-            if not ts:
+            dt_utc: Optional[datetime] = None
+            if ts is not None:
+                try:
+                    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                except Exception:
+                    dt_utc = None
+
+            # 2) date + time
+            if dt_utc is None:
+                dt_utc = _ff_parse_dt(it.get("date") or it.get("dateStr") or "", it.get("time"))
+
+            if dt_utc is None:
                 continue
-            dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+
             country_raw = (it.get("country") or "").strip()
             country = FF_CODE2NAME.get(country_raw.lower(), country_raw).lower()
+
+            title = it.get("title") or it.get("event") or it.get("impactTitle") or "Event"
+            impact = it.get("impact") or it.get("impactText") or ""
+
             data.append({
                 "utc": dt_utc,
                 "country": country,
-                "title": it.get("title") or it.get("event") or "Event",
-                "importance": it.get("impact") or "",
+                "title": title,
+                "importance": impact,
             })
+
         _FF_CACHE["data"] = data
         _FF_CACHE["at"] = now
         _FF_NEG["until"] = 0
@@ -785,37 +817,73 @@ def fetch_calendar_events_ff_all() -> list[dict]:
         return data
     except Exception as e:
         log.warning("calendar fetch (FF) failed: %s", e)
-        return _FF_CACHE["data"] or []
+        return _FF_CACHE["data"]
 
 
 def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: list[dict]) -> list[dict]:
     want = {c.lower() for c in countries}
     out = []
     for ev in events:
+        if ev.get("utc") is None or ev.get("country") is None:
+            continue
         if ev["country"].lower() in want and importance_is_high(ev.get("importance")) and d1 <= ev["utc"] <= d2:
             out.append(ev)
     return out
 
 
+def _load_official_backup_all() -> List[dict]:
+    """Опциональный бэкап: OFFICIAL_BACKUP_JSON(_B64) = JSON-массив событий.
+       Формат элементов: { "utc": "2025-09-10T12:30:00Z", "country": "united states", "title": "...", "importance": "High" }
+    """
+    src = OFF_BACKUP_JSON or ""
+    if not src and OFF_BACKUP_JSON_B64:
+        try:
+            src = _decode_b64_maybe_padded(OFF_BACKUP_JSON_B64)
+        except Exception:
+            src = ""
+    if not src:
+        return []
+    try:
+        arr = json.loads(src) or []
+        out = []
+        for it in arr:
+            try:
+                dt_utc = datetime.fromisoformat(str(it.get("utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                continue
+            out.append({
+                "utc": dt_utc,
+                "country": (it.get("country") or "").strip().lower(),
+                "title": it.get("title") or "Event",
+                "importance": it.get("importance") or "High",
+            })
+        return out
+    except Exception:
+        return []
+
+
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    """Комбинированный фетч по провайдеру/фоллбэкам."""
     prov = CAL_PROVIDER
+    if prov == "ff":
+        return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
     if prov == "te":
         return fetch_calendar_events_te(countries, d1, d2)
     if prov == "fmp":
         return fetch_calendar_events_fmp(countries, d1, d2)
     if prov == "finnhub":
         return fetch_calendar_events_finnhub(countries, d1, d2)
-    if prov == "ff":
-        return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
 
-    # auto: пробуем по очереди
-    ev = fetch_calendar_events_te(countries, d1, d2)
+    # auto: бесплатный FF → TE → FMP → Finnhub → официальный бэкап
+    ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+    if not ev:
+        ev = fetch_calendar_events_te(countries, d1, d2)
     if not ev:
         ev = fetch_calendar_events_fmp(countries, d1, d2)
     if not ev:
         ev = fetch_calendar_events_finnhub(countries, d1, d2)
     if not ev:
-        ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+        ev = _filter_events_by(countries, d1, d2, _load_official_backup_all())
     return ev
 
 
@@ -835,17 +903,20 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
         d1_ext, d2_ext = now - timedelta(hours=36), now + timedelta(hours=36)
 
     out: Dict[str, dict] = {}
-    all_raw_events = fetch_calendar_events_ff_all() if CAL_PROVIDER in ('ff', 'auto') else None
+
+    # Если используем FF/auto — выгодно один раз подтянуть weekly и дальше фильтровать.
+    all_raw_ff = fetch_calendar_events_ff_all() if CAL_PROVIDER in ("ff", "auto") else None
 
     for sym in symbols:
         countries = PAIR_COUNTRIES.get(sym, [])
 
-        if all_raw_events is not None:
+        if all_raw_ff is not None:
             want = {c.lower() for c in countries}
-            sym_raw_all = [ev for ev in all_raw_events if ev["country"].lower() in want]
+            sym_raw_all = [ev for ev in all_raw_ff if ev.get("country", "").lower() in want]
         else:
             sym_raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
 
+        # события внутри окна ±w
         around = [
             {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
             for ev in sym_raw_all
@@ -859,6 +930,7 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
             for ev in around
         )
 
+        # если в окне нет событий — всё равно найдём «последнее/ближайшее» High
         nearest_prev = nearest_next = None
         if not around:
             high_events = [ev for ev in sym_raw_all if importance_is_high(ev.get("importance"))]
@@ -885,6 +957,7 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
     for sym, pack in out.items():
         log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
                  sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
+
     return out
 
 
@@ -1000,12 +1073,20 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
 • **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
-    summary_lines, all_events = [], []
+    # Сводка ближайших событий по всем символам
+    summary_lines: List[str] = []
+    all_events = []
     for sym in SYMBOLS:
-        all_events.extend((ev["utc"], ev["local"], sym, ev["country"], ev["title"]) for ev in cal.get(sym, {}).get("events", []))
-
+        all_events.extend(
+            (ev["utc"], ev["local"], sym, ev["country"], ev["title"])
+            for ev in cal.get(sym, {}).get("events", [])
+        )
     if not all_events:
-        all_events.extend((n["utc"], n["local"], sym, n["country"], n["title"]) for sym in SYMBOLS if (n := cal.get(sym, {}).get("nearest_next")))
+        all_events.extend(
+            (n["utc"], n["local"], sym, n["country"], n["title"])
+            for sym in SYMBOLS
+            if (n := cal.get(sym, {}).get("nearest_next"))
+        )
 
     if all_events:
         summary_lines.append("\n📅 **Ближайшие High-события (Белград):**")
@@ -1013,8 +1094,11 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
         for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    # Никогда не возвращаем пустую строку — Telegram вернёт 400 "message text is empty"
-    return "\n\n".join(blocks + ["\n".join(summary_lines)]) if summary_lines else "\n\n".join(blocks)
+    # ВАЖНО: не возвращаем пустой текст (исправление "Message text is empty")
+    parts = list(blocks)
+    if summary_lines:
+        parts.append("\n".join(summary_lines))
+    return "\n\n".join(parts)
 
 
 # -------------------- СТАРТ --------------------
@@ -1040,12 +1124,16 @@ async def _set_bot_commands(app: Application):
 
 async def morning_digest_scheduler(app: Application):
     from datetime import datetime as _dt, timedelta as _td, time as _time
+    import asyncio as _asyncio
     while True:
         now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
-        target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
+        if LOCAL_TZ:
+            target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ))
+        else:
+            target = now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
         if now >= target:
             target = target + _td(days=1)
-        await asyncio.sleep(max(1.0, (target - now).total_seconds()))
+        await _asyncio.sleep(max(1.0, (target - now).total_seconds()))
         try:
             sh, _src = build_sheets_client(SHEET_ID)
             if sh:
@@ -1067,6 +1155,7 @@ def build_application() -> Application:
     if 'AIORateLimiter' in globals() and AIORateLimiter:
         builder = builder.rate_limiter(AIORateLimiter())
     app = builder.build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -1078,6 +1167,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
+
     return app
 
 
@@ -1088,7 +1178,6 @@ async def main_async():
     await app.initialize()
     await app.start()
     asyncio.create_task(morning_digest_scheduler(app))
-    # PTB v20: у Application есть updater
     await app.updater.start_polling()
     await asyncio.Event().wait()
 
