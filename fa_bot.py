@@ -3,8 +3,8 @@ import os
 import json
 import base64
 import logging
-from datetime import datetime
-from typing import Dict, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Tuple, Optional, List
 
 import asyncio
 
@@ -44,6 +44,16 @@ except Exception:
     gspread = None
     service_account = None
     _GSHEETS_AVAILABLE = False
+
+# --- HTTP для календаря ---
+try:
+    import requests
+    from urllib.parse import quote
+    _REQUESTS_AVAILABLE = True
+except Exception:
+    requests = None
+    quote = None
+    _REQUESTS_AVAILABLE = False
 
 # --- LLM-клиент ---
 try:
@@ -85,12 +95,34 @@ LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
-# --- Названия листов с логами по парам (можно переопределить через ENV) ---
+# --- Названия листов с логами по парам (переопределяются через ENV) ---
 BMR_SHEETS = {
     "USDJPY": os.getenv("BMR_SHEET_USDJPY", "BMR_DCA_USDJPY"),
     "AUDUSD": os.getenv("BMR_SHEET_AUDUSD", "BMR_DCA_AUDUSD"),
     "EURUSD": os.getenv("BMR_SHEET_EURUSD", "BMR_DCA_EURUSD"),
     "GBPUSD": os.getenv("BMR_SHEET_GBPUSD", "BMR_DCA_GBPUSD"),
+}
+
+# --- Календарь (TradingEconomics) ---
+TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
+TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
+TE_KEY = os.getenv("TE_KEY", "guest").strip()
+CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))     # окно для вывода событий (+/-)
+QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))  # тихое окно ДО high-релиза
+QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))  # тихое окно ПОСЛЕ high-релиза
+
+COUNTRY_BY_CCY = {
+    "USD": "united states",
+    "JPY": "japan",
+    "EUR": "euro area",
+    "GBP": "united kingdom",
+    "AUD": "australia",
+}
+PAIR_COUNTRIES = {
+    "USDJPY": [COUNTRY_BY_CCY["USD"], COUNTRY_BY_CCY["JPY"]],
+    "AUDUSD": [COUNTRY_BY_CCY["AUD"], COUNTRY_BY_CCY["USD"]],
+    "EURUSD": [COUNTRY_BY_CCY["EUR"], COUNTRY_BY_CCY["USD"]],
+    "GBPUSD": [COUNTRY_BY_CCY["GBP"], COUNTRY_BY_CCY["USD"]],
 }
 
 # -------------------- GOOGLE CREDS LOADER --------------------
@@ -204,7 +236,7 @@ HELP_TEXT = (
     "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
     "/weights — показать целевые веса.\n"
     "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
-    "/digest — утренний «инвесторский» дайджест (по людям).\n"
+    "/digest — утренний «инвесторский» дайджест (человеческий язык + события).\n"
     "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
     "/init_sheet — создать/проверить лист в Google Sheets.\n"
     "/sheet_test — записать тестовую строку в лист.\n"
@@ -299,7 +331,7 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "\n".join(lines)
     await update.message.reply_text(msg)
 
-    # опционально лог в таблицу
+    # лог в таблицу
     sh, _src = build_sheets_client(SHEET_ID)
     if sh:
         try:
@@ -320,7 +352,7 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Если пользователь написал "pro" → отдаём прежний краткий/профи вариант через LLM
+    # "pro" → краткий/профи вариант через LLM
     args = (update.message.text or "").split()
     pro = len(args) > 1 and args[1].lower() == "pro"
 
@@ -337,7 +369,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
-    # Инвесторский режим (локально, без LLM)
+    # Инвесторский режим (локально)
     sh, _src = build_sheets_client(SHEET_ID)
     if not sh:
         await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
@@ -424,6 +456,16 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Digest helpers (инвесторский режим) ----------
 
+# --- RU-дата ---
+_RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+_RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
+
+def header_ru(dt) -> str:
+    wd = _RU_WD[dt.weekday()]
+    mm = _RU_MM[dt.month - 1]
+    return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
+
+
 def _to_float(x, default=0.0) -> float:
     try:
         s = str(x).strip().replace(",", ".")
@@ -433,7 +475,6 @@ def _to_float(x, default=0.0) -> float:
 
 
 def _last_record(ws):
-    """Вернуть последнюю строку как dict через get_all_records()."""
     try:
         rows = ws.get_all_records()
         return rows[-1] if rows else None
@@ -441,15 +482,57 @@ def _last_record(ws):
         return None
 
 
-def get_last_bmr_row(sh, symbol: str) -> Optional[dict]:
+def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
     sheet_name = BMR_SHEETS.get(symbol)
     if not sheet_name:
         return None
     try:
         ws = sh.worksheet(sheet_name)
-        return _last_record(ws)
+        rows = ws.get_all_records()
+        if not rows:
+            return None
+        for r in reversed(rows):
+            for f in needed_fields:
+                v = r.get(f)
+                if v not in (None, "", 0, "0", "0.0"):
+                    return r
+        return rows[-1]
     except Exception:
         return None
+
+
+def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
+    sheet_name = BMR_SHEETS.get(symbol)
+    if not sheet_name:
+        return None, None
+    try:
+        ws = sh.worksheet(sheet_name)
+        rows = ws.get_all_records()
+        if not rows:
+            return None, None
+        tgt = fac = None
+        for r in reversed(rows):
+            if tgt is None:
+                tv = r.get("Bank_Target_USDT")
+                if tv not in (None, "", 0, "0", "0.0"):
+                    tgt = _to_float(tv, None)
+            if fac is None:
+                fv = r.get("Bank_Fact_USDT")
+                if fv not in (None, "", 0, "0", "0.0"):
+                    fac = _to_float(fv, None)
+            if tgt is not None and fac is not None:
+                break
+        return tgt, fac
+    except Exception:
+        return None, None
+
+
+def price_fmt(symbol: str, value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    is_jpy = symbol.endswith("JPY")
+    prec = 3 if is_jpy else 5
+    return f"{value:.{prec}f}"
 
 
 def map_fa_level(risk: str) -> str:
@@ -473,10 +556,10 @@ def map_fa_bias(bias: str) -> str:
 def policy_from_level(level: str) -> Dict[str, object]:
     L = (level or "OK").upper()
     if L == "HIGH":
-        return {"quiet_min": (45, 60), "reserve_off": True,  "dca_scale": 0.50, "icon": "🚧", "label": "высокий риск"}
+        return {"reserve_off": True,  "dca_scale": 0.50, "icon": "🚧", "label": "высокий риск"}
     if L == "CAUTION":
-        return {"quiet_min": (30, 45), "reserve_off": False, "dca_scale": 0.75, "icon": "⚠️", "label": "умеренный риск"}
-    return {"quiet_min": (0, 0), "reserve_off": False, "dca_scale": 1.00, "icon": "✅", "label": "фон спокойный"}
+        return {"reserve_off": False, "dca_scale": 0.75, "icon": "⚠️", "label": "умеренный риск"}
+    return {"reserve_off": False, "dca_scale": 1.00, "icon": "✅", "label": "фон спокойный"}
 
 
 def supertrend_dir(val: str) -> str:
@@ -485,7 +568,6 @@ def supertrend_dir(val: str) -> str:
 
 
 def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
-    # Инвесторские формулировки
     trend_txt = "умеренное" if adx < 20 else "заметное" if adx < 25 else "выраженное"
     dir_txt = "вверх" if st_dir == "up" else "вниз" if st_dir == "down" else "вбок"
     vola_txt = "ниже нормы" if atr1h < 0.8 else "около нормы" if atr1h < 1.2 else "выше нормы"
@@ -493,19 +575,132 @@ def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
     return f"{trend_txt} движение {dir_txt}; колебания {vola_txt}; рыночный шум {noise_txt}"
 
 
+def importance_is_high(val) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        return val >= 3
+    s = str(val).strip().lower()
+    return "high" in s or s == "3"
+
+
+def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    """Вернуть события TE для списка стран в интервале [d1; d2]. Если requests недоступен — вернуть []."""
+    if not _REQUESTS_AVAILABLE:
+        return []
+    try:
+        path = "/calendar/country/" + ",".join(quote(c) for c in countries)
+        url = TE_BASE + path
+        params = {
+            "d1": d1.strftime("%Y-%m-%dT%H:%M"),
+            "d2": d2.strftime("%Y-%m-%dT%H:%M"),
+            "importance": "3",  # High
+            "c": f"{TE_CLIENT}:{TE_KEY}",
+            "format": "json",
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        events = []
+        for it in data:
+            # нормализуем время
+            # TE обычно даёт "Date" в локали и "DateUtc" — берём UTC, иначе пробуем "Date"
+            dt_utc = None
+            for k in ("DateUtc", "Date", "DateUTC"):
+                val = it.get(k)
+                if not val:
+                    continue
+                try:
+                    # Примеры: "2025-09-10T14:00:00", "2025-09-10 14:00:00"
+                    s = str(val).replace(" ", "T")
+                    dt_utc = datetime.fromisoformat(s)
+                    if dt_utc.tzinfo is None:
+                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                    else:
+                        dt_utc = dt_utc.astimezone(timezone.utc)
+                    break
+                except Exception:
+                    continue
+            if not dt_utc:
+                continue
+            title = it.get("Event") or it.get("Title") or it.get("Category") or "Event"
+            country = (it.get("Country") or "").strip()
+            imp = it.get("Importance") or it.get("impact") or it.get("CategoryGroup")
+            events.append({
+                "utc": dt_utc,
+                "country": country,
+                "title": str(title),
+                "importance": imp,
+            })
+        return events
+    except Exception as e:
+        log.warning("calendar fetch failed: %s", e)
+        return []
+
+
+def build_calendar_for_symbols(symbols: List[str]) -> Dict[str, dict]:
+    """
+    Собирает события для каждой пары в окне +/- CAL_WINDOW_MIN минут.
+    Возвращает dict[symbol] = {
+        "events": [ { "utc": dt, "local": dt_local, "title": str, "country": str, "importance": imp }, ...] (отсортированы),
+        "red_event_soon": bool (<=60 мин от сейчас),
+        "quiet_from_to": (before, after),
+        "quiet_now": bool (находимся ли мы прямо сейчас в тихом окне),
+    }
+    """
+    now = datetime.now(timezone.utc)
+    d1 = now - timedelta(minutes=CAL_WINDOW_MIN)
+    d2 = now + timedelta(minutes=CAL_WINDOW_MIN)
+
+    out: Dict[str, dict] = {}
+    for sym in symbols:
+        countries = PAIR_COUNTRIES.get(sym, [])
+        raw = fetch_calendar_events(countries, d1, d2)
+        items = []
+        red_soon = False
+        quiet_now = False
+        for ev in raw:
+            if not importance_is_high(ev.get("importance")):
+                continue
+            # попадает в окно
+            t_utc = ev["utc"]
+            t_local = t_utc.astimezone(LOCAL_TZ) if LOCAL_TZ else t_utc
+            items.append({**ev, "local": t_local})
+
+            # флаг "в ближайшие 60 минут"
+            diff_min = abs((t_utc - now).total_seconds()) / 60.0
+            if diff_min <= 60:
+                red_soon = True
+
+            # тихое окно вокруг события
+            start = t_utc - timedelta(minutes=QUIET_BEFORE_MIN)
+            end = t_utc + timedelta(minutes=QUIET_AFTER_MIN)
+            if start <= now <= end:
+                quiet_now = True
+
+        items.sort(key=lambda x: x["utc"])
+        quiet_from_to = (QUIET_BEFORE_MIN, QUIET_AFTER_MIN) if items else (0, 0)
+        out[sym] = {
+            "events": items,
+            "red_event_soon": red_soon,
+            "quiet_from_to": quiet_from_to,
+            "quiet_now": quiet_now,
+        }
+    return out
+
+
 def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
                         vol_z: float, atr1h: float, rsi: float, red_event_soon: bool) -> int:
-    # База
     P = 55
     against_dir = "down" if (side or "").upper() == "LONG" else "up"
 
-    # FA bias
     if (fa_bias == "LONG" and against_dir == "up") or (fa_bias == "SHORT" and against_dir == "down"):
         P += 10
     elif fa_bias in ("LONG", "SHORT"):
         P -= 15
 
-    # ADX
     if adx >= 25:
         P += 6
     elif adx >= 20:
@@ -513,13 +708,11 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     else:
         P -= 5
 
-    # Supertrend
     if st_dir == against_dir:
         P += 5
     else:
         P -= 5
 
-    # Vol_z
     if vol_z < 0.3:
         P -= 3
     elif vol_z < 1.5:
@@ -527,7 +720,6 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     elif vol_z > 2.5:
         P -= 7
 
-    # ATR_1h (как z-скор)
     if atr1h > 1.2:
         P += 4
     elif atr1h < 0.8:
@@ -535,7 +727,6 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     else:
         P += 1
 
-    # RSI экстремы против позиции
     side_up = (side or "").upper() == "SHORT"  # против short = вверх
     if side_up:
         if rsi > 65: P += 3
@@ -553,7 +744,6 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
 
 def action_text(P: int, quiet_now: bool, level: str) -> str:
     if level == "HIGH":
-        # в HIGH не обещаем 2 шага
         if P >= 64:
             return "готовьтесь добирать 1 шаг (после снятия ограничений и вне тихого окна)"
     if P >= 64:
@@ -578,64 +768,102 @@ def delta_marker(target: float, fact: float) -> str:
 
 
 def build_investor_digest(sh) -> str:
-    # Заголовок с локальным временем
+    # Заголовок на русском (локальное время)
     now_utc = datetime.utcnow()
     if LOCAL_TZ:
         now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(LOCAL_TZ)
-        header = f"🧭 Утренний фон — {now_local:%A, %d %B %Y, %H:%M} (Europe/Belgrade)"
+        header = header_ru(now_local)
     else:
-        header = f"🧭 Утренний фон — {now_utc.strftime('%A, %d %B %Y, %H:%M')} (UTC)"
+        header = f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
 
-    blocks = [header]
+    blocks: List[str] = [header]
 
-    # TODO: календарь и событие_рядом (пока без внешнего API)
-    red_event_soon = False  # заглушка
-    quiet_now = False       # заглушка
+    # Календарь для всех символов
+    cal = build_calendar_for_symbols(SYMBOLS)
 
+    # Основные блоки по парам
     for sym in SYMBOLS:
-        row = get_last_bmr_row(sh, sym) or {}
+        row = get_last_nonempty_row(sh, sym) or {}
         side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
-        avg = _to_float(row.get("Avg_Price"))
-        next_dca = _to_float(row.get("Next_DCA_Price"))
+
+        avg_raw = row.get("Avg_Price")
+        next_raw = row.get("Next_DCA_Price")
 
         adx = _to_float(row.get("ADX_5m"))
         rsi = _to_float(row.get("RSI_5m"), 50.0)
         volz = _to_float(row.get("Vol_z"))
-        atr1h = _to_float(row.get("ATR_1h"), 1.0)  # трактуем как z-скор ~1.0
+        atr1h = _to_float(row.get("ATR_1h"), 1.0)
         st = supertrend_dir(row.get("Supertrend"))
 
         fa_level = map_fa_level(row.get("FA_Risk"))
         fa_bias = map_fa_bias(row.get("FA_Bias"))
 
         policy = policy_from_level(fa_level)
-        quiet_from, quiet_to = policy["quiet_min"]
         reserve = "OFF" if policy["reserve_off"] else "ON"
         dca_scale = policy["dca_scale"]
         icon = policy["icon"]
         label = policy["label"]
 
+        # календарь для пары
+        c = cal.get(sym, {})
+        red_event_soon = bool(c.get("red_event_soon"))
+        quiet_from, quiet_to = c.get("quiet_from_to", (0, 0))
+        quiet_now = bool(c.get("quiet_now"))
+
         P = probability_against(side, fa_bias, adx, st, volz, atr1h, rsi, red_event_soon)
         act = action_text(P, quiet_now, fa_level)
 
-        target = _to_float(row.get("Bank_Target_USDT"))
-        fact = _to_float(row.get("Bank_Fact_USDT"))
-        marker = delta_marker(target, fact)
+        target, fact = latest_bank_target_fact(sh, sym)
+        avg = None if avg_raw in (None, "", 0, "0", "0.0") else _to_float(avg_raw)
+        next_dca = None if next_raw in (None, "", 0, "0", "0.0") else _to_float(next_raw)
+
+        banks_line = "данных нет"
+        if target is not None or fact is not None:
+            tt = target if target is not None else 0.0
+            ff = fact if fact is not None else 0.0
+            marker = delta_marker(tt, ff) if target not in (None, 0) else "—"
+            if target is None and fact is not None:
+                banks_line = f"Target — / Fact **{ff:g}**"
+            elif fact is None and target is not None:
+                banks_line = f"Target **{tt:g}** / Fact —"
+            else:
+                banks_line = f"Target **{tt:g}** / Fact **{ff:g}** — {marker}"
 
         pair_pretty = f"{sym[:3]}/{sym[3:]}"
+        # ближайшее событие для пары (если есть)
+        ev_line = ""
+        events = c.get("events") or []
+        if events:
+            # покажем самое близкое по времени к текущему моменту
+            now = datetime.now(timezone.utc)
+            nearest = min(events, key=lambda e: abs((e["utc"] - now).total_seconds()))
+            tloc = nearest["local"]
+            ev_line = f"\n• **Событие (Белград):** {tloc:%H:%M} — {nearest['country']}: {nearest['title']} (High)"
+
         blocks.append(
 f"""**{pair_pretty} — {icon} {label}, bias: {fa_bias}**
 • **Фундаментально:** { 'нейтрально' if fa_level=='OK' else ('умеренные риски' if fa_level=='CAUTION' else 'высокие риски') }.
 • **Рынок сейчас:** {market_phrases(adx, st, volz, atr1h)}.
-• **Наша позиция:** **{side}**, средняя {avg:.5f}; следующий добор {next_dca:.5f}.
+• **Наша позиция:** **{side}**, средняя {price_fmt(sym, avg)}; следующий добор {price_fmt(sym, next_dca)}.
 • **Что делаем сейчас:** {"тихое окно не требуется" if quiet_from==0 and quiet_to==0 else f"тихое окно [{-quiet_from:+d};+{quiet_to:d}] мин"}; reserve **{reserve}**; dca_scale **{dca_scale:.2f}**.
 • **Вероятность против позиции:** ≈ **{P}%** → {act}.
-• **Цель vs факт:** Target **{target:g}** / Fact **{fact:g}** — {marker}"""
+• **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
-    # Блок ближайших событий можно добавить здесь после подключения календаря
-    # blocks.append("\n📅 Ближайшие события: —")
+    # Сводка ближайших событий по всем парам (внизу)
+    summary_lines: List[str] = []
+    all_events = []
+    for sym in SYMBOLS:
+        for ev in cal.get(sym, {}).get("events", []):
+            all_events.append((ev["utc"], ev["local"], sym, ev["country"], ev["title"]))
+    all_events.sort(key=lambda x: x[0])
 
-    return "\n\n".join(blocks)
+    if all_events:
+        summary_lines.append("\n📅 **Ближайшие High-события (Белград, ±{} мин):**".format(CAL_WINDOW_MIN))
+        for _, tloc, sym, cty, title in all_events[:8]:
+            summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
+
+    return "\n\n".join(blocks + (["\n".join(summary_lines)] if summary_lines else []))
 
 
 # -------------------- СТАРТ --------------------
@@ -666,15 +894,9 @@ async def morning_digest_scheduler(app: Application):
 
     while True:
         now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
-        target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else _dt.utcnow()
-        if not LOCAL_TZ:
-            # без zoneinfo просто шлём через ~24 часа от старта
-            target = now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
-            if now >= target:
-                target = target + _td(days=1)
-        else:
-            if now >= target:
-                target = target + _td(days=1)
+        target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
+        if now >= target:
+            target = target + _td(days=1)
 
         wait_s = (target - now).total_seconds()
         await _asyncio.sleep(max(1.0, wait_s))
