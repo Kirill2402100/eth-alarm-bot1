@@ -107,12 +107,19 @@ BMR_SHEETS = {
 TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
 TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
 TE_KEY = os.getenv("TE_KEY", "guest").strip()
+
 CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
-CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()  # auto | te | fmp | ff
+
+# auto | te | fmp | ff
+CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
+
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
 CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
+
+# персистентный кеш FF (переживает перезапуски)
+FF_CACHE_PATH = os.getenv("FF_CACHE_PATH", "/tmp/ff_calendar_weekly.json")
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -121,7 +128,7 @@ COUNTRY_BY_CCY = {
     "GBP": "united kingdom",
     "AUD": "australia",
 }
-# FF country приходит кодами валют → приводим к нашим названиям
+# FF country приходит кодами валют
 FF_CODE2NAME = {
     "usd": "united states",
     "jpy": "japan",
@@ -211,7 +218,6 @@ SHEET_HEADERS = ["ts", "chat_id", "action", "total", "weights_json", "note"]
 
 
 def ensure_worksheet(sh, title: str):
-    """Вернёт существующий лист или создаст новый с заголовками."""
     try:
         for ws in sh.worksheets():
             if ws.title == title:
@@ -275,6 +281,7 @@ HELP_TEXT = (
     "/init_sheet — создать/проверить лист в Google Sheets.\n"
     "/sheet_test — записать тестовую строку в лист.\n"
     "/diag — диагностика LLM и Google Sheets.\n"
+    "/caldiag — диагностика календаря (окно, события, провайдер).\n"
     "/ping — проверить связь."
 )
 
@@ -360,7 +367,6 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "\n".join(lines)
     await update.message.reply_text(msg)
 
-    # лог в таблицу
     sh, _src = build_sheets_client(SHEET_ID)
     if sh:
         try:
@@ -397,7 +403,6 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
-    # Инвесторский дайджест (локально)
     sh, _src = build_sheets_client(SHEET_ID)
     if not sh:
         await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
@@ -441,49 +446,27 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{llm_line}\n{sheets_line}")
 
 
-async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not SHEET_ID:
-        await update.message.reply_text("SHEET_ID не задан.")
-        return
-    sh, src = build_sheets_client(SHEET_ID)
-    if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
-        return
+# --- DIAG: календарь ---
+async def cmd_caldiag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        ws, created = ensure_worksheet(sh, SHEET_WS)
-        await update.message.reply_text(
-            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
-        )
+        win = CAL_WINDOW_MIN
+        cal = build_calendar_for_symbols(SYMBOLS, window_min=win)
+        lines = [f"CAL_PROVIDER: {CAL_PROVIDER}, window ±{win} мин"]
+        for sym in SYMBOLS:
+            pack = cal.get(sym, {})
+            lines.append(
+                f"{sym}: events={len(pack.get('events') or [])}, "
+                f"quiet_now={pack.get('quiet_now')}, "
+                f"prev={'yes' if pack.get('nearest_prev') else 'no'}, "
+                f"next={'yes' if pack.get('nearest_next') else 'no'}"
+            )
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
-
-
-async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sh, src = build_sheets_client(SHEET_ID)
-    if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
-        return
-    try:
-        append_row(
-            sh,
-            SHEET_WS,
-            [
-                datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                str(update.effective_chat.id),
-                "test",
-                f"{STATE['total']:.2f}",
-                json.dumps(STATE['weights'], ensure_ascii=False),
-                "manual /sheet_test",
-            ],
-        )
-        await update.message.reply_text("Sheets: ✅ записано (test row).")
-    except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
+        await update.message.reply_text(f"/caldiag error: {e}")
 
 
 # ---------- Digest helpers (инвесторский режим) ----------
 
-# RU-дата
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
 
@@ -502,13 +485,11 @@ def _to_float(x, default=0.0) -> float:
 
 def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name:
-        return None
+    if not sheet_name: return None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows:
-            return None
+        if not rows: return None
         for r in reversed(rows):
             if any(r.get(f) not in (None, "", 0, "0", "0.0") for f in needed_fields):
                 return r
@@ -519,13 +500,11 @@ def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_
 
 def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name:
-        return None, None
+    if not sheet_name: return None, None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows:
-            return None, None
+        if not rows: return None, None
         tgt = fac = None
         for r in reversed(rows):
             if tgt is None and r.get("Bank_Target_USDT") not in (None, "", 0, "0", "0.0"):
@@ -540,35 +519,28 @@ def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[
 
 
 def price_fmt(symbol: str, value: Optional[float]) -> str:
-    if value is None:
-        return "—"
+    if value is None: return "—"
     return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
 
 
 def map_fa_level(risk: str) -> str:
     r = (risk or "").strip().lower()
-    if r.startswith("red"):
-        return "HIGH"
-    if r.startswith("yellow") or r.startswith("amber"):
-        return "CAUTION"
+    if r.startswith("red"): return "HIGH"
+    if r.startswith("yellow") or r.startswith("amber"): return "CAUTION"
     return "OK"
 
 
 def map_fa_bias(bias: str) -> str:
     b = (bias or "").strip().lower()
-    if b.startswith("long"):
-        return "LONG"
-    if b.startswith("short"):
-        return "SHORT"
+    if b.startswith("long"): return "LONG"
+    if b.startswith("short"): return "SHORT"
     return "BOTH"
 
 
 def policy_from_level(level: str) -> Dict[str, object]:
     L = (level or "OK").upper()
-    if L == "HIGH":
-        return {"reserve_off": True,  "dca_scale": 0.50, "icon": "🚧", "label": "высокий риск"}
-    if L == "CAUTION":
-        return {"reserve_off": False, "dca_scale": 0.75, "icon": "⚠️", "label": "умеренный риск"}
+    if L == "HIGH": return {"reserve_off": True,  "dca_scale": 0.50, "icon": "🚧", "label": "высокий риск"}
+    if L == "CAUTION": return {"reserve_off": False, "dca_scale": 0.75, "icon": "⚠️", "label": "умеренный риск"}
     return {"reserve_off": False, "dca_scale": 1.00, "icon": "✅", "label": "фон спокойный"}
 
 
@@ -586,17 +558,14 @@ def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
 
 
 def importance_is_high(val) -> bool:
-    if val is None:
-        return False
-    if isinstance(val, (int, float)):
-        return val >= 3
+    if val is None: return False
+    if isinstance(val, (int, float)): return val >= 3
     s = str(val).strip().lower()
     return "high" in s or s == "3"
 
 
 # -------- Провайдеры календаря --------
 def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """TradingEconomics: High-важности в интервале d1..d2 по списку стран (строки)."""
     if not _REQUESTS_AVAILABLE:
         return []
     try:
@@ -605,7 +574,7 @@ def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -
         params = {
             "d1": d1.strftime("%Y-%m-%dT%H:%M"),
             "d2": d2.strftime("%Y-%m-%dT%H:%M"),
-            "importance": "3",  # High
+            "importance": "3",
             "c": f"{TE_CLIENT}:{TE_KEY}",
             "format": "json",
         }
@@ -636,12 +605,7 @@ def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -
             title = it.get("Event") or it.get("Title") or it.get("Category") or "Event"
             country = (it.get("Country") or "").strip()
             imp = it.get("Importance") or it.get("impact") or it.get("CategoryGroup")
-            events.append({
-                "utc": dt_utc,
-                "country": country,
-                "title": str(title),
-                "importance": imp,
-            })
+            events.append({"utc": dt_utc, "country": country, "title": str(title), "importance": imp})
         return events
     except Exception as e:
         log.warning("calendar fetch (TE) failed: %s", e)
@@ -649,16 +613,11 @@ def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -
 
 
 def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """FinancialModelingPrep fallback: фильтруем High impact и нужные страны."""
     if not (_REQUESTS_AVAILABLE and FMP_API_KEY):
         return []
     try:
         url = "https://financialmodelingprep.com/api/v3/economic_calendar"
-        params = {
-            "from": d1.strftime("%Y-%m-%d"),
-            "to":   d2.strftime("%Y-%m-%d"),
-            "apikey": FMP_API_KEY,
-        }
+        params = {"from": d1.strftime("%Y-%m-%d"), "to": d2.strftime("%Y-%m-%d"), "apikey": FMP_API_KEY}
         r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
@@ -673,7 +632,7 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
             impact = (it.get("impact") or "").lower()
             if "high" not in impact:
                 continue
-            val = it.get("date")  # "YYYY-MM-DD HH:MM:SS" UTC
+            val = it.get("date")
             if not val:
                 continue
             try:
@@ -685,25 +644,58 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
             except Exception:
                 continue
             title = it.get("event") or "Event"
-            events.append({
-                "utc": dt_utc,
-                "country": it.get("country") or "",
-                "title": str(title),
-                "importance": "High",
-            })
-        # отфильтруем строго по d1..d2 (FMP бывает даёт края)
+            events.append({"utc": dt_utc, "country": it.get("country") or "", "title": str(title), "importance": "High"})
         return [e for e in events if d1 <= e["utc"] <= d2]
     except Exception as e:
         log.warning("calendar fetch (FMP) failed: %s", e)
         return []
 
 
+def _ff_cache_load():
+    if not FF_CACHE_PATH:
+        return
+    try:
+        if os.path.exists(FF_CACHE_PATH):
+            with open(FF_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                _FF_CACHE["data"] = [
+                    {"utc": datetime.fromtimestamp(int(x["ts"]), tz=timezone.utc),
+                     "country": x["country"],
+                     "title": x["title"],
+                     "importance": x.get("importance", "")}
+                    for x in data
+                ]
+                _FF_CACHE["at"] = int(datetime.now(timezone.utc).timestamp())
+                log.info("FF persistent cache loaded: %d events", len(_FF_CACHE["data"]))
+    except Exception as e:
+        log.warning("FF persistent cache load failed: %s", e)
+
+
+def _ff_cache_save():
+    if not FF_CACHE_PATH:
+        return
+    try:
+        payload = [
+            {"ts": int(ev["utc"].timestamp()), "country": ev["country"], "title": ev["title"], "importance": ev.get("importance", "")}
+            for ev in (_FF_CACHE["data"] or [])
+        ]
+        with open(FF_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        log.warning("FF persistent cache save failed: %s", e)
+
+
 def fetch_calendar_events_ff_all() -> list[dict]:
-    """Скачиваем недельный JSON FF с кешом и защитой от 429."""
+    """ForexFactory weekly feed с зеркалами, кешем, бэкоффом и персистентным кешем."""
     if not _REQUESTS_AVAILABLE:
         return _FF_CACHE["data"]
+
     import time as _t
     now = int(_t.time())
+
+    if _FF_CACHE["at"] == 0:
+        _ff_cache_load()
 
     if _FF_NEG["until"] and now < _FF_NEG["until"]:
         return _FF_CACHE["data"]
@@ -711,38 +703,56 @@ def fetch_calendar_events_ff_all() -> list[dict]:
     if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
         return _FF_CACHE["data"]
 
-    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-        if r.status_code == 429:
-            _FF_NEG["until"] = now + 120
-            log.warning("calendar fetch (FF) 429: backoff 120s")
-            return _FF_CACHE["data"]
-        r.raise_for_status()
+    urls = [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    ]
 
-        raw = r.json()
-        data = []
-        for it in raw or []:
-            ts = it.get("timestamp")
-            if not ts:
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
+            if r.status_code == 429:
+                _FF_NEG["until"] = now + 120
+                log.warning("calendar fetch (FF) 429: backoff 120s")
+                return _FF_CACHE["data"]
+            r.raise_for_status()
+            raw = r.json()
+
+            if not isinstance(raw, list) or not raw:
+                # пустой ответ не перезатирает кеш
+                log.warning("calendar fetch (FF) empty payload from %s", url)
+                last_err = "empty"
                 continue
-            dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            country_raw = (it.get("country") or "").strip()
-            country = FF_CODE2NAME.get(country_raw.lower(), country_raw)
-            data.append({
-                "utc": dt_utc,
-                "country": country,
-                "title": it.get("title") or it.get("event") or "Event",
-                "importance": it.get("impact") or "",
-            })
-        _FF_CACHE["data"] = data
-        _FF_CACHE["at"] = now
-        _FF_NEG["until"] = 0
-        log.info("FF weekly: loaded %d events", len(data))
-        return data
-    except Exception as e:
-        log.warning("calendar fetch (FF) failed: %s", e)
-        return _FF_CACHE["data"] or []
+
+            data = []
+            for it in raw:
+                ts = it.get("timestamp")
+                if not ts:
+                    continue
+                dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                country_raw = (it.get("country") or "").strip()
+                country = FF_CODE2NAME.get(country_raw.lower(), country_raw)
+                data.append({
+                    "utc": dt_utc,
+                    "country": country,
+                    "title": it.get("title") or it.get("event") or "Event",
+                    "importance": it.get("impact") or "",
+                })
+
+            _FF_CACHE["data"] = data
+            _FF_CACHE["at"] = now
+            _FF_NEG["until"] = 0
+            _ff_cache_save()
+            log.info("FF weekly: loaded %d events (source=%s)", len(data), url)
+            return data
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err:
+        log.warning("calendar fetch (FF) failed: %s", last_err)
+    return _FF_CACHE["data"]
 
 
 def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: list[dict]) -> list[dict]:
@@ -755,7 +765,6 @@ def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: 
 
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """Роутер провайдеров: TE → FMP → FF, либо принудительно через CAL_PROVIDER."""
     prov = CAL_PROVIDER
     if prov == "te":
         return fetch_calendar_events_te(countries, d1, d2)
@@ -775,23 +784,11 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
 
 
 def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = None) -> Dict[str, dict]:
-    """
-    Собирает события для каждой пары в окне +/- window_min минут (по умолчанию CAL_WINDOW_MIN).
-    Возвращает dict[symbol] = {
-        "events": [ { "utc": dt, "local": dt_local, "title": str, "country": str, "importance": imp }, ...],
-        "red_event_soon": bool,
-        "quiet_from_to": (before, after),
-        "quiet_now": bool,
-        "nearest_prev": {...} | None,
-        "nearest_next": {...} | None,
-    }
-    """
     now = datetime.now(timezone.utc)
     w = window_min if window_min is not None else CAL_WINDOW_MIN
     d1 = now - timedelta(minutes=w)
     d2 = now + timedelta(minutes=w)
 
-    # расширяем диапазон добычи для расчёта «последний/ближайший»
     if LOCAL_TZ:
         now_loc = now.astimezone(LOCAL_TZ)
         day_start_loc = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -803,7 +800,7 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
 
     out: Dict[str, dict] = {}
 
-    # ⚠️ Предзагрузка FF — только в режиме 'ff'. В 'auto' используем роутер TE→FMP→FF.
+    # Предзагрузка FF только при провайдере 'ff'
     all_raw_events = fetch_calendar_events_ff_all() if CAL_PROVIDER == 'ff' else None
 
     for sym in symbols:
@@ -854,7 +851,6 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
     for sym, pack in out.items():
         log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
                  sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
-
     return out
 
 
@@ -883,7 +879,7 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     elif atr1h < 0.8: P -= 4
     else: P += 1
 
-    side_up = (side or "").upper() == "SHORT"  # «против SHORT» = вверх
+    side_up = (side or "").upper() == "SHORT"
     if side_up:
         if rsi > 65: P += 3
         if rsi < 35: P -= 4
@@ -922,48 +918,34 @@ def delta_marker(target: float, fact: float) -> str:
 
 
 def build_investor_digest(sh) -> str:
-    # Заголовок на русском (локальное время)
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
 
     blocks: List[str] = [header]
-
-    # Календарь для всех символов
     cal = build_calendar_for_symbols(SYMBOLS)
 
-    # Основные блоки по парам
     for sym in SYMBOLS:
         row = get_last_nonempty_row(sh, sym) or {}
         side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
-
         adx = _to_float(row.get("ADX_5m"))
         rsi = _to_float(row.get("RSI_5m"), 50.0)
         volz = _to_float(row.get("Vol_z"))
         atr1h = _to_float(row.get("ATR_1h"), 1.0)
         st = supertrend_dir(row.get("Supertrend"))
-
         fa_level = map_fa_level(row.get("FA_Risk"))
         fa_bias = map_fa_bias(row.get("FA_Bias"))
         policy = policy_from_level(fa_level)
-
         c = cal.get(sym, {})
-        red_event_soon = bool(c.get("red_event_soon"))
-        quiet_from, quiet_to = c.get("quiet_from_to", (0, 0))
-        quiet_now = bool(c.get("quiet_now"))
-
-        P = probability_against(side, fa_bias, adx, st, volz, atr1h, rsi, red_event_soon)
-        act = action_text(P, quiet_now, fa_level)
-
+        P = probability_against(side, fa_bias, adx, st, volz, atr1h, rsi, bool(c.get("red_event_soon")))
+        act = action_text(P, bool(c.get("quiet_now")), fa_level)
         target, fact = latest_bank_target_fact(sh, sym)
         banks_line = "данных нет"
         if target is not None or fact is not None:
             tt, ff = target or 0.0, fact or 0.0
             banks_line = f"Target **{tt:g}** / Fact **{ff:g}** — {delta_marker(tt, ff) if tt > 0 else '—'}"
 
-        # событие/альтернативы
         ev_line = ""
-        events = c.get("events") or []
-        if events:
+        if events := c.get("events"):
             nearest = min(events, key=lambda e: abs((e["utc"] - now_utc).total_seconds()))
             tloc = nearest["local"]
             ev_line = f"\n• **Событие (Белград):** {tloc:%H:%M} — {nearest['country']}: {nearest['title']} (High)"
@@ -972,46 +954,32 @@ def build_investor_digest(sh) -> str:
                 ev_line += f"\n• **Последний High:** {prev_ev['local']:%H:%M} — {prev_ev['country']}: {prev_ev['title']} ({_fmt_tdelta_human(prev_ev['utc'])})."
             if next_ev := c.get("nearest_next"):
                 ev_line += f"\n• **Ближайший High:** {next_ev['local']:%H:%M} — {next_ev['country']}: {next_ev['title']} ({_fmt_tdelta_human(next_ev['utc'])})."
-
-        pair_pretty = f"{sym[:3]}/{sym[3:]}"
-        reserve = "OFF" if policy["reserve_off"] else "ON"
-        dca_scale = policy["dca_scale"]
+        
+        q_from, q_to = c.get("quiet_from_to", (0, 0))
         blocks.append(
-f"""**{pair_pretty} — {policy['icon']} {policy['label']}, bias: {fa_bias}**
+f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias}**
 • **Фундаментально:** {'нейтрально' if fa_level=='OK' else ('умеренные риски' if fa_level=='CAUTION' else 'высокие риски')}.
 • **Рынок сейчас:** {market_phrases(adx, st, volz, atr1h)}.
 • **Наша позиция:** **{side}**, средняя {price_fmt(sym, _to_float(row.get("Avg_Price"), None))}; следующий добор {price_fmt(sym, _to_float(row.get("Next_DCA_Price"), None))}.
-• **Что делаем сейчас:** {"тихое окно не требуется" if quiet_from==0 and quiet_to==0 else f"тихое окно [{-quiet_from:+d};+{quiet_to:d}] мин"}; reserve **{reserve}**; dca_scale **{dca_scale:.2f}**.
+• **Что делаем сейчас:** {"тихое окно не требуется" if not q_from and not q_to else f"тихое окно [{-q_from:+d};+{q_to:d}] мин"}; reserve **{'OFF' if policy['reserve_off'] else 'ON'}**; dca_scale **{policy['dca_scale']:.2f}**.
 • **Вероятность против позиции:** ≈ **{P}%** → {act}.
 • **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
-    # Сводка ближайших событий по всем парам (внизу)
-    summary_lines: List[str] = []
-    all_events = []
+    summary_lines, all_events = [], []
     for sym in SYMBOLS:
-        for ev in cal.get(sym, {}).get("events", []):
-            all_events.append((ev["utc"], ev["local"], sym, ev["country"], ev["title"]))
-    all_events.sort(key=lambda x: x[0])
+        all_events.extend((ev["utc"], ev["local"], sym, ev["country"], ev["title"]) for ev in cal.get(sym, {}).get("events", []))
 
     if not all_events:
-        # если в окне пусто — показываем ближайшие next
-        for sym in SYMBOLS:
-            n = cal.get(sym, {}).get("nearest_next")
-            if n:
-                all_events.append((n["utc"], n["local"], sym, n["country"], n["title"]))
-        all_events.sort(key=lambda x: x[0])
+        all_events.extend((n["utc"], n["local"], sym, n["country"], n["title"]) for sym in SYMBOLS if (n := cal.get(sym, {}).get("nearest_next")))
 
     if all_events:
         summary_lines.append("\n📅 **Ближайшие High-события (Белград):**")
-        # дедуп по времени
-        unique = {}
-        for ev in all_events:
-            unique.setdefault(ev[0], ev)
-        for _, tloc, sym, cty, title in list(unique.values())[:8]:
+        unique_events = {ev[0]: ev for ev in sorted(all_events)}
+        for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    return "\n\n".join(blocks + (["\n".join(summary_lines)] if summary_lines else []))
+    return "\n\n".join(blocks + ["\n".join(summary_lines)] if summary_lines else [])
 
 
 # -------------------- СТАРТ --------------------
@@ -1028,6 +996,7 @@ async def _set_bot_commands(app: Application):
         BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
         BotCommand("sheet_test", "Тестовая запись в лист"),
         BotCommand("diag", "Диагностика LLM и Sheets"),
+        BotCommand("caldiag", "Диагностика календаря"),
     ]
     try:
         await app.bot.set_my_commands(cmds)
@@ -1036,19 +1005,14 @@ async def _set_bot_commands(app: Application):
 
 
 async def morning_digest_scheduler(app: Application):
-    """Ежедневный автопост инвесторского дайджеста в MASTER_CHAT_ID в MORNING_HOUR:MORNING_MINUTE Europe/Belgrade."""
-    import asyncio as _asyncio
     from datetime import datetime as _dt, timedelta as _td, time as _time
-
+    import asyncio as _asyncio
     while True:
         now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
         target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
         if now >= target:
             target = target + _td(days=1)
-
-        wait_s = (target - now).total_seconds()
-        await _asyncio.sleep(max(1.0, wait_s))
-
+        await _asyncio.sleep(max(1.0, (target - now).total_seconds()))
         try:
             sh, _src = build_sheets_client(SHEET_ID)
             if sh:
@@ -1066,12 +1030,10 @@ async def morning_digest_scheduler(app: Application):
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
-
     builder: ApplicationBuilder = Application.builder().token(BOT_TOKEN)
-    if _RATE_LIMITER_AVAILABLE:
+    if 'AIORateLimiter' in globals() and AIORateLimiter:
         builder = builder.rate_limiter(AIORateLimiter())
     app = builder.build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -1081,9 +1043,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("alloc", cmd_alloc))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("caldiag", cmd_caldiag))
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
-
     return app
 
 
