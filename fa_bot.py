@@ -1,10 +1,12 @@
 # fa_bot.py
 import os
+import re
 import json
+import html
 import base64
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
+from datetime import datetime, timedelta, timezone
 
 import asyncio
 
@@ -17,21 +19,21 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# --- Таймзона Белграда ---
+# --- Таймзона ---
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
-except Exception:  # pragma: no cover
+except Exception:
     ZoneInfo = None
 
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else None
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
 
-# --- Лимитер Telegram (может быть не установлен) ---
+# --- Rate limiter (если установлен) ---
 try:
     from telegram.ext import AIORateLimiter
     _RATE_LIMITER_AVAILABLE = True
-except Exception:  # pragma: no cover
+except Exception:
     AIORateLimiter = None
     _RATE_LIMITER_AVAILABLE = False
 
@@ -45,23 +47,20 @@ except Exception:
     service_account = None
     _GSHEETS_AVAILABLE = False
 
-# --- HTTP для календаря ---
+# --- HTTP ---
 try:
     import requests
-    from urllib.parse import quote
     _REQUESTS_AVAILABLE = True
 except Exception:
     requests = None
-    quote = None
     _REQUESTS_AVAILABLE = False
 
-# --- LLM-клиент ---
+# --- LLM-клиент (опционально) ---
 try:
     from llm_client import generate_digest, llm_ping
 except Exception:
     async def generate_digest(*args, **kwargs) -> str:
         return "⚠️ LLM сейчас недоступен (нет llm_client.py)."
-
     async def llm_ping() -> bool:
         return bool(os.getenv("OPENAI_API_KEY"))
 
@@ -78,7 +77,11 @@ MASTER_CHAT_ID = int(os.getenv("MASTER_CHAT_ID", "0") or "0")
 
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_WS = os.getenv("SHEET_WS", "FUND_BOT").strip() or "FUND_BOT"
-SHEET_CAL_WS = os.getenv("SHEET_CAL_WS", "CAL_EVENTS").strip()  # Лист с ручным бэкапом календаря
+
+# новый лист для событий:
+CAL_SHEET_WS = os.getenv("CAL_SHEET_WS", "CAL_EVENTS").strip() or "CAL_EVENTS"
+CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "3600") or "3600")      # кэш событий
+CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "180") or "180")  # окно для дайджеста, ±минут
 
 _DEFAULT_WEIGHTS_RAW = os.getenv("DEFAULT_WEIGHTS", "").strip()
 if _DEFAULT_WEIGHTS_RAW:
@@ -96,7 +99,7 @@ LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
-# --- Названия листов с логами по парам (переопределяются через ENV) ---
+# --- Листы с логами по парам (переопределяются через ENV) ---
 BMR_SHEETS = {
     "USDJPY": os.getenv("BMR_SHEET_USDJPY", "BMR_DCA_USDJPY"),
     "AUDUSD": os.getenv("BMR_SHEET_AUDUSD", "BMR_DCA_AUDUSD"),
@@ -104,27 +107,7 @@ BMR_SHEETS = {
     "GBPUSD": os.getenv("BMR_SHEET_GBPUSD", "BMR_DCA_GBPUSD"),
 }
 
-# --- Календарь ---
-TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
-TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
-TE_KEY = os.getenv("TE_KEY", "guest").strip()
-
-CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "720"))  # дефолт — 12 часов до/после
-QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
-QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
-CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
-
-FMP_API_KEY      = os.getenv("FMP_API_KEY", "").strip()
-FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "").strip()
-CAL_TTL_SEC      = int(os.getenv("CAL_TTL_SEC", "600") or "600")
-
-# Опциональный «официальный» бэкап: JSON с массивом событий
-OFF_BACKUP_JSON     = os.getenv("OFFICIAL_BACKUP_JSON", "").strip()
-OFF_BACKUP_JSON_B64 = os.getenv("OFFICIAL_BACKUP_JSON_B64", "").strip()
-
-# Форс-прокси для FF (если сделаешь Cloudflare Worker): FF_PROXY='https://your-worker.example.com'
-FF_PROXY = os.getenv("FF_PROXY", "").strip()
-
+# --- Маппинги стран/валют ---
 COUNTRY_BY_CCY = {
     "USD": "united states",
     "JPY": "japan",
@@ -145,11 +128,9 @@ PAIR_COUNTRIES = {
     "EURUSD": [COUNTRY_BY_CCY["EUR"], COUNTRY_BY_CCY["USD"]],
     "GBPUSD": [COUNTRY_BY_CCY["GBP"], COUNTRY_BY_CCY["USD"]],
 }
+CCY_BY_COUNTRY = {v: k for k, v in COUNTRY_BY_CCY.items()}  # обратная маппа
 
-# -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
-_FF_CACHE = {"at": 0, "data": []}
-_FF_NEG   = {"until": 0}
-
+# -------------------- ГЛОБАЛЬНОЕ СОСТОЯНИЕ --------------------
 STATE = {
     "total": 0.0,
     "weights": DEFAULT_WEIGHTS.copy(),
@@ -158,11 +139,9 @@ STATE = {
 # -------------------- GOOGLE CREDS LOADER --------------------
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-
 def _env(name: str) -> str:
     v = os.getenv(name, "")
     return v if isinstance(v, str) else ""
-
 
 def _decode_b64_maybe_padded(s: str) -> str:
     s = s.strip()
@@ -170,7 +149,6 @@ def _decode_b64_maybe_padded(s: str) -> str:
         return ""
     padded = s + "=" * ((4 - len(s) % 4) % 4)
     return base64.b64decode(padded).decode("utf-8", "strict")
-
 
 def load_google_service_info() -> Tuple[Optional[dict], str, Optional[str]]:
     b64 = _env("GOOGLE_CREDENTIALS_JSON_B64")
@@ -195,7 +173,6 @@ def load_google_service_info() -> Tuple[Optional[dict], str, Optional[str]]:
 
     return None, "not-found", None
 
-
 def build_sheets_client(sheet_id: str):
     if not _GSHEETS_AVAILABLE:
         return None, "gsheets libs not installed"
@@ -215,33 +192,206 @@ def build_sheets_client(sheet_id: str):
     except Exception as e:
         return None, f"auth/open error: {e}"
 
-
 # ---------- Sheets helpers ----------
 SHEET_HEADERS = ["ts", "chat_id", "action", "total", "weights_json", "note"]
-
 
 def ensure_worksheet(sh, title: str):
     try:
         for ws in sh.worksheets():
             if ws.title == title:
                 return ws, False
-        ws = sh.add_worksheet(title=title, rows=200, cols=20)
-        if title == SHEET_WS:
-            ws.update("A1", [SHEET_HEADERS])
+        ws = sh.add_worksheet(title=title, rows=200, cols=max(10, len(SHEET_HEADERS)))
+        ws.update("A1", [SHEET_HEADERS])
         return ws, True
     except Exception as e:
         raise RuntimeError(f"ensure_worksheet error: {e}")
-
 
 def append_row(sh, title: str, row: list):
     ws, _ = ensure_worksheet(sh, title)
     ws.append_row(row, value_input_option="RAW")
 
+# ---------- CAL events sheet ----------
+CAL_HEADERS = [
+    "utc_iso",      # ISO время события (UTC)
+    "local_iso",    # ISO в локальной таймзоне (для удобства)
+    "country",      # страна (canonical: united states / euro area / united kingdom / japan / australia)
+    "currency",     # USD / EUR / GBP / JPY / AUD (если можем вывести)
+    "title",        # название события
+    "impact",       # 1/2/3 или текст ("high"/"medium"/"low")
+    "source",       # ff_html / ...
+    "fetched_at",   # когда бот подтянул
+]
 
-# -------------------- УТИЛИТЫ --------------------
+def ensure_cal_sheet(sh):
+    try:
+        for ws in sh.worksheets():
+            if ws.title == CAL_SHEET_WS:
+                # проверим хедеры
+                head = ws.row_values(1)
+                if head != CAL_HEADERS:
+                    ws.clear()
+                    ws.update("A1", [CAL_HEADERS])
+                return ws
+        ws = sh.add_worksheet(title=CAL_SHEET_WS, rows=1000, cols=len(CAL_HEADERS))
+        ws.update("A1", [CAL_HEADERS])
+        return ws
+    except Exception as e:
+        raise RuntimeError(f"ensure_cal_sheet error: {e}")
+
+def clear_cal_sheet(sh):
+    ws = ensure_cal_sheet(sh)
+    # чистим всё, оставив заголовок
+    ws.resize(rows=1)
+    ws.update("A1", [CAL_HEADERS])
+
+def add_events_to_cal_sheet(sh, events: List[dict]):
+    if not events:
+        return 0
+    ws = ensure_cal_sheet(sh)
+    # Добавим пачкой
+    values = []
+    fetched = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    for ev in events:
+        utc_dt: datetime = ev["utc"]
+        local_dt = utc_dt.astimezone(LOCAL_TZ) if LOCAL_TZ else utc_dt
+        values.append([
+            utc_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            local_dt.replace(microsecond=0).isoformat(),
+            ev.get("country", ""),
+            ev.get("currency", ""),
+            ev.get("title", ""),
+            str(ev.get("impact", "")),
+            ev.get("source", ""),
+            fetched
+        ])
+    ws.append_rows(values, value_input_option="RAW")
+    return len(values)
+
+def read_events_from_sheet(sh) -> List[dict]:
+    try:
+        ws = ensure_cal_sheet(sh)
+        rows = ws.get_all_records()
+        out = []
+        for r in rows:
+            try:
+                utc = r.get("utc_iso") or r.get("utc")
+                dt = datetime.fromisoformat(utc.replace("Z", "+00:00"))
+                out.append({
+                    "utc": dt,
+                    "country": (r.get("country") or "").strip().lower(),
+                    "currency": (r.get("currency") or "").strip().upper(),
+                    "title": r.get("title") or "",
+                    "impact": r.get("impact") or "",
+                    "source": r.get("source") or "",
+                    "fetched_at": r.get("fetched_at") or "",
+                })
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        log.warning("read_events_from_sheet error: %s", e)
+        return []
+
+# -------------------- Бесплатный сборщик: ForexFactory HTML --------------------
+_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36 fund-bot"
+
+def _clean_text(x: str) -> str:
+    return html.unescape(re.sub(r"\s+", " ", x)).strip()
+
+def fetch_forexfactory_week_html() -> List[dict]:
+    """
+    Парсим https://www.forexfactory.com/calendar?week=this
+    Вытаскиваем High-impact события, строим list[dict]:
+    {utc: datetime(UTC), country: canonical name, currency: USD..., title: str, impact: 3, source: 'ff_html'}
+    """
+    if not _REQUESTS_AVAILABLE:
+        return []
+    url = "https://www.forexfactory.com/calendar?week=this"
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": _UA})
+        r.raise_for_status()
+        html_text = r.text
+    except Exception as e:
+        log.warning("FF HTML fetch failed: %s", e)
+        return []
+
+    # Режим «широкий» парсинг: выделяем TR с классом calendar__row
+    rows = re.findall(r"<tr[^>]*calendar__row[^>]*>.*?</tr>", html_text, flags=re.I | re.S)
+    events = []
+    for row in rows:
+        # impact: ищем impact--3 (high)
+        m_imp = re.search(r"impact--([0-9])", row, flags=re.I)
+        if not m_imp:
+            continue
+        impact = int(m_imp.group(1))
+        if impact < 3:   # берем только High
+            continue
+
+        # timestamp: либо data-timestamp, либо data-event-datetime
+        m_ts = re.search(r'data-(?:event-)?timestamp="(\d+)"', row, flags=re.I)
+        ts = None
+        if m_ts:
+            try:
+                ts = int(m_ts.group(1))
+            except Exception:
+                ts = None
+        if not ts:
+            # fallback: иногда время лежит в data-time-utc="2025-09-10 12:30:00"
+            m_iso = re.search(r'data-time-utc="([\d:\-\s]+)"', row, flags=re.I)
+            if m_iso:
+                try:
+                    dt = datetime.strptime(m_iso.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    ts = int(dt.timestamp())
+                except Exception:
+                    ts = None
+        if not ts:
+            continue
+        dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+        # country code (USD/EUR/..)
+        m_ccy = re.search(r'data-country="([A-Za-z]{3})"', row)
+        ccy = None
+        if m_ccy:
+            ccy = m_ccy.group(1).upper()
+        else:
+            m_ccy2 = re.search(r'class="country__iso"[^>]*>\s*([A-Z]{3})\s*<', row)
+            if m_ccy2:
+                ccy = m_ccy2.group(1).upper()
+
+        country_name = ""
+        if ccy:
+            country_name = FF_CODE2NAME.get(ccy.lower(), ccy.lower())
+
+        # title
+        m_title = re.search(r'data-title="([^"]+)"', row)
+        if m_title:
+            title = _clean_text(m_title.group(1))
+        else:
+            m_title2 = re.search(r'calendar__event-title[^>]*>(.*?)</', row, flags=re.S | re.I)
+            title = _clean_text(m_title2.group(1)) if m_title2 else "Event"
+
+        events.append({
+            "utc": dt_utc,
+            "country": country_name,
+            "currency": ccy or CCY_BY_COUNTRY.get(country_name, "").upper(),
+            "title": title,
+            "impact": impact,
+            "source": "ff_html",
+        })
+
+    # простая дедупликация по (utc+country+title)
+    uniq = {}
+    for ev in events:
+        key = (ev["utc"].isoformat(), ev.get("country",""), ev.get("title",""))
+        if key not in uniq:
+            uniq[key] = ev
+    events = list(uniq.values())
+    log.info("FF HTML parsed: %d high-impact events", len(events))
+    return events
+
+# -------------------- Утилиты --------------------
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
-
 
 def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, float]:
     s = max(sum(weights.values()), 1)
@@ -251,7 +401,6 @@ def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, f
         "EURUSD": round(total * weights.get("EUR", 0) / s, 2),
         "GBPUSD": round(total * weights.get("GBP", 0) / s, 2),
     }
-
 
 def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
     now = now or datetime.now(timezone.utc)
@@ -266,28 +415,26 @@ def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
         return (f"через {h} ч" if future else f"{h} ч назад")
     return (f"через {m} мин" if future else f"{m} мин назад")
 
-
 def assert_master_chat(update: Update) -> bool:
     if MASTER_CHAT_ID and update.effective_chat:
         return update.effective_chat.id == MASTER_CHAT_ID
     return True
 
-
-# -------------------- КОМАНДЫ --------------------
+# -------------------- Команды --------------------
 HELP_TEXT = (
     "Что я умею\n"
     "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
     "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
     "/weights — показать целевые веса.\n"
     "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
-    "/digest — утренний «инвесторский» дайджест (человеческий язык + события).\n"
+    "/digest — утренний «инвесторский» дайджест.\n"
     "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
-    "/init_sheet — создать/проверить лист в Google Sheets.\n"
-    "/sheet_test — записать тестовую строку в лист.\n"
+    "/cal_refresh — обновить бесплатный календарь и записать в Sheets.\n"
+    "/init_sheet — создать/проверить листы в Google Sheets.\n"
+    "/sheet_test — записать тестовую строку в лист FUND_BOT.\n"
     "/diag — диагностика LLM и Google Sheets.\n"
     "/ping — проверить связь."
 )
-
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -295,14 +442,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
 
-
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
-
 
 async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not assert_master_chat(update):
@@ -319,7 +463,6 @@ async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     STATE["total"] = total
     await update.message.reply_text(f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
-
 
 async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not assert_master_chat(update):
@@ -342,14 +485,10 @@ async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     STATE["weights"] = new_w
-    await update.message.reply_text(
-        f"Целевые веса обновлены: {human_readable_weights(new_w)}"
-    )
-
+    await update.message.reply_text(f"Целевые веса обновлены: {human_readable_weights(new_w)}")
 
 async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Целевые веса: {human_readable_weights(STATE['weights'])}")
-
 
 async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = float(STATE["total"])
@@ -388,35 +527,22 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning("append_row alloc failed: %s", e)
 
-
-async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = (update.message.text or "").split()
-    pro = len(args) > 1 and args[1].lower() == "pro"
-
-    if pro:
-        try:
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-            txt = await generate_digest(
-                symbols=SYMBOLS,
-                model=LLM_MINI,
-                token_budget=LLM_TOKEN_BUDGET_PER_DAY,
-            )
-            await update.message.reply_text(txt)
-        except Exception as e:
-            await update.message.reply_text(f"LLM ошибка: {e}")
-        return
-
-    sh, _src = build_sheets_client(SHEET_ID)
+async def cmd_cal_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sh, src = build_sheets_client(SHEET_ID)
     if not sh:
-        await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
+        await update.message.reply_text(f"Sheets: ❌ {src}")
         return
-
     try:
-        msg = build_investor_digest(sh)
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        clear_cal_sheet(sh)
+        events = fetch_forexfactory_week_html()
+        # фильтруем по нашим 5 странам, только High
+        want = {c for c in COUNTRY_BY_CCY.values()}
+        events = [ev for ev in events if ev.get("country") in want and str(ev.get("impact")) in ("3", "high")]
+        n = add_events_to_cal_sheet(sh, events)
+        await update.message.reply_text(f"Календарь обновлён: записано {n} событий (High).")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
-
+        await update.message.reply_text(f"Ошибка обновления календаря: {e}")
 
 def sheets_diag_text() -> str:
     sid_state = "set" if SHEET_ID else "empty"
@@ -433,10 +559,11 @@ def sheets_diag_text() -> str:
         try:
             ws, created = ensure_worksheet(sh, SHEET_WS)
             mark = "created" if created else "exists"
-            return f"Sheets: ✅ ok (SID={sid_state}, {src}, ws={ws.title}:{mark})"
+            # проверим и cal лист
+            ensure_cal_sheet(sh)
+            return f"Sheets: ✅ ok (SID={sid_state}, {src}, ws={ws.title}:{mark}, cal={CAL_SHEET_WS})"
         except Exception as e:
             return f"Sheets: ❌ (open ok, ws error: {e})"
-
 
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -448,7 +575,6 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheets_line = sheets_diag_text()
     await update.message.reply_text(f"{llm_line}\n{sheets_line}")
 
-
 async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not SHEET_ID:
         await update.message.reply_text("SHEET_ID не задан.")
@@ -459,12 +585,12 @@ async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         ws, created = ensure_worksheet(sh, SHEET_WS)
+        ensure_cal_sheet(sh)
         await update.message.reply_text(
-            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
+            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'}; cal='{CAL_SHEET_WS}' готов ({src})"
         )
     except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
-
+        await update.message.reply_text(f"Sheets: ❌ ошибка создания листов: {e}")
 
 async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sh, src = build_sheets_client(SHEET_ID)
@@ -488,7 +614,6 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
-
 # ---------- Digest helpers ----------
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
@@ -498,13 +623,11 @@ def header_ru(dt) -> str:
     mm = _RU_MM[dt.month - 1]
     return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
 
-
 def _to_float(x, default=0.0) -> float:
     try:
         return float(str(x).strip().replace(",", "."))
     except Exception:
         return default
-
 
 def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
     sheet_name = BMR_SHEETS.get(symbol)
@@ -519,7 +642,6 @@ def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_
         return rows[-1]
     except Exception:
         return None
-
 
 def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
     sheet_name = BMR_SHEETS.get(symbol)
@@ -540,11 +662,9 @@ def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[
     except Exception:
         return None, None
 
-
 def price_fmt(symbol: str, value: Optional[float]) -> str:
     if value is None: return "—"
     return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
-
 
 def map_fa_level(risk: str) -> str:
     r = (risk or "").strip().lower()
@@ -552,13 +672,11 @@ def map_fa_level(risk: str) -> str:
     if r.startswith("yellow") or r.startswith("amber"): return "CAUTION"
     return "OK"
 
-
 def map_fa_bias(bias: str) -> str:
     b = (bias or "").strip().lower()
     if b.startswith("long"): return "LONG"
     if b.startswith("short"): return "SHORT"
     return "BOTH"
-
 
 def policy_from_level(level: str) -> Dict[str, object]:
     L = (level or "OK").upper()
@@ -566,11 +684,9 @@ def policy_from_level(level: str) -> Dict[str, object]:
     if L == "CAUTION": return {"reserve_off": False, "dca_scale": 0.75, "icon": "⚠️", "label": "умеренный риск"}
     return {"reserve_off": False, "dca_scale": 1.00, "icon": "✅", "label": "фон спокойный"}
 
-
 def supertrend_dir(val: str) -> str:
     v = (val or "").strip().lower()
     return "up" if "up" in v else "down" if "down" in v else "flat"
-
 
 def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
     trend_txt = "умеренное" if adx < 20 else "заметное" if adx < 25 else "выраженное"
@@ -579,451 +695,31 @@ def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
     noise_txt = "низкий" if vol_z < 0.5 else "умеренный" if vol_z < 1.5 else "повышенный"
     return f"{trend_txt} движение {dir_txt}; колебания {vola_txt}; рыночный шум {noise_txt}"
 
-
 def importance_is_high(val) -> bool:
     if val is None: return False
     if isinstance(val, (int, float)): return val >= 3
     s = str(val).strip().lower()
     return "high" in s or s == "3"
 
-
-# -------------------- КАЛЕНДАРИ --------------------
-def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    if not _REQUESTS_AVAILABLE:
-        return []
-    try:
-        cc = ",".join(quote(c) for c in countries)
-        url = f"{TE_BASE}/calendar/country/{cc}?d1={d1.strftime('%Y-%m-%dT%H:%M')}&d2={d2.strftime('%Y-%m-%dT%H:%M')}&importance=3&c={quote(TE_CLIENT)}:{quote(TE_KEY)}&format=json"
-        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-        r.raise_for_status()
-        arr = r.json() or []
-        out = []
-        for it in arr:
-            dt_s = it.get("DateUtc") or it.get("Date")
-            if not dt_s:
-                continue
-            try:
-                dt_utc = datetime.fromisoformat(dt_s.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            out.append({
-                "utc": dt_utc.astimezone(timezone.utc),
-                "country": (it.get("Country") or "").strip().lower(),
-                "title": it.get("Event") or "Event",
-                "importance": it.get("Importance") or 3,
-            })
-        return out
-    except Exception as e:
-        log.warning("calendar fetch (TE) failed: %s", e)
-        return []
-
-
-def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    if not (_REQUESTS_AVAILABLE and FMP_API_KEY):
-        return []
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={d1.date()}&to={d2.date()}&apikey={FMP_API_KEY}"
-        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-        r.raise_for_status()
-        arr = r.json() or []
-        out = []
-        want = {c.lower() for c in countries}
-        for it in arr:
-            cty = (it.get("country") or "").strip().lower()
-            if cty not in want:
-                continue
-            dt_s = it.get("date")
-            tm_s = it.get("time")
-            if not dt_s:
-                continue
-            try:
-                if tm_s:
-                    dt_utc = datetime.fromisoformat(f"{dt_s}T{tm_s}+00:00")
-                else:
-                    dt_utc = datetime.fromisoformat(f"{dt_s}T00:00:00+00:00")
-            except Exception:
-                continue
-            out.append({
-                "utc": dt_utc.astimezone(timezone.utc),
-                "country": cty,
-                "title": it.get("event") or it.get("title") or "Event",
-                "importance": it.get("impact") or it.get("importance") or "",
-            })
-        return out
-    except Exception as e:
-        log.warning("calendar fetch (FMP) failed: %s", e)
-        return []
-
-
-def fetch_calendar_events_finnhub(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    if not (_REQUESTS_AVAILABLE and FINNHUB_API_KEY):
-        return []
-    try:
-        url = f"https://finnhub.io/api/v1/calendar/economic?from={d1.date()}&to={d2.date()}&token={FINNHUB_API_KEY}"
-        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-        r.raise_for_status()
-        data = r.json() or {}
-        arr = data.get("economicCalendar") or data.get("events") or []
-        want = {c.lower() for c in countries}
-        out = []
-        for it in arr:
-            cty_raw = (it.get("country") or it.get("region") or "").strip().lower()
-            cty = FF_CODE2NAME.get(cty_raw, cty_raw)
-            if cty not in want:
-                continue
-            dt_s = it.get("time") or it.get("datetime") or it.get("date")
-            dt_utc = None
-            if dt_s:
-                try:
-                    dt_utc = datetime.fromisoformat(str(dt_s).replace("Z", "+00:00"))
-                except Exception:
-                    try:
-                        dt_utc = datetime.fromisoformat(f"{dt_s}T00:00:00+00:00")
-                    except Exception:
-                        pass
-            if not dt_utc:
-                continue
-            imp = it.get("impact") or it.get("importance") or ""
-            title = it.get("event") or it.get("title") or "Event"
-            out.append({
-                "utc": dt_utc.astimezone(timezone.utc),
-                "country": cty,
-                "title": title,
-                "importance": imp,
-            })
-        return out
-    except Exception as e:
-        log.warning("calendar fetch (Finnhub) failed: %s", e)
-        return []
-
-
-# ---------- Бесплатный ForexFactory: много эндпоинтов ----------
-def _ff_endpoints() -> List[str]:
-    # можно переопределить через FF_PROXY (например, твой CF Worker проксирует путь один в один)
-    base_list = [
-        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
-        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-        "https://cdn-nfs.faireconomy.media/ff_calendar_nextweek.json",
-        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-        "https://cdn-nfs.faireconomy.media/ff_calendar_lastweek.json",
-        "https://nfs.faireconomy.media/ff_calendar_lastweek.json",
-    ]
-    if FF_PROXY:
-        proxied = []
-        for u in base_list:
-            proxied.append(FF_PROXY.rstrip("/") + "/" + u.split("/", 3)[-1])
-        return proxied + base_list
-    return base_list
-
-
-def _ff_parse_dt(date_s: str, time_s: Optional[str]) -> Optional[datetime]:
-    try:
-        if not date_s:
-            return None
-        date_s = str(date_s).strip()
-        if time_s:
-            t = str(time_s).strip().lower()
-            if t in ("all day", "allday", "tentative"):
-                dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
-            else:
-                if "am" in t or "pm" in t:
-                    tnum = t.replace(" ", "")
-                    am = tnum.endswith("am")
-                    pm = tnum.endswith("pm")
-                    tnum = tnum[:-2]
-                    hh, mm = tnum.split(":") if ":" in tnum else (tnum, "00")
-                    h = int(hh); m = int(mm)
-                    if pm and h < 12: h += 12
-                    if am and h == 12: h = 0
-                    dt = datetime.fromisoformat(f"{date_s}T{h:02d}:{m:02d}:00+00:00")
-                else:
-                    if ":" in t:
-                        hh, mm = t.split(":", 1)
-                        h = int(hh); m = int(mm.split()[0])
-                        dt = datetime.fromisoformat(f"{date_s}T{h:02d}:{m:02d}:00+00:00")
-                    else:
-                        dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
-        else:
-            dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def fetch_calendar_events_ff_all() -> list[dict]:
-    """Пробуем несколько зеркал и недель (this/next/last). Кеш + backoff."""
-    if not _REQUESTS_AVAILABLE:
-        return _FF_CACHE["data"]
-    now = int(datetime.now(tz=timezone.utc).timestamp())
-
-    if _FF_NEG["until"] and now < _FF_NEG["until"]:
-        return _FF_CACHE["data"]
-
-    if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
-        return _FF_CACHE["data"]
-
-    headers = {
-        "User-Agent": "fund-bot/1.0 (+https://example.local)",
-        "Accept": "application/json,text/plain,*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    }
-
-    endpoints = _ff_endpoints()
-    for url in endpoints:
-        try:
-            # Анти-кеш
-            sep = "&" if "?" in url else "?"
-            full = f"{url}{sep}_={now%1000000}"
-            r = requests.get(full, timeout=12, headers=headers)
-            if r.status_code == 429:
-                _FF_NEG["until"] = now + 120
-                log.warning("calendar fetch (FF) 429 on %s: backoff 120s", url)
-                continue
-            r.raise_for_status()
-            raw = r.json() or []
-            data = []
-            for it in raw:
-                dt_utc = None
-                ts = it.get("timestamp")
-                if ts is not None:
-                    try:
-                        dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-                    except Exception:
-                        dt_utc = None
-                if dt_utc is None:
-                    dt_utc = _ff_parse_dt(it.get("date") or it.get("dateStr") or "", it.get("time"))
-                if dt_utc is None:
-                    continue
-                country_raw = (it.get("country") or "").strip()
-                country = FF_CODE2NAME.get(country_raw.lower(), country_raw).lower()
-                title = it.get("title") or it.get("event") or it.get("impactTitle") or "Event"
-                impact = it.get("impact") or it.get("impactText") or ""
-                data.append({
-                    "utc": dt_utc,
-                    "country": country,
-                    "title": title,
-                    "importance": impact,
-                })
-            if data:
-                _FF_CACHE["data"] = data
-                _FF_CACHE["at"] = now
-                _FF_NEG["until"] = 0
-                log.info("FF weekly: loaded %d events from %s", len(data), url)
-                return data
-            else:
-                log.info("FF weekly: %s returned 0 events", url)
-        except Exception as e:
-            log.warning("calendar fetch (FF) failed on %s: %s", url, e)
-
-    # Ничего не дали — оставляем прежний кеш (возможно пустой)
-    return _FF_CACHE["data"]
-
-
-def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: list[dict]) -> list[dict]:
-    want = {c.lower() for c in countries}
-    out = []
-    for ev in events:
-        if ev.get("utc") is None or ev.get("country") is None:
-            continue
-        if ev["country"].lower() in want and importance_is_high(ev.get("importance")) and d1 <= ev["utc"] <= d2:
-            out.append(ev)
-    return out
-
-
-def _load_official_backup_all() -> List[dict]:
-    src = OFF_BACKUP_JSON or ""
-    if not src and OFF_BACKUP_JSON_B64:
-        try:
-            src = _decode_b64_maybe_padded(OFF_BACKUP_JSON_B64)
-        except Exception:
-            src = ""
-    if not src:
-        return []
-    try:
-        arr = json.loads(src) or []
-        out = []
-        for it in arr:
-            try:
-                dt_utc = datetime.fromisoformat(str(it.get("utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
-            except Exception:
-                continue
-            out.append({
-                "utc": dt_utc,
-                "country": (it.get("country") or "").strip().lower(),
-                "title": it.get("title") or "Event",
-                "importance": it.get("importance") or "High",
-            })
-        return out
-    except Exception:
-        return []
-
-
-def _load_sheet_calendar_backup(d1: datetime, d2: datetime, countries: List[str]) -> List[dict]:
-    """Бесплатный и стабильный способ: лист CAL_EVENTS в твоём Google Sheet."""
-    if not SHEET_ID or not _GSHEETS_AVAILABLE:
-        return []
-    try:
-        sh, _ = build_sheets_client(SHEET_ID)
-        if not sh:
-            return []
-        ws, _ = ensure_worksheet(sh, SHEET_CAL_WS)
-        rows = ws.get_all_records()  # ожидаем колонки: utc,country,title,importance
-        want = {c.lower() for c in countries}
-        out = []
-        for r in rows:
-            utc_s = (r.get("utc") or r.get("UTC") or "").strip()
-            if not utc_s:
-                continue
-            try:
-                dt_utc = datetime.fromisoformat(utc_s.replace("Z", "+00:00")).astimezone(timezone.utc)
-            except Exception:
-                continue
-            cty = (r.get("country") or r.get("COUNTRY") or "").strip().lower()
-            if cty not in want:
-                continue
-            if not (d1 <= dt_utc <= d2):
-                continue
-            out.append({
-                "utc": dt_utc,
-                "country": cty,
-                "title": (r.get("title") or r.get("TITLE") or "Event").strip(),
-                "importance": (r.get("importance") or r.get("IMPACT") or "High").strip(),
-            })
-        if out:
-            log.info("Sheet calendar backup: %d events from '%s'", len(out), SHEET_CAL_WS)
-        return out
-    except Exception as e:
-        log.warning("Sheet calendar backup failed: %s", e)
-        return []
-
-
-def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    prov = CAL_PROVIDER
-    if prov == "ff":
-        ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
-        if not ev:
-            ev = _load_sheet_calendar_backup(d1, d2, countries)
-        if not ev:
-            ev = _filter_events_by(countries, d1, d2, _load_official_backup_all())
-        return ev
-    if prov == "te":
-        return fetch_calendar_events_te(countries, d1, d2)
-    if prov == "fmp":
-        return fetch_calendar_events_fmp(countries, d1, d2)
-    if prov == "finnhub":
-        return fetch_calendar_events_finnhub(countries, d1, d2)
-
-    # auto: FF → Sheet backup → Official backup → TE → FMP → Finnhub
-    ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
-    if not ev:
-        ev = _load_sheet_calendar_backup(d1, d2, countries)
-    if not ev:
-        ev = _filter_events_by(countries, d1, d2, _load_official_backup_all())
-    if not ev:
-        ev = fetch_calendar_events_te(countries, d1, d2)
-    if not ev:
-        ev = fetch_calendar_events_fmp(countries, d1, d2)
-    if not ev:
-        ev = fetch_calendar_events_finnhub(countries, d1, d2)
-    return ev
-
-
-def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = None) -> Dict[str, dict]:
-    now = datetime.now(timezone.utc)
-    w = window_min if window_min is not None else CAL_WINDOW_MIN
-    d1 = now - timedelta(minutes=w)
-    d2 = now + timedelta(minutes=w)
-
-    if LOCAL_TZ:
-        now_loc = now.astimezone(LOCAL_TZ)
-        day_start_loc = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
-        d1_ext = day_start_loc - timedelta(days=1)
-        d2_ext = day_start_loc + timedelta(days=2)
-        d1_ext, d2_ext = d1_ext.astimezone(timezone.utc), d2_ext.astimezone(timezone.utc)
-    else:
-        d1_ext, d2_ext = now - timedelta(hours=36), now + timedelta(hours=36)
-
-    out: Dict[str, dict] = {}
-
-    all_raw_ff = fetch_calendar_events_ff_all() if CAL_PROVIDER in ("ff", "auto") else None
-
-    for sym in symbols:
-        countries = PAIR_COUNTRIES.get(sym, [])
-
-        if all_raw_ff is not None:
-            want = {c.lower() for c in countries}
-            sym_raw_all = [ev for ev in all_raw_ff if ev.get("country", "").lower() in want]
-        else:
-            sym_raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
-
-        around = [
-            {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
-            for ev in sym_raw_all
-            if importance_is_high(ev.get("importance")) and d1 <= ev["utc"] <= d2
-        ]
-        around.sort(key=lambda x: x["utc"])
-
-        red_soon = any(abs((ev["utc"] - now).total_seconds()) / 60.0 <= 60 for ev in around)
-        quiet_now = any(
-            (ev["utc"] - timedelta(minutes=QUIET_BEFORE_MIN)) <= now <= (ev["utc"] + timedelta(minutes=QUIET_AFTER_MIN))
-            for ev in around
-        )
-
-        nearest_prev = nearest_next = None
-        if not around:
-            high_events = [ev for ev in sym_raw_all if importance_is_high(ev.get("importance"))]
-            past = [ev for ev in high_events if ev["utc"] < now]
-            futr = [ev for ev in high_events if ev["utc"] >= now]
-            if past:
-                p = max(past, key=lambda e: e["utc"])
-                nearest_prev = {**p, "local": p["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else p["utc"]}
-            if futr:
-                n = min(futr, key=lambda e: e["utc"])
-                nearest_next = {**n, "local": n["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]}
-
-        out[sym] = {
-            "events": around,
-            "red_event_soon": red_soon,
-            "quiet_from_to": (QUIET_BEFORE_MIN, QUIET_AFTER_MIN) if around else (0, 0),
-            "quiet_now": quiet_now,
-            "nearest_prev": nearest_prev,
-            "nearest_next": nearest_next,
-        }
-
-    log.info("calendar: provider=%s, window=±%s min, utc=%s..%s",
-             CAL_PROVIDER, w, d1.isoformat(timespec="minutes"), d2.isoformat(timespec="minutes"))
-    for sym, pack in out.items():
-        log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
-                 sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
-    return out
-
-
 def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
                         vol_z: float, atr1h: float, rsi: float, red_event_soon: bool) -> int:
     P = 55
     against_dir = "down" if (side or "").upper() == "LONG" else "up"
-
     if (fa_bias == "LONG" and against_dir == "up") or (fa_bias == "SHORT" and against_dir == "down"):
         P += 10
     elif fa_bias in ("LONG", "SHORT"):
         P -= 15
-
     if adx >= 25: P += 6
     elif adx >= 20: P += 3
     else: P -= 5
-
     if st_dir == against_dir: P += 5
     else: P -= 5
-
     if vol_z < 0.3: P -= 3
     elif vol_z < 1.5: P += 3
     elif vol_z > 2.5: P -= 7
-
     if atr1h > 1.2: P += 4
     elif atr1h < 0.8: P -= 4
     else: P += 1
-
     side_up = (side or "").upper() == "SHORT"
     if side_up:
         if rsi > 65: P += 3
@@ -1031,10 +727,8 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     else:
         if rsi < 35: P += 3
         if rsi > 65: P -= 4
-
     if red_event_soon: P -= 7
     return max(35, min(75, int(round(P))))
-
 
 def action_text(P: int, quiet_now: bool, level: str) -> str:
     if level == "HIGH":
@@ -1048,7 +742,6 @@ def action_text(P: int, quiet_now: bool, level: str) -> str:
         return "базовый план"
     return "дополнительные доборы не приоритетны"
 
-
 def delta_marker(target: float, fact: float) -> str:
     if target <= 0:
         return "—"
@@ -1060,13 +753,91 @@ def delta_marker(target: float, fact: float) -> str:
         return f"⚠️ небольшое отклонение ({delta_pct:+.1%})"
     return f"🚧 существенное отклонение ({delta_pct:+.1%})"
 
+# -------------------- Календарь: читаем из Sheets, обновляем при необходимости --------------------
+def load_events_for_symbols_from_sheet(sh, symbols: List[str], window_min: int) -> Dict[str, dict]:
+    """
+    Возвращает слепок событий для каждой пары (как раньше), но источником служит лист CAL_EVENTS.
+    """
+    now = datetime.now(timezone.utc)
+    d1 = now - timedelta(minutes=window_min)
+    d2 = now + timedelta(minutes=window_min)
+
+    all_rows = read_events_from_sheet(sh)
+
+    # определим свежесть кэша
+    fresh = False
+    try:
+        latest_fetch = max(
+            datetime.fromisoformat((r.get("fetched_at") or "").replace("Z", "+00:00"))
+            for r in all_rows if r.get("fetched_at")
+        )
+        fresh = (datetime.utcnow().replace(tzinfo=timezone.utc) - latest_fetch) < timedelta(seconds=CAL_TTL_SEC)
+    except Exception:
+        fresh = False
+
+    # если пусто или кэш протух — попробуем обновиться из FF и тут же перечитать
+    if (not all_rows) or (not fresh):
+        try:
+            clear_cal_sheet(sh)
+            events = fetch_forexfactory_week_html()
+            want = {c for c in COUNTRY_BY_CCY.values()}
+            events = [ev for ev in events if ev.get("country") in want and str(ev.get("impact")) in ("3", "high")]
+            add_events_to_cal_sheet(sh, events)
+            all_rows = read_events_from_sheet(sh)
+            log.info("Calendar refreshed: %d rows", len(all_rows))
+        except Exception as e:
+            log.warning("Calendar refresh failed: %s", e)
+
+    # фильтруем по окну и раскладываем по парам
+    out: Dict[str, dict] = {}
+    for sym in symbols:
+        countries = PAIR_COUNTRIES.get(sym, [])
+        around = []
+        high_events = []
+        for r in all_rows:
+            if r.get("country") in countries:
+                if importance_is_high(r.get("impact")):
+                    high_events.append(r)
+                    if d1 <= r["utc"] <= d2:
+                        around.append(r)
+
+        around.sort(key=lambda x: x["utc"])
+        red_soon = any(abs((ev["utc"] - now).total_seconds()) / 60.0 <= 60 for ev in around)
+        quiet_now = any(
+            (ev["utc"] - timedelta(minutes=45)) <= now <= (ev["utc"] + timedelta(minutes=45))
+            for ev in around
+        )
+
+        nearest_prev = nearest_next = None
+        if not around and high_events:
+            past = [ev for ev in high_events if ev["utc"] < now]
+            futr = [ev for ev in high_events if ev["utc"] >= now]
+            if past:
+                p = max(past, key=lambda e: e["utc"])
+                nearest_prev = {**p, "local": p["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else p["utc"]}
+            if futr:
+                n = min(futr, key=lambda e: e["utc"])
+                nearest_next = {**n, "local": n["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]}
+
+        out[sym] = {
+            "events": [
+                {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
+                for ev in around
+            ],
+            "red_event_soon": red_soon,
+            "quiet_from_to": (45, 45) if around else (0, 0),
+            "quiet_now": quiet_now,
+            "nearest_prev": nearest_prev,
+            "nearest_next": nearest_next,
+        }
+    return out
 
 def build_investor_digest(sh) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
 
     blocks: List[str] = [header]
-    cal = build_calendar_for_symbols(SYMBOLS)
+    cal = load_events_for_symbols_from_sheet(sh, SYMBOLS, CAL_WINDOW_MIN)
 
     for sym in SYMBOLS:
         row = get_last_nonempty_row(sh, sym) or {}
@@ -1098,7 +869,7 @@ def build_investor_digest(sh) -> str:
                 ev_line += f"\n• **Последний High:** {prev_ev['local']:%H:%M} — {prev_ev['country']}: {prev_ev['title']} ({_fmt_tdelta_human(prev_ev['utc'])})."
             if next_ev := c.get("nearest_next"):
                 ev_line += f"\n• **Ближайший High:** {next_ev['local']:%H:%M} — {next_ev['country']}: {next_ev['title']} ({_fmt_tdelta_human(next_ev['utc'])})."
-
+        
         q_from, q_to = c.get("quiet_from_to", (0, 0))
         blocks.append(
 f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias}**
@@ -1110,18 +881,17 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
 • **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
-    summary_lines: List[str] = []
-    all_events = []
+    summary_lines, all_events = [], []
     for sym in SYMBOLS:
         all_events.extend(
-            (ev["utc"], ev["local"], sym, ev["country"], ev["title"])
+            (ev["utc"], ev.get("local", ev["utc"]), sym, ev.get("country",""), ev.get("title",""))
             for ev in cal.get(sym, {}).get("events", [])
         )
+
     if not all_events:
         all_events.extend(
             (n["utc"], n["local"], sym, n["country"], n["title"])
-            for sym in SYMBOLS
-            if (n := cal.get(sym, {}).get("nearest_next"))
+            for sym in SYMBOLS if (n := cal.get(sym, {}).get("nearest_next"))
         )
 
     if all_events:
@@ -1130,11 +900,7 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
         for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    parts = list(blocks)
-    if summary_lines:
-        parts.append("\n".join(summary_lines))
-    return "\n\n".join(parts)
-
+    return "\n\n".join(blocks + ["\n".join(summary_lines)] if summary_lines else [])
 
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
@@ -1147,7 +913,8 @@ async def _set_bot_commands(app: Application):
         BotCommand("weights", "Показать целевые веса"),
         BotCommand("alloc", "Рассчитать распределение банка"),
         BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
-        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
+        BotCommand("cal_refresh", "Обновить бесплатный календарь событий"),
+        BotCommand("init_sheet", "Создать/проверить листы в Google Sheets"),
         BotCommand("sheet_test", "Тестовая запись в лист"),
         BotCommand("diag", "Диагностика LLM и Sheets"),
     ]
@@ -1156,23 +923,34 @@ async def _set_bot_commands(app: Application):
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
 
-
 async def morning_digest_scheduler(app: Application):
     from datetime import datetime as _dt, timedelta as _td, time as _time
     import asyncio as _asyncio
     while True:
         now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
-        if LOCAL_TZ:
-            target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ))
-        else:
-            target = now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
+        target = _dt.combine(
+            now.date(),
+            _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)
+        ) if LOCAL_TZ else now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
         if now >= target:
             target = target + _td(days=1)
         await _asyncio.sleep(max(1.0, (target - now).total_seconds()))
         try:
             sh, _src = build_sheets_client(SHEET_ID)
             if sh:
+                # перед дайджестом убедимся в наличии свежих событий
+                try:
+                    clear_cal_sheet(sh)
+                    events = fetch_forexfactory_week_html()
+                    want = {c for c in COUNTRY_BY_CCY.values()}
+                    events = [ev for ev in events if ev.get("country") in want and str(ev.get("impact")) in ("3", "high")]
+                    add_events_to_cal_sheet(sh, events)
+                except Exception as e:
+                    log.warning("Morning refresh calendar failed: %s", e)
+
                 msg = build_investor_digest(sh)
+                if not msg.strip():
+                    msg = "Календарь пуст или источники не ответили (попробуем позже)."
                 await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
             else:
                 await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
@@ -1182,7 +960,6 @@ async def morning_digest_scheduler(app: Application):
             except Exception:
                 pass
 
-
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
@@ -1190,7 +967,6 @@ def build_application() -> Application:
     if 'AIORateLimiter' in globals() and AIORateLimiter:
         builder = builder.rate_limiter(AIORateLimiter())
     app = builder.build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -1199,11 +975,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("weights", cmd_weights))
     app.add_handler(CommandHandler("alloc", cmd_alloc))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("cal_refresh", cmd_cal_refresh))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
     return app
-
 
 async def main_async():
     log.info("Fund bot is running…")
@@ -1215,13 +991,11 @@ async def main_async():
     await app.updater.start_polling()
     await asyncio.Event().wait()
 
-
 def main():
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass
-
 
 if __name__ == "__main__":
     main()
