@@ -1,10 +1,9 @@
-# fa_bot.py
+# fa_bot.py  — Fund/FA bot, investor digest + calendar
+# Default TZ: Europe/Belgrade. Calendar provider: auto (TE -> FMP -> FF) with FF cache/backoff.
 import os
 import json
 import base64
 import logging
-from math import floor
-from time import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
 
@@ -50,11 +49,9 @@ except Exception:
 # --- HTTP для календаря ---
 try:
     import requests
-    from urllib.parse import quote
     _REQUESTS_AVAILABLE = True
 except Exception:
     requests = None
-    quote = None
     _REQUESTS_AVAILABLE = False
 
 # --- LLM-клиент ---
@@ -112,7 +109,7 @@ TE_KEY = os.getenv("TE_KEY", "guest").strip()
 CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
-CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
+CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()  # auto | te | fmp | ff
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
 CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
 
@@ -247,15 +244,15 @@ def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, f
 def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
     now = now or datetime.now(timezone.utc)
     sec = int((dt_to - now).total_seconds())
-    sign = "через" if sec >= 0 else "назад"
+    future = sec >= 0
     sec = abs(sec)
     h = sec // 3600
     m = (sec % 3600) // 60
     if h and m:
-        return f"{'через ' if sign=='через' else ''}{h} ч {m:02d} мин" if sign=='через' else f"{h} ч {m:02d} мин назад"
+        return (f"через {h} ч {m:02d} мин") if future else (f"{h} ч {m:02d} мин назад")
     if h:
-        return f"{'через ' if sign=='через' else ''}{h} ч" if sign=='через' else f"{h} ч назад"
-    return f"{'через ' if sign=='через' else ''}{m} мин" if sign=='через' else f"{m} мин назад"
+        return (f"через {h} ч") if future else (f"{h} ч назад")
+    return (f"через {m} мин") if future else (f"{m} мин назад")
 
 
 def assert_master_chat(update: Update) -> bool:
@@ -368,7 +365,7 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sh,
                 SHEET_WS,
                 [
-                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                     str(update.effective_chat.id),
                     "alloc",
                     f"{total:.2f}",
@@ -467,7 +464,7 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sh,
             SHEET_WS,
             [
-                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                 str(update.effective_chat.id),
                 "test",
                 f"{STATE['total']:.2f}",
@@ -578,24 +575,94 @@ def importance_is_high(val) -> bool:
     return "high" in s or s == "3"
 
 
+def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
+                        vol_z: float, atr1h: float, rsi: float, red_event_soon: bool) -> int:
+    P = 55
+    against_dir = "down" if (side or "").upper() == "LONG" else "up"
+
+    if (fa_bias == "LONG" and against_dir == "up") or (fa_bias == "SHORT" and against_dir == "down"):
+        P += 10
+    elif fa_bias in ("LONG", "SHORT"):
+        P -= 15
+
+    if adx >= 25: P += 6
+    elif adx >= 20: P += 3
+    else: P -= 5
+
+    if st_dir == against_dir: P += 5
+    else: P -= 5
+
+    if vol_z < 0.3: P -= 3
+    elif vol_z < 1.5: P += 3
+    elif vol_z > 2.5: P -= 7
+
+    if atr1h > 1.2: P += 4
+    elif atr1h < 0.8: P -= 4
+    else: P += 1
+
+    side_up = (side or "").upper() == "SHORT"  # «против SHORT» = вверх
+    if side_up:
+        if rsi > 65: P += 3
+        if rsi < 35: P -= 4
+    else:
+        if rsi < 35: P += 3
+        if rsi > 65: P -= 4
+
+    if red_event_soon: P -= 7
+
+    return max(35, min(75, int(round(P))))
+
+
+def action_text(P: int, quiet_now: bool, level: str) -> str:
+    if level == "HIGH":
+        if P >= 64:
+            return "готовьтесь добирать 1 шаг (после снятия ограничений и вне тихого окна)"
+    if P >= 64:
+        return "готовьтесь добирать 2 шага" + (" (вне тихого окна)" if quiet_now else "")
+    if P >= 58:
+        return "готовьтесь добирать 1 шаг" + (" (вне тихого окна)" if quiet_now else "")
+    if P >= 50:
+        return "базовый план"
+    return "дополнительные доборы не приоритетны"
+
+
+def delta_marker(target: float, fact: float) -> str:
+    if target <= 0:
+        return "—"
+    delta_pct = (fact - target) / target
+    ap = abs(delta_pct)
+    if ap <= 0.02:
+        return "✅"
+    if ap <= 0.05:
+        return f"⚠️ небольшое отклонение ({delta_pct:+.1%})"
+    return f"🚧 существенное отклонение ({delta_pct:+.1%})"
+
+
+# ---- Поставщики календаря (TE/FMP заглушки; FF — рабочий) ----
 def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    # ... (implementation remains the same)
+    # TradingEconomics требует персональный ключ; здесь заглушка.
+    # Оставлено для совместимости при CAL_PROVIDER=te.
     return []
 
 
 def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    # ... (implementation remains the same)
+    # FMP «Economic Calendar» может быть недоступен на free-плане; заглушка.
+    # Оставлено для совместимости при CAL_PROVIDER=fmp.
     return []
 
 
 def fetch_calendar_events_ff_all() -> list[dict]:
     """Скачиваем недельный JSON FF с кешом и защитой от 429."""
-    import time
-    now = int(time.time())
+    if not _REQUESTS_AVAILABLE:
+        return _FF_CACHE["data"]
+    import time as _time
+    now = int(_time.time())
 
+    # Если недавно был 429 — терпим
     if _FF_NEG["until"] and now < _FF_NEG["until"]:
         return _FF_CACHE["data"]
 
+    # Свежий кеш
     if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
         return _FF_CACHE["data"]
 
@@ -612,7 +679,8 @@ def fetch_calendar_events_ff_all() -> list[dict]:
         data = []
         for it in raw or []:
             ts = it.get("timestamp")
-            if not ts: continue
+            if not ts:
+                continue
             dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
             country_raw = (it.get("country") or "").strip()
             country = FF_CODE2NAME.get(country_raw.lower(), country_raw)
@@ -628,7 +696,7 @@ def fetch_calendar_events_ff_all() -> list[dict]:
         return data
     except Exception as e:
         log.warning("calendar fetch (FF) failed: %s", e)
-        return _FF_CACHE["data"]
+        return _FF_CACHE["data"] or []
 
 
 def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: list[dict]) -> list[dict]:
@@ -642,13 +710,19 @@ def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: 
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
     prov = CAL_PROVIDER
-    if prov == "te": return fetch_calendar_events_te(countries, d1, d2)
-    if prov == "fmp": return fetch_calendar_events_fmp(countries, d1, d2)
-    if prov == "ff": return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+    if prov == "te":
+        return fetch_calendar_events_te(countries, d1, d2)
+    if prov == "fmp":
+        return fetch_calendar_events_fmp(countries, d1, d2)
+    if prov == "ff":
+        return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
 
+    # auto: TE -> FMP -> FF
     ev = fetch_calendar_events_te(countries, d1, d2)
-    if not ev: ev = fetch_calendar_events_fmp(countries, d1, d2)
-    if not ev: ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+    if not ev:
+        ev = fetch_calendar_events_fmp(countries, d1, d2)
+    if not ev:
+        ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
     return ev
 
 
@@ -658,6 +732,7 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
     d1 = now - timedelta(minutes=w)
     d2 = now + timedelta(minutes=w)
 
+    # расширенное окно на +-1 день вокруг текущих суток по локальному времени, чтобы найти prev/next
     if LOCAL_TZ:
         now_loc = now.astimezone(LOCAL_TZ)
         day_start_loc = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -668,21 +743,19 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
         d1_ext, d2_ext = now - timedelta(hours=36), now + timedelta(hours=36)
 
     out: Dict[str, dict] = {}
-    
-    # Efficiently pre-fetch all events if using a provider that supports it (like FF)
+
+    # При CAL_PROVIDER in ('ff','auto') — подхватим FF-список один раз (экономия запросов).
     all_raw_events = fetch_calendar_events_ff_all() if CAL_PROVIDER in ('ff', 'auto') else None
 
     for sym in symbols:
         countries = PAIR_COUNTRIES.get(sym, [])
-        
+
         if all_raw_events is not None:
-             # Filter pre-fetched list
             want = {c.lower() for c in countries}
             sym_raw_all = [ev for ev in all_raw_events if ev["country"].lower() in want]
         else:
-             # Fetch per-symbol group
             sym_raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
-            
+
         around = [
             {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
             for ev in sym_raw_all
@@ -716,11 +789,18 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
             "nearest_prev": nearest_prev,
             "nearest_next": nearest_next,
         }
+
+    log.info("calendar: provider=%s, window=±%s min, utc=%s..%s",
+             CAL_PROVIDER, w, d1.isoformat(timespec="minutes"), d2.isoformat(timespec="minutes"))
+    for sym, pack in out.items():
+        log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
+                 sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
+
     return out
 
 
 def build_investor_digest(sh) -> str:
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
 
     blocks: List[str] = [header]
@@ -756,7 +836,7 @@ def build_investor_digest(sh) -> str:
                 ev_line += f"\n• **Последний High:** {prev_ev['local']:%H:%M} — {prev_ev['country']}: {prev_ev['title']} ({_fmt_tdelta_human(prev_ev['utc'])})."
             if next_ev := c.get("nearest_next"):
                 ev_line += f"\n• **Ближайший High:** {next_ev['local']:%H:%M} — {next_ev['country']}: {next_ev['title']} ({_fmt_tdelta_human(next_ev['utc'])})."
-        
+
         q_from, q_to = c.get("quiet_from_to", (0, 0))
         blocks.append(
 f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias}**
@@ -768,46 +848,108 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
 • **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
+    # Сводка ближайших событий (если в «окне» пусто — покажем ближайшие next)
     summary_lines, all_events = [], []
     for sym in SYMBOLS:
         all_events.extend((ev["utc"], ev["local"], sym, ev["country"], ev["title"]) for ev in cal.get(sym, {}).get("events", []))
-
     if not all_events:
         all_events.extend((n["utc"], n["local"], sym, n["country"], n["title"]) for sym in SYMBOLS if (n := cal.get(sym, {}).get("nearest_next")))
 
     if all_events:
         summary_lines.append("\n📅 **Ближайшие High-события (Белград):**")
-        unique_events = {ev[0]: ev for ev in sorted(all_events)}
-        for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
+        # дедуп по (utc, title, sym) чтобы не склеить разные страны в одну точку времени
+        uniq = {}
+        for item in sorted(all_events, key=lambda x: x[0]):
+            key = (item[0], item[2], item[4])
+            if key not in uniq:
+                uniq[key] = item
+        for _, tloc, sym, cty, title in list(uniq.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    return "\n\n".join(blocks + ["\n".join(summary_lines)] if summary_lines else [])
+    return "\n\n".join(blocks + (["\n".join(summary_lines)] if summary_lines else []))
 
 
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
-    # ... (implementation remains the same)
-    pass
+    cmds = [
+        BotCommand("start", "Запуск бота"),
+        BotCommand("help", "Список команд"),
+        BotCommand("ping", "Проверка связи"),
+        BotCommand("settotal", "Задать общий банк (мастер-чат)"),
+        BotCommand("setweights", "Задать целевые веса (мастер-чат)"),
+        BotCommand("weights", "Показать целевые веса"),
+        BotCommand("alloc", "Рассчитать распределение банка"),
+        BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
+        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
+        BotCommand("sheet_test", "Тестовая запись в лист"),
+        BotCommand("diag", "Диагностика LLM и Sheets"),
+    ]
+    try:
+        await app.bot.set_my_commands(cmds)
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
 
 
 async def morning_digest_scheduler(app: Application):
-    # ... (implementation remains the same)
-    pass
+    from datetime import datetime as _dt, timedelta as _td, time as _time
+    import asyncio as _asyncio
+    while True:
+        now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
+        target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
+        if now >= target:
+            target = target + _td(days=1)
+        await _asyncio.sleep(max(1.0, (target - now).total_seconds()))
+        try:
+            sh, _src = build_sheets_client(SHEET_ID)
+            if sh:
+                msg = build_investor_digest(sh)
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
+        except Exception as e:
+            try:
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+            except Exception:
+                pass
 
 
 def build_application() -> Application:
-    # ... (implementation remains the same)
-    return Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+    builder: ApplicationBuilder = Application.builder().token(BOT_TOKEN)
+    if _RATE_LIMITER_AVAILABLE and AIORateLimiter:
+        builder = builder.rate_limiter(AIORateLimiter())
+    app = builder.build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("settotal", cmd_settotal))
+    app.add_handler(CommandHandler("setweights", cmd_setweights))
+    app.add_handler(CommandHandler("weights", cmd_weights))
+    app.add_handler(CommandHandler("alloc", cmd_alloc))
+    app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
+    app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
+    return app
 
 
 async def main_async():
-    # ... (implementation remains the same)
-    pass
+    log.info("Fund bot is running…")
+    app = build_application()
+    await _set_bot_commands(app)
+    await app.initialize()
+    await app.start()
+    asyncio.create_task(morning_digest_scheduler(app))
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
 
 
 def main():
-    # ... (implementation remains the same)
-    pass
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
