@@ -106,18 +106,18 @@ LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
 # ---------- Календарь/источники ----------
-TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
-TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
-TE_KEY = os.getenv("TE_KEY", "guest").strip()
-
 CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "240") or "240")
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
 
 # provider: auto|ff|fmp|te|free|dailyfx|investing
+# В этом файле реализован режим free (FF/DailyFX/Investing/CB)
 CAL_PROVIDER = os.getenv("CAL_PROVIDER", "free").lower()
 
-FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
+# Горизонт, на который собираем события в шит и для объединителя
+FREE_LOOKAHEAD_DAYS = int(os.getenv("FREE_LOOKAHEAD_DAYS", "10") or "10")
+FREE_LOOKBACK_DAYS  = int(os.getenv("FREE_LOOKBACK_DAYS",  "2") or "2")
+
 CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
 CAL_REFRESH_MIN = int(os.getenv("CAL_REFRESH_MIN", "180") or "180")
 
@@ -128,16 +128,13 @@ COUNTRY_BY_CCY = {
     "GBP": "united kingdom",
     "AUD": "australia",
 }
-FF_CODE2NAME = {
-    "usd": "united states", "jpy": "japan", "eur": "euro area",
-    "gbp": "united kingdom", "aud": "australia",
-}
 PAIR_COUNTRIES = {
     "USDJPY": [COUNTRY_BY_CCY["USD"], COUNTRY_BY_CCY["JPY"]],
     "AUDUSD": [COUNTRY_BY_CCY["AUD"], COUNTRY_BY_CCY["USD"]],
     "EURUSD": [COUNTRY_BY_CCY["EUR"], COUNTRY_BY_CCY["USD"]],
     "GBPUSD": [COUNTRY_BY_CCY["GBP"], COUNTRY_BY_CCY["USD"]],
 }
+WANT_COUNTRIES = {c.lower() for ps in PAIR_COUNTRIES.values() for c in ps}
 
 # ---------- STATE ----------
 _FF_CACHE = {"at": 0, "data": []}
@@ -209,16 +206,16 @@ def ensure_worksheet(sh, title: str, headers: Optional[List[str]]=None):
             if ws.title == title:
                 if headers:
                     try:
-                        ws.update(headers, "A1")
+                        # правильный порядок аргументов
+                        ws.update("A1", [headers])
                     except Exception:
-                        # ignore if not needed
                         pass
                 return ws, False
         ws = sh.add_worksheet(title=title, rows=500, cols=max(10, len(headers or SHEET_HEADERS)))
         if headers:
-            ws.update(headers, "A1")
+            ws.update("A1", [headers])
         else:
-            ws.update([SHEET_HEADERS], "A1")
+            ws.update("A1", [SHEET_HEADERS])
         return ws, True
     except Exception as e:
         raise RuntimeError(f"ensure_worksheet error: {e}")
@@ -258,7 +255,7 @@ def assert_master_chat(update: Update) -> bool:
         return update.effective_chat.id == MASTER_CHAT_ID
     return True
 
-# ---------- Commands ----------
+# ---------- Commands: basic ----------
 HELP_TEXT = (
     "Что я умею\n"
     "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
@@ -266,7 +263,8 @@ HELP_TEXT = (
     "/weights — показать целевые веса.\n"
     "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
     "/digest — утренний дайджест (investor) / pro (trader).\n"
-    "/cal_refresh — обновить экономкалендарь (бесплатные источники).\n"
+    "/cal_refresh — обновить экономкалендарь (free источники) и записать в шит.\n"
+    "/cal_debug — показать статистику по источникам/фильтрам.\n"
     "/init_sheet — создать/проверить листы в Google Sheets.\n"
     "/sheet_test — тестовая запись в лист.\n"
     "/diag — диагностика LLM и Google Sheets.\n"
@@ -426,12 +424,6 @@ def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
     noise_txt = "низкий" if vol_z < 0.5 else "умеренный" if vol_z < 1.5 else "повышенный"
     return f"{trend_txt} движение {dir_txt}; колебания {vola_txt}; рыночный шум {noise_txt}"
 
-def importance_is_high(val) -> bool:
-    if val is None: return False
-    if isinstance(val, (int, float)): return val >= 3
-    s = str(val).strip().lower()
-    return "high" in s or s == "3"
-
 def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
                         vol_z: float, atr1h: float, rsi: float, red_event_soon: bool) -> int:
     P = 55
@@ -533,11 +525,68 @@ def _fetch_with_fallback(url: str, referer: str | None = None, timeout=12) -> tu
 def _clean_text(x: str) -> str:
     return re.sub(r"\s+", " ", x or "").strip()
 
-# ---------- Sources: ForexFactory ----------
+# ---------- Sources: ForexFactory JSON + HTML ----------
+def fetch_ff_json_week() -> list[dict]:
+    """
+    Основной бесплатный источник: недельный JSON FF.
+    Берём 2 адреса по очереди.
+    """
+    if not _REQUESTS_AVAILABLE:
+        return _FF_CACHE["data"] or []
+
+    import time as _t
+    now = int(_t.time())
+
+    if _FF_NEG["until"] and now < _FF_NEG["until"]:
+        return _FF_CACHE["data"] or []
+
+    if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
+        return _FF_CACHE["data"]
+
+    urls = [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    ]
+    s = _build_session()
+    s.headers.update({"User-Agent": _ua(1)})
+
+    for url in urls:
+        try:
+            r = s.get(url, timeout=12)
+            if r.status_code == 429:
+                _FF_NEG["until"] = now + 120
+                log.warning("FF JSON 429: backoff 120s")
+                return _FF_CACHE["data"] or []
+            r.raise_for_status()
+            raw = r.json()
+            data = []
+            for it in raw or []:
+                ts = it.get("timestamp")
+                ccy = (it.get("country") or "").strip().upper()
+                impact = str(it.get("impact") or "").lower()
+                if not ts or "high" not in impact:
+                    continue
+                dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                data.append({
+                    "utc": dt_utc,
+                    "country": COUNTRY_BY_CCY.get(ccy, ccy),
+                    "title": it.get("title") or it.get("event") or "Event",
+                    "importance": "high",
+                    "src": "ff_json",
+                })
+            _FF_CACHE["data"] = data
+            _FF_CACHE["at"] = now
+            _FF_NEG["until"] = 0
+            log.info("FF JSON parsed: %d", len(data))
+            return data
+        except Exception as e:
+            log.warning("FF JSON fetch failed (%s): %s", url, e)
+            continue
+    return _FF_CACHE["data"] or []
+
 def _parse_ff_text(text: str) -> list[dict]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     out = []
-    # Пример строки через зеркало содержит месяц: "Wed, Sep 11 14:30 USD CPI m/m High Impact Expected"
     rx = re.compile(
         r"(?P<dow>Mon|Tue|Wed|Thu|Fri|Sat|Sun)[, ]+(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+(?P<h>\d{1,2}):(?P<m>\d{2})\s+(?P<ccy>[A-Z]{3})\s+(?P<title>.+?)\s+(High Impact|High Impact Expected)",
         re.I)
@@ -556,14 +605,14 @@ def _parse_ff_text(text: str) -> list[dict]:
             dt_utc = dt_loc.replace(tzinfo=timezone.utc)
         except Exception:
             dt_utc = now
-        out.append({"utc": dt_utc, "country": COUNTRY_BY_CCY.get(ccy, ccy), "title": title, "importance": "high", "src": "ff"})
+        out.append({"utc": dt_utc, "country": COUNTRY_BY_CCY.get(ccy, ccy), "title": title, "importance": "high", "src": "ff_html"})
     return out
 
 def fetch_forexfactory_week_html() -> list[dict]:
     url = "https://www.forexfactory.com/calendar?week=this"
     text, mode = _fetch_with_fallback(url, referer="https://www.forexfactory.com/")
     if not text:
-        log.info("FF HTML parsed: 0 high-impact events")
+        log.info("FF HTML parsed: 0 high-impact events (mode=none)")
         return []
     events = _parse_ff_text(text)
     log.info("FF HTML parsed: %d high-impact events (mode=%s)", len(events), mode)
@@ -589,7 +638,7 @@ def _parse_dailyfx_from_next(next_data: dict) -> list[dict]:
                 dt_raw = str(obj.get("date") or obj.get("datetime") or "")
                 try:
                     if dt_raw.isdigit():
-                        ts = int(dt_raw)
+                        ts = int(dt_raw); 
                         if ts > 10_000_000_000: ts //= 1000
                         dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
                     else:
@@ -607,40 +656,31 @@ def _parse_dailyfx_from_next(next_data: dict) -> list[dict]:
 def fetch_dailyfx_html() -> list[dict]:
     base = "https://www.dailyfx.com/economic-calendar"
     html, mode = _fetch_with_fallback(base, referer="https://www.dailyfx.com/")
-    if not html:
-        log.warning("DailyFX fetch failed (empty)")
-        return []
-    next_json = _extract_dailyfx_next_json(html)
-    if next_json:
-        ev = _parse_dailyfx_from_next(next_json)
-        if ev:
-            log.info("DailyFX parsed from NEXT_DATA: %d (mode=%s)", len(ev), mode)
-            return ev
-    html2, mode2 = _fetch_with_fallback(base + "?tz=0", referer=base)
-    if html2:
-        next_json2 = _extract_dailyfx_next_json(html2)
-        if next_json2:
-            ev2 = _parse_dailyfx_from_next(next_json2)
-            if ev2:
-                log.info("DailyFX parsed (?tz=0): %d (mode=%s)", len(ev2), mode2)
-                return ev2
-    # текстовый резерв
-    text, mode3 = _fetch_with_fallback(base, referer="https://www.dailyfx.com/")
+    if html:
+        next_json = _extract_dailyfx_next_json(html)
+        if next_json:
+            ev = _parse_dailyfx_from_next(next_json)
+            if ev:
+                log.info("DailyFX parsed from NEXT_DATA: %d (mode=%s)", len(ev), mode)
+                return ev
+    # текстовый fallback (зеркало часто выкидывает скрипт)
+    text, mode2 = _fetch_with_fallback(base + "?tz=0", referer=base)
     out = []
     if text:
+        # Либа mirror может разбросать куски текста: ловим строки с ВРЕМЕНЕМ, валютой и словом High рядом
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         now = datetime.now(timezone.utc)
-        rx = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2})\s+UTC\s+(?P<ccy>[A-Z]{3})\s+(?P<title>.+?)\s+(High impact|High)", re.I)
+        rx = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2}).{0,10}UTC.*?(?P<ccy>[A-Z]{3}).{0,40}\b(High impact|High)\b", re.I)
         for l in lines:
             m = rx.search(l)
             if not m: continue
             hh = int(m.group("h")); mm = int(m.group("m"))
             ccy = m.group("ccy").upper()
-            title = _clean_text(m.group("title"))
             dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            out.append({"utc": dt, "country": COUNTRY_BY_CCY.get(ccy, ccy), "title": title, "importance": "high", "src": "dailyfx"})
+            title = _clean_text(re.sub(r".*UTC", "", l))
+            out.append({"utc": dt, "country": COUNTRY_BY_CCY.get(ccy, ccy), "title": title, "importance": "high", "src": "dailyfx_txt"})
     if out:
-        log.info("DailyFX parsed (text-fallback): %d (mode=%s)", len(out), mode3)
+        log.info("DailyFX parsed (text-fallback): %d (mode=%s)", len(out), mode2)
         return out
     log.warning("DailyFX parse gave 0")
     return []
@@ -654,18 +694,16 @@ def fetch_investing_calendar() -> list[dict]:
     if not text:
         log.warning("Investing fetch failed")
         return out
-    # ищем строки с временем, валютой и High (зеркало отдаёт текст)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     now = datetime.now(timezone.utc)
-    # Пример шаблона: "14:30 USD CPI (YoY) (Aug) Importance: High"
-    rx = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2})\s+(?P<ccy>[A-Z]{3})\s+(?P<title>.+?)\s+(Importance:\s*High|High)", re.I)
+    rx = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2}).{0,10}(?P<ccy>[A-Z]{3}).{0,50}\b(Importance:\s*High|High)\b", re.I)
     for l in lines:
         m = rx.search(l)
         if not m: continue
         hh = int(m.group("h")); mm = int(m.group("m"))
         ccy = m.group("ccy").upper()
-        title = _clean_text(m.group("title"))
         dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        title = _clean_text(l)
         out.append({"utc": dt, "country": COUNTRY_BY_CCY.get(ccy, ccy), "title": title, "importance": "high", "src": "investing"})
     log.info("Investing parsed: %d (mode=%s)", len(out), mode)
     return out
@@ -684,14 +722,12 @@ def _parse_month(s: str) -> int | None:
     return mm
 
 def fetch_fomc() -> list[dict]:
-    # https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
     url = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
     text, mode = _fetch_with_fallback(url, referer="https://www.federalreserve.gov/")
     if not text:
         return []
     out = []
     year = datetime.now(timezone.utc).year
-    # шаблон: "September 16-17, 2025" или "September 17, 2025"
     rx = re.compile(r"(?P<mon>[A-Za-z]+)\s+(?P<d1>\d{1,2})(?:\s*[-–]\s*(?P<d2>\d{1,2}))?,\s*(?P<y>\d{4})", re.I)
     for m in rx.finditer(text):
         y = int(m.group("y"))
@@ -699,20 +735,17 @@ def fetch_fomc() -> list[dict]:
         mon = _parse_month(m.group("mon"))
         d1 = int(m.group("d1"))
         d2 = int(m.group("d2") or d1)
-        # ставим на второй день в полдень UTC
         out.append(_mk_cb_event(y, mon, d2, COUNTRY_BY_CCY["USD"], "FOMC meeting (time TBD)"))
     log.info("FOMC parsed: %d (mode=%s)", len(out), mode)
     return out
 
 def fetch_ecb() -> list[dict]:
-    # https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html
     url = "https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html"
     text, mode = _fetch_with_fallback(url, referer="https://www.ecb.europa.eu/")
     if not text:
         return []
     out = []
     year = datetime.now(timezone.utc).year
-    # примеры: "Monetary policy meeting: 12 September 2025"
     rx = re.compile(r"Monetary policy meeting:\s*(?P<d>\d{1,2})\s+(?P<mon>[A-Za-z]+)\s+(?P<y>\d{4})", re.I)
     for m in rx.finditer(text):
         y = int(m.group("y"))
@@ -724,7 +757,6 @@ def fetch_ecb() -> list[dict]:
     return out
 
 def fetch_boe() -> list[dict]:
-    # https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes  (часто есть "Next MPC meeting: 19 September 2025")
     url = "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes"
     text, mode = _fetch_with_fallback(url, referer="https://www.bankofengland.co.uk/")
     if not text:
@@ -733,7 +765,7 @@ def fetch_boe() -> list[dict]:
     year = datetime.now(timezone.utc).year
     rx = re.compile(r"(MPC meeting|Monetary Policy Committee meeting).*?(?P<d>\d{1,2})\s+(?P<mon>[A-Za-z]+)\s+(?P<y>\d{4})", re.I)
     for m in rx.finditer(text):
-        y = int(m.group("y"))
+        y = int(m.group("y")); 
         if abs(y - year) > 1: continue
         mon = _parse_month(m.group("mon")); d = int(m.group("d"))
         out.append(_mk_cb_event(y, mon, d, COUNTRY_BY_CCY["GBP"], "BoE MPC meeting (time TBD)"))
@@ -741,14 +773,12 @@ def fetch_boe() -> list[dict]:
     return out
 
 def fetch_boj() -> list[dict]:
-    # https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm/
     url = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm/"
     text, mode = _fetch_with_fallback(url, referer="https://www.boj.or.jp/")
     if not text:
         return []
     out = []
     year = datetime.now(timezone.utc).year
-    # Пример: "Monetary Policy Meeting (MPM) September 20–21, 2025"
     rx = re.compile(r"Monetary Policy Meeting.*?(?P<mon>[A-Za-z]+)\s+(?P<d1>\d{1,2})\D+(?P<d2>\d{1,2}),\s*(?P<y>\d{4})", re.I)
     for m in rx.finditer(text):
         y = int(m.group("y"))
@@ -780,49 +810,64 @@ def merge_sources(groups: list[list[dict]]) -> list[dict]:
             uniq[key] = ev
     return sorted(uniq.values(), key=lambda e: e["utc"])
 
-def get_all_free_calendar_events() -> list[dict]:
-    prov = CAL_PROVIDER
-    ev_ff = ev_dfx = ev_inv = ev_cb = []
-
-    if prov in ("ff", "free", "auto"):
-        try:
-            ev_ff = fetch_forexfactory_week_html()
-        except Exception as e:
-            log.warning("FF fetch failed: %s", e)
-
-    if prov in ("dailyfx", "free", "auto"):
-        try:
-            ev_dfx = fetch_dailyfx_html()
-        except Exception as e:
-            log.warning("DailyFX fetch failed: %s", e)
-
-    if prov in ("investing", "free", "auto"):
-        try:
-            ev_inv = fetch_investing_calendar()
-        except Exception as e:
-            log.warning("Investing fetch failed: %s", e)
-
-    # Центральные банки — всегда полезно как резерв
-    try:
-        ev_cb = fetch_cbank_all()
-    except Exception as e:
-        log.warning("CB fetch failed: %s", e)
-
-    if prov == "ff": out = ev_ff or ev_dfx or ev_inv or ev_cb
-    elif prov == "dailyfx": out = ev_dfx or ev_ff or ev_inv or ev_cb
-    elif prov == "investing": out = ev_inv or ev_ff or ev_dfx or ev_cb
-    else:  # free/auto
-        out = merge_sources([ev_ff, ev_dfx, ev_inv, ev_cb])
-
-    # фильтр по валютам и окну
-    want_countries = {c.lower() for ps in PAIR_COUNTRIES.values() for c in ps}
+def _time_window_bounds_for_free() -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
-    d1 = now - timedelta(minutes=CAL_WINDOW_MIN)
-    d2 = now + timedelta(minutes=CAL_WINDOW_MIN)
+    d1 = now - timedelta(days=FREE_LOOKBACK_DAYS)
+    d2 = now + timedelta(days=FREE_LOOKAHEAD_DAYS)
+    return d1, d2
 
-    out = [ev for ev in out if ev["country"].lower() in want_countries and d1 <= ev["utc"] <= d2]
-    log.info("Free calendar union: provider=%s, total=%d", prov, len(out))
-    return out
+def get_all_free_calendar_events(return_debug=False):
+    """
+    Собираем максимум событий, потом фильтруем только по странам и широкому горизонту (дни).
+    Временное «узкое» окно ±CAL_WINDOW_MIN применяется позже — в build_calendar_for_symbols.
+    """
+    prov = CAL_PROVIDER
+
+    # Источники
+    ev_ff_json = []
+    ev_ff_html = []
+    ev_dfx = []
+    ev_inv = []
+    ev_cb = []
+
+    try: ev_ff_json = fetch_ff_json_week()
+    except Exception as e: log.warning("FF JSON failed: %s", e)
+
+    if not ev_ff_json:
+        try: ev_ff_html = fetch_forexfactory_week_html()
+        except Exception as e: log.warning("FF HTML failed: %s", e)
+
+    try: ev_dfx = fetch_dailyfx_html()
+    except Exception as e: log.warning("DailyFX fetch failed: %s", e)
+
+    try: ev_inv = fetch_investing_calendar()
+    except Exception as e: log.warning("Investing fetch failed: %s", e)
+
+    try: ev_cb = fetch_cbank_all()
+    except Exception as e: log.warning("CB fetch failed: %s", e)
+
+    merged_all = merge_sources([ev_ff_json, ev_ff_html, ev_dfx, ev_inv, ev_cb])
+
+    # Фильтрация по странам и широкому горизонту (дни)
+    d1, d2 = _time_window_bounds_for_free()
+    filtered = [ev for ev in merged_all if ev["country"].lower() in WANT_COUNTRIES and d1 <= ev["utc"] <= d2]
+
+    log.info("Free calendar union: total_raw=%d; after_country+days=%d; days=[%s..%s]",
+             len(merged_all), len(filtered), d1.date(), d2.date())
+
+    if return_debug:
+        return {
+            "ff_json": len(ev_ff_json),
+            "ff_html": len(ev_ff_html),
+            "dailyfx": len(ev_dfx),
+            "investing": len(ev_inv),
+            "cb": len(ev_cb),
+            "merged": len(merged_all),
+            "filtered": len(filtered),
+            "d1": d1.isoformat(timespec="minutes"),
+            "d2": d2.isoformat(timespec="minutes"),
+        }, filtered
+    return filtered
 
 # ---------- Calendar builder used by digest ----------
 def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = None) -> Dict[str, dict]:
@@ -870,8 +915,7 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
             "nearest_next": nearest_next,
         }
 
-    log.info("calendar: provider=%s, window=±%s min, utc=%s..%s",
-             CAL_PROVIDER, w, d1.isoformat(timespec="minutes"), d2.isoformat(timespec="minutes"))
+    log.info("calendar window: ±%s min, utc=%s..%s", w, d1.isoformat(timespec="minutes"), d2.isoformat(timespec="minutes"))
     for sym, pack in out.items():
         log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
                  sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
@@ -972,8 +1016,8 @@ def sheets_diag_text() -> str:
         return f"Sheets: ❌ (SID={sid_state}, source={src}, b64_len={b64_len}, raw_len={raw_json_len})"
     else:
         try:
-            ws, created = ensure_worksheet(sh, SHEET_WS, headers=[SHEET_HEADERS])
-            _ = ensure_worksheet(sh, CAL_WS, headers=[CAL_HEADERS])
+            ws, created = ensure_worksheet(sh, SHEET_WS, headers=SHEET_HEADERS)
+            _ = ensure_worksheet(sh, CAL_WS, headers=CAL_HEADERS)
             mark = "created" if created else "exists"
             return f"Sheets: ✅ ok (SID={sid_state}, {src}, ws={ws.title}:{mark})"
         except Exception as e:
@@ -997,8 +1041,8 @@ async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Sheets: ❌ {src}")
         return
     try:
-        ws, created = ensure_worksheet(sh, SHEET_WS, headers=[SHEET_HEADERS])
-        ensure_worksheet(sh, CAL_WS, headers=[CAL_HEADERS])
+        ws, created = ensure_worksheet(sh, SHEET_WS, headers=SHEET_HEADERS)
+        ensure_worksheet(sh, CAL_WS, headers=CAL_HEADERS)
         await update.message.reply_text(
             f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'}; календарь '{CAL_WS}' готов ({src})"
         )
@@ -1026,20 +1070,24 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
 # ---------- Calendar -> Google Sheet ----------
+def _filter_for_sheet(events: List[dict]) -> List[dict]:
+    d1, d2 = _time_window_bounds_for_free()
+    return [e for e in events if d1 <= e["utc"] <= d2 and e["country"].lower() in WANT_COUNTRIES]
+
 def write_calendar_to_sheet(events: List[dict]) -> int:
     sh, src = build_sheets_client(SHEET_ID)
     if not sh:
         log.warning("Sheets not available: %s", src)
         return 0
     try:
-        ws, _ = ensure_worksheet(sh, CAL_WS, headers=[CAL_HEADERS])
+        ws, _ = ensure_worksheet(sh, CAL_WS, headers=CAL_HEADERS)
         # очистим всё кроме заголовка
         try:
             ws.resize(rows=1)
         except Exception:
             pass
         rows = []
-        for ev in sorted(events, key=lambda e: e["utc"]):
+        for ev in sorted(_filter_for_sheet(events), key=lambda e: e["utc"]):
             utc_iso = ev["utc"].isoformat(timespec="minutes").replace("+00:00","Z")
             lt = ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]
             rows.append([utc_iso, lt.strftime("%Y-%m-%d %H:%M"), ev["country"], ev["title"], ev.get("src",""), "High"])
@@ -1056,6 +1104,24 @@ async def cmd_cal_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = write_calendar_to_sheet(ev)
     await update.message.reply_text(f"Календарь обновлён: записано {n} событий (High).")
 
+async def cmd_cal_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dbg, filtered = get_all_free_calendar_events(return_debug=True)
+    lines = [
+        "Источник → найдено:",
+        f"FF JSON: {dbg['ff_json']}",
+        f"FF HTML: {dbg['ff_html']}",
+        f"DailyFX: {dbg['dailyfx']}",
+        f"Investing: {dbg['investing']}",
+        f"CBanks: {dbg['cb']}",
+        f"Итого raw (до фильтра): {dbg['merged']}",
+        f"После страны+горизонт [{dbg['d1']} .. {dbg['d2']}]: {dbg['filtered']}",
+    ]
+    # покажем первые 5 событий для наглядности
+    for ev in sorted(filtered, key=lambda e: e["utc"])[:5]:
+        lt = ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]
+        lines.append(f"• {lt:%Y-%m-%d %H:%M} {ev['country']}: {ev['title']} ({ev.get('src','')})")
+    await update.message.reply_text("\n".join(lines))
+
 # ---------- Schedulers ----------
 async def _set_bot_commands(app: Application):
     cmds = [
@@ -1068,6 +1134,7 @@ async def _set_bot_commands(app: Application):
         BotCommand("alloc", "Рассчитать распределение банка"),
         BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
         BotCommand("cal_refresh", "Обновить экономкалендарь"),
+        BotCommand("cal_debug", "Диагностика источников календаря"),
         BotCommand("init_sheet", "Создать/проверить листы в Google Sheets"),
         BotCommand("sheet_test", "Тестовая запись в лист"),
         BotCommand("diag", "Диагностика LLM и Sheets"),
@@ -1099,7 +1166,6 @@ async def morning_digest_scheduler(app: Application):
                 pass
 
 async def calendar_auto_refresher(app: Application):
-    # периодически обновляем календарь и лист
     while True:
         try:
             ev = get_all_free_calendar_events()
@@ -1134,6 +1200,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
     app.add_handler(CommandHandler("cal_refresh", cmd_cal_refresh))
+    app.add_handler(CommandHandler("cal_debug", cmd_cal_debug))
     return app
 
 async def main_async():
@@ -1142,10 +1209,8 @@ async def main_async():
     await _set_bot_commands(app)
     await app.initialize()
     await app.start()
-    # Автозадачи
     asyncio.create_task(morning_digest_scheduler(app))
     asyncio.create_task(calendar_auto_refresher(app))
-    # polling
     await app.updater.start_polling()
     await asyncio.Event().wait()
 
