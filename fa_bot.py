@@ -131,7 +131,8 @@ PAIR_COUNTRIES = {
 }
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
-_FF_CACHE = {"at": 0, "data": []}  # unix time сек
+_FF_CACHE = {"at": 0, "data": []}        # успешный кеш (unix time)
+_FF_NEG   = {"until": 0}                 # «тихий» период после 429 (unix time)
 
 STATE = {
     "total": 0.0,
@@ -660,46 +661,32 @@ def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -
 
 
 def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """FMP fallback: https://financialmodelingprep.com/api/v3/economic_calendar?from=YYYY-MM-DD&to=YYYY-MM-DD&apikey=KEY"""
+    """FMP fallback"""
     if not (_REQUESTS_AVAILABLE and FMP_API_KEY):
         return []
     try:
         url = "https://financialmodelingprep.com/api/v3/economic_calendar"
-        params = {
-            "from": d1.strftime("%Y-%m-%d"),
-            "to":   d2.strftime("%Y-%m-%d"),
-            "apikey": FMP_API_KEY,
-        }
+        params = { "from": d1.strftime("%Y-%m-%d"), "to": d2.strftime("%Y-%m-%d"), "apikey": FMP_API_KEY }
         r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
-        if not isinstance(data, list):
-            return []
+        if not isinstance(data, list): return []
         want = [c.lower() for c in countries]
         events = []
         for it in data:
             ctry = (it.get("country") or "").lower()
-            if not any(w in ctry for w in want):
-                continue
-            impact = (it.get("impact") or "").lower()
-            if "high" not in impact:
-                continue
+            if not any(w in ctry for w in want): continue
+            if "high" not in (it.get("impact") or "").lower(): continue
             val = it.get("date")
-            if not val:
-                continue
+            if not val: continue
             try:
-                dt_utc = datetime.fromisoformat(str(val).replace(" ", "T"))
-                if dt_utc.tzinfo is None:
-                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                else:
-                    dt_utc = dt_utc.astimezone(timezone.utc)
+                dt_utc = datetime.fromisoformat(str(val).replace(" ", "T")).replace(tzinfo=timezone.utc)
             except Exception:
                 continue
-            title = it.get("event") or "Event"
             events.append({
                 "utc": dt_utc,
                 "country": it.get("country") or "",
-                "title": str(title),
+                "title": it.get("event") or "Event",
                 "importance": "High",
             })
         return [e for e in events if d1 <= e["utc"] <= d2]
@@ -709,20 +696,31 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
 
 
 def fetch_calendar_events_ff_all() -> list[dict]:
-    # Кеш на CAL_TTL_SEC
+    """Скачиваем недельный JSON FF с кешом и защитой от 429."""
     import time
     now = int(time.time())
+
+    # негативный кеш: если недавно был 429 — не трогаем источник
+    if _FF_NEG["until"] and now < _FF_NEG["until"]:
+        return _FF_CACHE["data"]  # отдаём что есть (может быть и пусто)
+
+    # обычный кеш
     if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
         return _FF_CACHE["data"]
 
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
+        if r.status_code == 429:
+            # тихий период 2 минуты (можно увеличить)
+            _FF_NEG["until"] = now + 120
+            log.warning("calendar fetch (FF) 429: backoff 120s")
+            return _FF_CACHE["data"]
         r.raise_for_status()
+
         raw = r.json()
         data = []
         for it in raw or []:
-            # FF: {'timestamp': 1694527200, 'impact': 'High', 'country': 'USD', 'title': 'CPI m/m', ...}
             ts = it.get("timestamp")
             if not ts:
                 continue
@@ -735,10 +733,21 @@ def fetch_calendar_events_ff_all() -> list[dict]:
             })
         _FF_CACHE["data"] = data
         _FF_CACHE["at"] = now
+        _FF_NEG["until"] = 0  # сбросить «тихий» режим
         return data
     except Exception as e:
         log.warning("calendar fetch (FF) failed: %s", e)
-        return []
+        return _FF_CACHE["data"]
+
+
+def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: list[dict]) -> list[dict]:
+    want_codes = {FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries}
+    want_codes.discard("")
+    out = []
+    for ev in events:
+        if ev["country"].upper() in want_codes and importance_is_high(ev.get("importance")) and d1 <= ev["utc"] <= d2:
+            out.append(ev)
+    return out
 
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
@@ -748,28 +757,14 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
     if prov == "fmp":
         return fetch_calendar_events_fmp(countries, d1, d2)
     if prov == "ff":
-        # один общий фид на неделю; фильтруем по стране и окну
-        want = {COUNTRY_BY_CCY.get(c.upper(), c.lower()) for c in PAIR_COUNTRIES}
-        out = []
-        for ev in fetch_calendar_events_ff_all():
-            if ev["country"].lower() not in want:
-                continue
-            if not importance_is_high(ev["importance"]):
-                continue
-            if d1 <= ev["utc"] <= d2:
-                out.append(ev)
-        return out
+        return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
 
     # auto: TE→FMP→FF
     ev = fetch_calendar_events_te(countries, d1, d2)
     if not ev:
         ev = fetch_calendar_events_fmp(countries, d1, d2)
     if not ev:
-        ev = []
-        want = {COUNTRY_BY_CCY.get(c.upper(), c.lower()) for c in PAIR_COUNTRIES}
-        for e in fetch_calendar_events_ff_all():
-            if e["country"].lower() in want and importance_is_high(e["importance"]) and d1 <= e["utc"] <= d2:
-                ev.append(e)
+        ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
     return ev
 
 
@@ -786,12 +781,10 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
     d1 = now - timedelta(minutes=w)
     d2 = now + timedelta(minutes=w)
 
-    # Расширенный горизонт для «контекста», чтобы найти прошлое/будущее событие,
-    # если в основном окне пусто. Берём вчера 00:00…завтра 23:59 по локальной TZ.
     if LOCAL_TZ:
         now_loc = now.astimezone(LOCAL_TZ)
         day_start_loc = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
-        d1_ext = day_start_loc.add(days=-1) if hasattr(day_start_loc, "add") else (day_start_loc - timedelta(days=1))
+        d1_ext = day_start_loc - timedelta(days=1)
         d2_ext = day_start_loc + timedelta(days=2)
         d1_ext = d1_ext.astimezone(timezone.utc)
         d2_ext = d2_ext.astimezone(timezone.utc)
@@ -800,29 +793,36 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
         d2_ext = now + timedelta(hours=36)
 
     out: Dict[str, dict] = {}
+    
+    # FF-провайдер работает с единым кешем, так что один вызов на все символы
+    raw_all = fetch_calendar_events_ff_all() if CAL_PROVIDER == 'ff' else None
+    
+    FF_CODE_BY_COUNTRY = { "united states": "USD", "japan": "JPY", "euro area": "EUR", "united kingdom": "GBP", "australia": "AUD" }
+
     for sym in symbols:
         countries = PAIR_COUNTRIES.get(sym, [])
-        # Сначала — широкий сбор, чтобы было из чего выбирать.
-        raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
+        
+        # Если не FF, делаем запрос для каждой группы стран
+        if raw_all is None:
+            sym_raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
+        else: # Фильтруем общий список
+            want_codes = {FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries}
+            want_codes.discard("")
+            sym_raw_all = [ev for ev in raw_all if ev["country"].upper() in want_codes]
 
-        def _is_high(ev): return importance_is_high(ev.get("importance"))
-
-        # События в узком окне
         around = []
         red_soon = False
         quiet_now = False
 
-        for ev in raw_all:
-            if not _is_high(ev):
+        for ev in sym_raw_all:
+            if not importance_is_high(ev.get("importance")):
                 continue
             t_utc = ev["utc"]
             if d1 <= t_utc <= d2:
                 t_local = t_utc.astimezone(LOCAL_TZ) if LOCAL_TZ else t_utc
                 around.append({**ev, "local": t_local})
-                # флаг «в ближайшие 60 мин»
                 if abs((t_utc - now).total_seconds())/60.0 <= 60:
                     red_soon = True
-                # тихое окно вокруг события
                 start = t_utc - timedelta(minutes=QUIET_BEFORE_MIN)
                 end   = t_utc + timedelta(minutes=QUIET_AFTER_MIN)
                 if start <= now <= end:
@@ -830,12 +830,11 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
 
         around.sort(key=lambda x: x["utc"])
 
-        # Если в окне пусто — поищем «последний» и «следующий»
         nearest_prev = None
         nearest_next = None
         if not around:
-            past = [ev for ev in raw_all if _is_high(ev) and ev["utc"] < now]
-            futr = [ev for ev in raw_all if _is_high(ev) and ev["utc"] >= now]
+            past = [ev for ev in sym_raw_all if importance_is_high(ev.get("importance")) and ev["utc"] < now]
+            futr = [ev for ev in sym_raw_all if importance_is_high(ev.get("importance")) and ev["utc"] >= now]
             if past:
                 p = max(past, key=lambda e: e["utc"])
                 nearest_prev = {**p, "local": p["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else p["utc"]}
@@ -865,31 +864,20 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     elif fa_bias in ("LONG", "SHORT"):
         P -= 15
 
-    if adx >= 25:
-        P += 6
-    elif adx >= 20:
-        P += 3
-    else:
-        P -= 5
+    if adx >= 25: P += 6
+    elif adx >= 20: P += 3
+    else: P -= 5
 
-    if st_dir == against_dir:
-        P += 5
-    else:
-        P -= 5
+    if st_dir == against_dir: P += 5
+    else: P -= 5
 
-    if vol_z < 0.3:
-        P -= 3
-    elif vol_z < 1.5:
-        P += 3
-    elif vol_z > 2.5:
-        P -= 7
+    if vol_z < 0.3: P -= 3
+    elif vol_z < 1.5: P += 3
+    elif vol_z > 2.5: P -= 7
 
-    if atr1h > 1.2:
-        P += 4
-    elif atr1h < 0.8:
-        P -= 4
-    else:
-        P += 1
+    if atr1h > 1.2: P += 4
+    elif atr1h < 0.8: P -= 4
+    else: P += 1
 
     side_up = (side or "").upper() == "SHORT"
     if side_up:
@@ -899,8 +887,7 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
         if rsi < 35: P += 3
         if rsi > 65: P -= 4
 
-    if red_event_soon:
-        P -= 7
+    if red_event_soon: P -= 7
 
     P = max(35, min(75, int(round(P))))
     return P
@@ -908,44 +895,29 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
 
 def action_text(P: int, quiet_now: bool, level: str) -> str:
     if level == "HIGH":
-        if P >= 64:
-            return "готовьтесь добирать 1 шаг (после снятия ограничений и вне тихого окна)"
-    if P >= 64:
-        return "готовьтесь добирать 2 шага" + (" (вне тихого окна)" if quiet_now else "")
-    if P >= 58:
-        return "готовьтесь добирать 1 шаг" + (" (вне тихого окна)" if quiet_now else "")
-    if P >= 50:
-        return "базовый план"
+        if P >= 64: return "готовьтесь добирать 1 шаг (после снятия ограничений и вне тихого окна)"
+    if P >= 64: return "готовьтесь добирать 2 шага" + (" (вне тихого окна)" if quiet_now else "")
+    if P >= 58: return "готовьтесь добирать 1 шаг" + (" (вне тихого окна)" if quiet_now else "")
+    if P >= 50: return "базовый план"
     return "дополнительные доборы не приоритетны"
 
 
 def delta_marker(target: float, fact: float) -> str:
-    if target <= 0:
-        return "—"
+    if target <= 0: return "—"
     delta_pct = (fact - target) / target
     ap = abs(delta_pct)
-    if ap <= 0.02:
-        return "✅"
-    if ap <= 0.05:
-        return f"⚠️ небольшое отклонение ({delta_pct:+.1%})"
+    if ap <= 0.02: return "✅"
+    if ap <= 0.05: return f"⚠️ небольшое отклонение ({delta_pct:+.1%})"
     return f"🚧 существенное отклонение ({delta_pct:+.1%})"
 
 
 def build_investor_digest(sh) -> str:
-    # Заголовок на русском (локальное время)
     now_utc = datetime.utcnow()
-    if LOCAL_TZ:
-        now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(LOCAL_TZ)
-        header = header_ru(now_local)
-    else:
-        header = f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
+    header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
 
     blocks: List[str] = [header]
-
-    # Календарь для всех символов
     cal = build_calendar_for_symbols(SYMBOLS)
 
-    # Основные блоки по парам
     for sym in SYMBOLS:
         row = get_last_nonempty_row(sh, sym) or {}
         side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
@@ -968,7 +940,6 @@ def build_investor_digest(sh) -> str:
         icon = policy["icon"]
         label = policy["label"]
 
-        # календарь для пары
         c = cal.get(sym, {})
         red_event_soon = bool(c.get("red_event_soon"))
         quiet_from, quiet_to = c.get("quiet_from_to", (0, 0))
@@ -983,28 +954,20 @@ def build_investor_digest(sh) -> str:
 
         banks_line = "данных нет"
         if target is not None or fact is not None:
-            tt = target if target is not None else 0.0
-            ff = fact if fact is not None else 0.0
-            marker = delta_marker(tt, ff) if target not in (None, 0) else "—"
-            if target is None and fact is not None:
-                banks_line = f"Target — / Fact **{ff:g}**"
-            elif fact is None and target is not None:
-                banks_line = f"Target **{tt:g}** / Fact —"
-            else:
-                banks_line = f"Target **{tt:g}** / Fact **{ff:g}** — {marker}"
+            tt = target or 0.0
+            ff = fact or 0.0
+            marker = delta_marker(tt, ff) if tt > 0 else "—"
+            banks_line = f"Target **{tt:g}** / Fact **{ff:g}** — {marker}"
 
         pair_pretty = f"{sym[:3]}/{sym[3:]}"
-        # ближайшее событие для пары (если есть)
         ev_line = ""
         events = c.get("events") or []
         if events:
-            # как было: ближайшее по модулю к now
             nowu = datetime.now(timezone.utc)
             nearest = min(events, key=lambda e: abs((e["utc"] - nowu).total_seconds()))
             tloc = nearest["local"]
             ev_line = f"\n• **Событие (Белград):** {tloc:%H:%M} — {nearest['country']}: {nearest['title']} (High)"
         else:
-            # окна пусты → покажем контекст
             prev_ev = c.get("nearest_prev")
             next_ev = c.get("nearest_next")
             if prev_ev:
@@ -1016,36 +979,36 @@ def build_investor_digest(sh) -> str:
 
         blocks.append(
 f"""**{pair_pretty} — {icon} {label}, bias: {fa_bias}**
-• **Фундаментально:** { 'нейтрально' if fa_level=='OK' else ('умеренные риски' if fa_level=='CAUTION' else 'высокие риски') }.
+• **Фундаментально:** {'нейтрально' if fa_level=='OK' else ('умеренные риски' if fa_level=='CAUTION' else 'высокие риски')}.
 • **Рынок сейчас:** {market_phrases(adx, st, volz, atr1h)}.
 • **Наша позиция:** **{side}**, средняя {price_fmt(sym, avg)}; следующий добор {price_fmt(sym, next_dca)}.
-• **Что делаем сейчас:** {"тихое окно не требуется" if quiet_from==0 and quiet_to==0 else f"тихое окно [{-quiet_from:+d};+{quiet_to:d}] мин"}; reserve **{reserve}**; dca_scale **{dca_scale:.2f}**.
+• **Что делаем сейчас:** {"тихое окно не требуется" if not quiet_from and not quiet_to else f"тихое окно [{-quiet_from:+d};+{quiet_to:d}] мин"}; reserve **{reserve}**; dca_scale **{dca_scale:.2f}**.
 • **Вероятность против позиции:** ≈ **{P}%** → {act}.
 • **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
-    # Сводка ближайших событий по всем парам (внизу)
     summary_lines: List[str] = []
     all_events = []
-
-    nowu = datetime.now(timezone.utc)
-    # Сначала добавим всё, что в окне (если есть)
     for sym in SYMBOLS:
         for ev in cal.get(sym, {}).get("events", []) or []:
             all_events.append((ev["utc"], ev["local"], sym, ev["country"], ev["title"]))
 
-    # Если в окне пусто вообще — добавим по одному ближайшему вперёд (nearest_next) с каждой пары
     if not all_events:
         for sym in SYMBOLS:
             n = cal.get(sym, {}).get("nearest_next")
-            if n:
-                all_events.append((n["utc"], n["local"], sym, n["country"], n["title"]))
+            if n: all_events.append((n["utc"], n["local"], sym, n["country"], n["title"]))
 
     all_events.sort(key=lambda x: x[0])
 
     if all_events:
         summary_lines.append("\n📅 **Ближайшие High-события (Белград):**")
-        for _, tloc, sym, cty, title in all_events[:8]:
+        unique_events = []
+        seen = set()
+        for event in all_events:
+            if event[0] not in seen:
+                unique_events.append(event)
+                seen.add(event[0])
+        for _, tloc, sym, cty, title in unique_events[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
     return "\n\n".join(blocks + (["\n".join(summary_lines)] if summary_lines else []))
@@ -1053,62 +1016,45 @@ f"""**{pair_pretty} — {icon} {label}, bias: {fa_bias}**
 
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
-    cmds = [
-        BotCommand("start", "Запуск бота"),
-        BotCommand("help", "Список команд"),
-        BotCommand("ping", "Проверка связи"),
-        BotCommand("settotal", "Задать общий банк (мастер-чат)"),
-        BotCommand("setweights", "Задать целевые веса (мастер-чат)"),
-        BotCommand("weights", "Показать целевые веса"),
-        BotCommand("alloc", "Рассчитать распределение банка"),
-        BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
-        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
-        BotCommand("sheet_test", "Тестовая запись в лист"),
-        BotCommand("diag", "Диагностика LLM и Sheets"),
-    ]
-    try:
-        await app.bot.set_my_commands(cmds)
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
+    cmds = [ BotCommand(c, d) for c, d in [
+        ("start", "Запуск бота"), ("help", "Список команд"), ("ping", "Проверка связи"),
+        ("settotal", "Задать общий банк (мастер-чат)"), ("setweights", "Задать целевые веса (мастер-чат)"),
+        ("weights", "Показать целевые веса"), ("alloc", "Рассчитать распределение банка"),
+        ("digest", "Утренний дайджест (investor) / pro (trader)"),
+        ("init_sheet", "Создать/проверить лист в Google Sheets"),
+        ("sheet_test", "Тестовая запись в лист"), ("diag", "Диагностика LLM и Sheets"),
+    ]]
+    try: await app.bot.set_my_commands(cmds)
+    except Exception as e: log.warning("set_my_commands failed: %s", e)
 
 
 async def morning_digest_scheduler(app: Application):
-    """Ежедневный автопост инвесторского дайджеста в MASTER_CHAT_ID в 09:30 Europe/Belgrade."""
     import asyncio as _asyncio
     from datetime import datetime as _dt, timedelta as _td, time as _time
-
     while True:
         now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
-        target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
-        if now >= target:
-            target = target + _td(days=1)
-
+        target_time = _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)
+        target = _dt.combine(now.date(), target_time)
+        if now >= target: target += _td(days=1)
         wait_s = (target - now).total_seconds()
         await _asyncio.sleep(max(1.0, wait_s))
-
         try:
-            sh, _src = build_sheets_client(SHEET_ID)
+            sh, _ = build_sheets_client(SHEET_ID)
             if sh:
                 msg = build_investor_digest(sh)
                 await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
             else:
                 await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
         except Exception as e:
-            try:
-                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
-            except Exception:
-                pass
+            try: await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+            except Exception: pass
 
 
 def build_application() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
-
-    builder: ApplicationBuilder = Application.builder().token(BOT_TOKEN)
-    if _RATE_LIMITER_AVAILABLE:
-        builder = builder.rate_limiter(AIORateLimiter())
+    if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+    builder = Application.builder().token(BOT_TOKEN)
+    if _RATE_LIMITER_AVAILABLE: builder = builder.rate_limiter(AIORateLimiter())
     app = builder.build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -1120,7 +1066,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
-
     return app
 
 
@@ -1136,10 +1081,8 @@ async def main_async():
 
 
 def main():
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main_async())
+    except KeyboardInterrupt: pass
 
 
 if __name__ == "__main__":
