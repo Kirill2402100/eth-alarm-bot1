@@ -1,4 +1,3 @@
-# fa_bot.py
 import os
 import json
 import base64
@@ -111,7 +110,11 @@ CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120") or "120")
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
 CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
+# защита от частой опечатки
+if CAL_PROVIDER == "finhub":
+    CAL_PROVIDER = "finnhub"
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()  # ⬅️ новый ключ
 CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
 
 COUNTRY_BY_CCY = {
@@ -129,6 +132,14 @@ FF_CODE2NAME = {
     "gbp": "united kingdom",
     "aud": "australia",
 }
+# Finnhub может отдавать коды стран (US, JP, EU, GB/UK, AU)
+FINNHUB_CODE2NAME = {
+    "US": "united states", "USA": "united states",
+    "JP": "japan", "JPN": "japan",
+    "EU": "euro area", "EMU": "euro area", "EA": "euro area", "EUR": "euro area",
+    "GB": "united kingdom", "UK": "united kingdom", "GBR": "united kingdom",
+    "AU": "australia", "AUS": "australia",
+}
 PAIR_COUNTRIES = {
     "USDJPY": [COUNTRY_BY_CCY["USD"], COUNTRY_BY_CCY["JPY"]],
     "AUDUSD": [COUNTRY_BY_CCY["AUD"], COUNTRY_BY_CCY["USD"]],
@@ -138,7 +149,7 @@ PAIR_COUNTRIES = {
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
 _FF_CACHE = {"at": 0, "data": []}
-_FF_NEG   = {"until": 0}
+_FF_NEG    = {"until": 0}
 
 STATE = {
     "total": 0.0,
@@ -254,6 +265,25 @@ def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
     if h:
         return ("через " if sign_is_future else "") + f"{h} ч" + ("" if sign_is_future else " назад")
     return ("через " if sign_is_future else "") + f"{m} мин" + ("" if sign_is_future else " назад")
+
+
+def _parse_any_utc(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    s = str(ts).strip().replace(" ", "T")
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        # запасной вариант: "YYYY-MM-DDTHH:MM:SS"
+        try:
+            dt = datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
 def assert_master_chat(update: Update) -> bool:
@@ -659,6 +689,59 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
         return []
 
 
+def fetch_calendar_events_finnhub(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    """Economic calendar via Finnhub: https://finnhub.io/docs/api/economic-calendar
+        Требует FINNHUB_API_KEY. Возвращает события в нашем формате.
+    """
+    if not _REQUESTS_AVAILABLE or not FINNHUB_API_KEY:
+        return []
+
+    try:
+        url = (
+            "https://finnhub.io/api/v1/calendar/economic"
+            f"?from={d1.date():%Y-%m-%d}&to={d2.date():%Y-%m-%d}&token={FINNHUB_API_KEY}"
+        )
+        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
+        r.raise_for_status()
+        js = r.json() or {}
+        rows = js.get("economicCalendar") or js.get("data") or []
+
+        want = {c.lower() for c in countries}
+        out: List[dict] = []
+
+        for it in rows:
+            # время
+            utc_dt = _parse_any_utc(it.get("time") or it.get("datetime") or it.get("date"))
+            if not utc_dt:
+                continue
+
+            # страна
+            raw_cty = (it.get("country") or it.get("countryCode") or "").strip()
+            cty = FINNHUB_CODE2NAME.get(raw_cty.upper(), raw_cty).lower()
+
+            # фильтрация по нужным странам и окну
+            if cty not in want or not (d1 <= utc_dt <= d2):
+                continue
+
+            # важность/impact
+            impact = (it.get("impact") or it.get("importance") or "").strip().lower()
+            # приведение к нашим значениям: high/medium/low → оставляем строку, фильтрация «high» позже
+            title = it.get("event") or it.get("title") or "Event"
+
+            out.append({
+                "utc": utc_dt,
+                "country": cty,
+                "title": title,
+                "importance": impact,  # importance_is_high() распознает "high"
+            })
+
+        log.info("Finnhub: loaded %d events in %s..%s", len(out), d1.date(), d2.date())
+        return out
+    except Exception as e:
+        log.warning("calendar fetch (Finnhub) failed: %s", e)
+        return []
+
+
 def fetch_calendar_events_ff_all() -> list[dict]:
     """Скачиваем недельный JSON FF с кешом и защитой от 429."""
     if not _REQUESTS_AVAILABLE:
@@ -716,14 +799,23 @@ def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: 
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
     prov = CAL_PROVIDER
-    if prov == "te": return fetch_calendar_events_te(countries, d1, d2)
-    if prov == "fmp": return fetch_calendar_events_fmp(countries, d1, d2)
-    if prov == "ff": return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+    if prov == "te":
+        return fetch_calendar_events_te(countries, d1, d2)
+    if prov == "fmp":
+        return fetch_calendar_events_fmp(countries, d1, d2)
+    if prov == "finnhub":
+        return fetch_calendar_events_finnhub(countries, d1, d2)
+    if prov == "ff":
+        return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
 
-    # auto
+    # auto: пробуем по очереди
     ev = fetch_calendar_events_te(countries, d1, d2)
-    if not ev: ev = fetch_calendar_events_fmp(countries, d1, d2)
-    if not ev: ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+    if not ev:
+        ev = fetch_calendar_events_fmp(countries, d1, d2)
+    if not ev:
+        ev = fetch_calendar_events_finnhub(countries, d1, d2)
+    if not ev:
+        ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
     return ev
 
 
@@ -921,12 +1013,8 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
         for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    # --- аккуратно склеиваем, чтобы не было пустого текста ---
-    parts = blocks + (["\n".join(summary_lines)] if summary_lines else [])
-    msg = "\n\n".join([p for p in parts if p and str(p).strip()])
-    if not msg.strip():
-        msg = header  # гарантируем непустой текст
-    return msg
+    # Никогда не возвращаем пустую строку — Telegram вернёт 400 "message text is empty"
+    return "\n\n".join(blocks + ["\n".join(summary_lines)]) if summary_lines else "\n\n".join(blocks)
 
 
 # -------------------- СТАРТ --------------------
