@@ -688,7 +688,8 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
         log.warning("calendar fetch (FMP) failed: %s", e)
         return []
 
-# --- ForexFactory (публичный JSON) ---
+
+# --- ForexFactory (публичный JSON этой недели) ---
 FF_CODE_BY_COUNTRY = {
     "united states": "USD",
     "japan": "JPY",
@@ -707,44 +708,40 @@ def fetch_calendar_events_ff(countries: List[str], d1: datetime, d2: datetime) -
         if not isinstance(data, list):
             return []
 
-        want_codes = set(FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries)
-        want_codes.discard("")
+        want = {FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries}
+        want.discard("")
 
         out = []
         for it in data:
-            # типичные поля FF: country (например "USD"), title, impact ("High"/"Medium"/"Low"), timestamp (unix, сек)
+            # поля FF: country (или currency), title, impact (High/Medium/Low), timestamp (unix)
             ctry = (it.get("country") or it.get("currency") or "").upper()
-            if want_codes and ctry not in want_codes:
+            if want and ctry not in want:
                 continue
-            impact = (it.get("impact") or "").lower()
-            if "high" not in impact:
+            if "high" not in (it.get("impact") or "").lower():
                 continue
+
             ts = it.get("timestamp")
-            if not ts:
-                # запасной путь: склейка даты/времени, если нет timestamp
-                dt_str = f"{it.get('date','')} {it.get('time','')}"
+            if ts:
                 try:
-                    dt_utc = datetime.fromisoformat(dt_str.replace(" ", "T"))
-                    if dt_utc.tzinfo is None:
-                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                    else:
-                        dt_utc = dt_utc.astimezone(timezone.utc)
+                    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
                 except Exception:
                     continue
             else:
+                # запасной путь, если попадётся без timestamp
+                dt_str = f"{it.get('date','')} {it.get('time','')}"
                 try:
-                    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                    dt_utc = datetime.fromisoformat(dt_str.replace(" ", "T"))
+                    dt_utc = dt_utc.replace(tzinfo=timezone.utc) if dt_utc.tzinfo is None else dt_utc.astimezone(timezone.utc)
                 except Exception:
                     continue
 
             if not (d1 <= dt_utc <= d2):
                 continue
 
-            title = it.get("title") or it.get("event") or "Event"
             out.append({
                 "utc": dt_utc,
                 "country": ctry,
-                "title": str(title),
+                "title": str(it.get("title") or it.get("event") or "Event"),
                 "importance": "High",
             })
         return out
