@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import logging
+from time import time  # <-- Добавлено
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
 
@@ -113,6 +114,7 @@ QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))  # тихое окн
 CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()    # auto | te | fmp | ff
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
 FF_URL = os.getenv("FF_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "180"))  # кэш календаря, сек
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -126,6 +128,14 @@ PAIR_COUNTRIES = {
     "AUDUSD": [COUNTRY_BY_CCY["AUD"], COUNTRY_BY_CCY["USD"]],
     "EURUSD": [COUNTRY_BY_CCY["EUR"], COUNTRY_BY_CCY["USD"]],
     "GBPUSD": [COUNTRY_BY_CCY["GBP"], COUNTRY_BY_CCY["USD"]],
+}
+
+# -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
+_FF_CACHE = {"ts": 0.0, "data": None}  # кэш списка событий FF на эту неделю
+
+STATE = {
+    "total": 0.0,
+    "weights": DEFAULT_WEIGHTS.copy(),
 }
 
 # -------------------- GOOGLE CREDS LOADER --------------------
@@ -246,11 +256,6 @@ HELP_TEXT = (
     "/diag — диагностика LLM и Google Sheets.\n"
     "/ping — проверить связь."
 )
-
-STATE = {
-    "total": 0.0,
-    "weights": DEFAULT_WEIGHTS.copy(),
-}
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,33 +694,48 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
         return []
 
 
-# --- ForexFactory (публичный JSON этой недели) ---
-FF_CODE_BY_COUNTRY = {
-    "united states": "USD",
-    "japan": "JPY",
-    "euro area": "EUR",
-    "united kingdom": "GBP",
-    "australia": "AUD",
-}
-
 def fetch_calendar_events_ff(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    """ForexFactory fallback: берём недельный JSON 1 раз, фильтруем по валютам и High."""
     if not _REQUESTS_AVAILABLE:
         return []
+
     try:
-        r = requests.get(FF_URL, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
+        # берём из кэша, если он свежий
+        now_ts = time()
+        data = None
+        if _FF_CACHE["data"] is not None and (now_ts - _FF_CACHE["ts"] < CAL_TTL_SEC):
+            data = _FF_CACHE["data"]
+        else:
+            # одна попытка сети
+            r = requests.get(FF_URL, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
+            if r.status_code == 429 and _FF_CACHE["data"] is not None:
+                # при лимите используем старый кэш
+                data = _FF_CACHE["data"]
+            else:
+                r.raise_for_status()
+                payload = r.json()
+                data = payload if isinstance(payload, list) else []
+                _FF_CACHE["data"] = data
+                _FF_CACHE["ts"] = now_ts
+
+        if not data:
             return []
 
-        want = {FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries}
-        want.discard("")
+        # фильтрация
+        FF_CODE_BY_COUNTRY = {
+            "united states": "USD",
+            "japan": "JPY",
+            "euro area": "EUR",
+            "united kingdom": "GBP",
+            "australia": "AUD",
+        }
+        want_codes = {FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries}
+        want_codes.discard("")
 
         out = []
         for it in data:
-            # поля FF: country (или currency), title, impact (High/Medium/Low), timestamp (unix)
             ctry = (it.get("country") or it.get("currency") or "").upper()
-            if want and ctry not in want:
+            if want_codes and ctry not in want_codes:
                 continue
             if "high" not in (it.get("impact") or "").lower():
                 continue
@@ -727,7 +747,6 @@ def fetch_calendar_events_ff(countries: List[str], d1: datetime, d2: datetime) -
                 except Exception:
                     continue
             else:
-                # запасной путь, если попадётся без timestamp
                 dt_str = f"{it.get('date','')} {it.get('time','')}"
                 try:
                     dt_utc = datetime.fromisoformat(dt_str.replace(" ", "T"))
@@ -745,9 +764,11 @@ def fetch_calendar_events_ff(countries: List[str], d1: datetime, d2: datetime) -
                 "importance": "High",
             })
         return out
+
     except Exception as e:
         log.warning("calendar fetch (FF) failed: %s", e)
-        return []
+        # при ошибке тоже пытаемся вернуть кэш
+        return _FF_CACHE["data"] or []
 
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
