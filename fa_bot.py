@@ -103,15 +103,16 @@ BMR_SHEETS = {
     "GBPUSD": os.getenv("BMR_SHEET_GBPUSD", "BMR_DCA_GBPUSD"),
 }
 
-# --- Календарь (TradingEconomics) ---
+# --- Календарь ---
 TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
 TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
 TE_KEY = os.getenv("TE_KEY", "guest").strip()
 CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))    # окно для вывода событий (+/-)
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))  # тихое окно ДО high-релиза
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))  # тихое окно ПОСЛЕ high-релиза
-CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()    # auto | te | fmp
+CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()    # auto | te | fmp | ff
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
+FF_URL = os.getenv("FF_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -687,20 +688,86 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
         log.warning("calendar fetch (FMP) failed: %s", e)
         return []
 
+# --- ForexFactory (публичный JSON) ---
+FF_CODE_BY_COUNTRY = {
+    "united states": "USD",
+    "japan": "JPY",
+    "euro area": "EUR",
+    "united kingdom": "GBP",
+    "australia": "AUD",
+}
+
+def fetch_calendar_events_ff(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    if not _REQUESTS_AVAILABLE:
+        return []
+    try:
+        r = requests.get(FF_URL, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+
+        want_codes = set(FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries)
+        want_codes.discard("")
+
+        out = []
+        for it in data:
+            # типичные поля FF: country (например "USD"), title, impact ("High"/"Medium"/"Low"), timestamp (unix, сек)
+            ctry = (it.get("country") or it.get("currency") or "").upper()
+            if want_codes and ctry not in want_codes:
+                continue
+            impact = (it.get("impact") or "").lower()
+            if "high" not in impact:
+                continue
+            ts = it.get("timestamp")
+            if not ts:
+                # запасной путь: склейка даты/времени, если нет timestamp
+                dt_str = f"{it.get('date','')} {it.get('time','')}"
+                try:
+                    dt_utc = datetime.fromisoformat(dt_str.replace(" ", "T"))
+                    if dt_utc.tzinfo is None:
+                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                    else:
+                        dt_utc = dt_utc.astimezone(timezone.utc)
+                except Exception:
+                    continue
+            else:
+                try:
+                    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                except Exception:
+                    continue
+
+            if not (d1 <= dt_utc <= d2):
+                continue
+
+            title = it.get("title") or it.get("event") or "Event"
+            out.append({
+                "utc": dt_utc,
+                "country": ctry,
+                "title": str(title),
+                "importance": "High",
+            })
+        return out
+    except Exception as e:
+        log.warning("calendar fetch (FF) failed: %s", e)
+        return []
+
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """Роутер провайдеров: TE → FMP, либо принудительно через CAL_PROVIDER."""
     prov = CAL_PROVIDER
     if prov == "te":
         return fetch_calendar_events_te(countries, d1, d2)
     if prov == "fmp":
         return fetch_calendar_events_fmp(countries, d1, d2)
+    if prov == "ff":
+        return fetch_calendar_events_ff(countries, d1, d2)
 
-    # auto: сначала TE, если пусто — FMP
+    # auto: TE → FMP → FF
     ev = fetch_calendar_events_te(countries, d1, d2)
-    if ev:
-        return ev
-    return fetch_calendar_events_fmp(countries, d1, d2)
+    if ev: return ev
+    ev = fetch_calendar_events_fmp(countries, d1, d2)
+    if ev: return ev
+    return fetch_calendar_events_ff(countries, d1, d2)
 
 
 def build_calendar_for_symbols(symbols: List[str]) -> Dict[str, dict]:
