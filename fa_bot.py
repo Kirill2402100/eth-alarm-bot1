@@ -947,8 +947,11 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
         for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    return "\n\n".join(blocks + ["\n".join(summary_lines)] if summary_lines else [])
-
+    parts = blocks + (["\n".join(summary_lines)] if summary_lines else [])
+msg = "\n\n".join([p for p in parts if p and p.strip()])  # всегда склеит хотя бы header
+if not msg.strip():
+    msg = header  # гарантируем непустой текст
+return msg
 
 # -------------------- СТАРТ --------------------
 def _safe_add(app: Application, command: str, func_name: str):
