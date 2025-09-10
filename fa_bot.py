@@ -3,7 +3,7 @@ import os
 import json
 import base64
 import logging
-from math import floor # <-- Добавлено
+from math import floor
 from time import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
@@ -114,8 +114,7 @@ QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))  # тихое окн
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))  # тихое окно ПОСЛЕ high-релиза
 CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()    # auto | te | fmp | ff
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
-FF_URL = os.getenv("FF_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
-CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "180"))  # кэш календаря, сек
+CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -132,7 +131,7 @@ PAIR_COUNTRIES = {
 }
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
-_FF_CACHE = {"ts": 0.0, "data": None}  # кэш списка событий FF на эту неделю
+_FF_CACHE = {"at": 0, "data": []}  # unix time сек
 
 STATE = {
     "total": 0.0,
@@ -679,14 +678,13 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
         want = [c.lower() for c in countries]
         events = []
         for it in data:
-            # поля у FMP: 'event', 'country', 'date' (UTC), 'impact' = Low/Medium/High
             ctry = (it.get("country") or "").lower()
             if not any(w in ctry for w in want):
                 continue
             impact = (it.get("impact") or "").lower()
             if "high" not in impact:
                 continue
-            val = it.get("date")  # "2025-09-10 14:00:00"
+            val = it.get("date")
             if not val:
                 continue
             try:
@@ -710,81 +708,37 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
         return []
 
 
-def fetch_calendar_events_ff(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """ForexFactory fallback: берём недельный JSON 1 раз, фильтруем по валютам и High."""
-    if not _REQUESTS_AVAILABLE:
-        return []
+def fetch_calendar_events_ff_all() -> list[dict]:
+    # Кеш на CAL_TTL_SEC
+    import time
+    now = int(time.time())
+    if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
+        return _FF_CACHE["data"]
 
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
-        # берём из кэша, если он свежий
-        now_ts = time()
-        data = None
-        if _FF_CACHE["data"] is not None and (now_ts - _FF_CACHE["ts"] < CAL_TTL_SEC):
-            data = _FF_CACHE["data"]
-        else:
-            # одна попытка сети
-            r = requests.get(FF_URL, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-            if r.status_code == 429 and _FF_CACHE["data"] is not None:
-                # при лимите используем старый кэш
-                data = _FF_CACHE["data"]
-            else:
-                r.raise_for_status()
-                payload = r.json()
-                data = payload if isinstance(payload, list) else []
-                _FF_CACHE["data"] = data
-                _FF_CACHE["ts"] = now_ts
-
-        if not data:
-            return []
-
-        # фильтрация
-        FF_CODE_BY_COUNTRY = {
-            "united states": "USD",
-            "japan": "JPY",
-            "euro area": "EUR",
-            "united kingdom": "GBP",
-            "australia": "AUD",
-        }
-        want_codes = {FF_CODE_BY_COUNTRY.get(c.lower(), "").upper() for c in countries}
-        want_codes.discard("")
-
-        out = []
-        for it in data:
-            ctry = (it.get("country") or it.get("currency") or "").upper()
-            if want_codes and ctry not in want_codes:
-                continue
-            if "high" not in (it.get("impact") or "").lower():
-                continue
-
+        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
+        r.raise_for_status()
+        raw = r.json()
+        data = []
+        for it in raw or []:
+            # FF: {'timestamp': 1694527200, 'impact': 'High', 'country': 'USD', 'title': 'CPI m/m', ...}
             ts = it.get("timestamp")
-            if ts:
-                try:
-                    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-                except Exception:
-                    continue
-            else:
-                dt_str = f"{it.get('date','')} {it.get('time','')}"
-                try:
-                    dt_utc = datetime.fromisoformat(dt_str.replace(" ", "T"))
-                    dt_utc = dt_utc.replace(tzinfo=timezone.utc) if dt_utc.tzinfo is None else dt_utc.astimezone(timezone.utc)
-                except Exception:
-                    continue
-
-            if not (d1 <= dt_utc <= d2):
+            if not ts:
                 continue
-
-            out.append({
+            dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            data.append({
                 "utc": dt_utc,
-                "country": ctry,
-                "title": str(it.get("title") or it.get("event") or "Event"),
-                "importance": "High",
+                "country": (it.get("country") or "").strip(),
+                "title": it.get("title") or it.get("event") or "Event",
+                "importance": it.get("impact") or "",
             })
-        return out
-
+        _FF_CACHE["data"] = data
+        _FF_CACHE["at"] = now
+        return data
     except Exception as e:
         log.warning("calendar fetch (FF) failed: %s", e)
-        # при ошибке тоже пытаемся вернуть кэш
-        return _FF_CACHE["data"] or []
+        return []
 
 
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
@@ -794,14 +748,29 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
     if prov == "fmp":
         return fetch_calendar_events_fmp(countries, d1, d2)
     if prov == "ff":
-        return fetch_calendar_events_ff(countries, d1, d2)
+        # один общий фид на неделю; фильтруем по стране и окну
+        want = {COUNTRY_BY_CCY.get(c.upper(), c.lower()) for c in PAIR_COUNTRIES}
+        out = []
+        for ev in fetch_calendar_events_ff_all():
+            if ev["country"].lower() not in want:
+                continue
+            if not importance_is_high(ev["importance"]):
+                continue
+            if d1 <= ev["utc"] <= d2:
+                out.append(ev)
+        return out
 
-    # auto: TE → FMP → FF
+    # auto: TE→FMP→FF
     ev = fetch_calendar_events_te(countries, d1, d2)
-    if ev: return ev
-    ev = fetch_calendar_events_fmp(countries, d1, d2)
-    if ev: return ev
-    return fetch_calendar_events_ff(countries, d1, d2)
+    if not ev:
+        ev = fetch_calendar_events_fmp(countries, d1, d2)
+    if not ev:
+        ev = []
+        want = {COUNTRY_BY_CCY.get(c.upper(), c.lower()) for c in PAIR_COUNTRIES}
+        for e in fetch_calendar_events_ff_all():
+            if e["country"].lower() in want and importance_is_high(e["importance"]) and d1 <= e["utc"] <= d2:
+                ev.append(e)
+    return ev
 
 
 def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = None) -> Dict[str, dict]:
@@ -922,7 +891,7 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     else:
         P += 1
 
-    side_up = (side or "").upper() == "SHORT"  # против short = вверх
+    side_up = (side or "").upper() == "SHORT"
     if side_up:
         if rsi > 65: P += 3
         if rsi < 35: P -= 4
