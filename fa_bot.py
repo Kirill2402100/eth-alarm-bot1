@@ -17,6 +17,16 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# --- Таймзона Белграда ---
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:  # pragma: no cover
+    ZoneInfo = None
+
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else None
+MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
+MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
+
 # --- Лимитер Telegram (может быть не установлен) ---
 try:
     from telegram.ext import AIORateLimiter
@@ -74,6 +84,14 @@ LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-5").strip()
 LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or "30000")
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
+
+# --- Названия листов с логами по парам (можно переопределить через ENV) ---
+BMR_SHEETS = {
+    "USDJPY": os.getenv("BMR_SHEET_USDJPY", "BMR_DCA_USDJPY"),
+    "AUDUSD": os.getenv("BMR_SHEET_AUDUSD", "BMR_DCA_AUDUSD"),
+    "EURUSD": os.getenv("BMR_SHEET_EURUSD", "BMR_DCA_EURUSD"),
+    "GBPUSD": os.getenv("BMR_SHEET_GBPUSD", "BMR_DCA_GBPUSD"),
+}
 
 # -------------------- GOOGLE CREDS LOADER --------------------
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -186,7 +204,8 @@ HELP_TEXT = (
     "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
     "/weights — показать целевые веса.\n"
     "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
-    "/digest — короткий «человеческий» дайджест по USDJPY / AUDUSD / EURUSD / GBPUSD.\n"
+    "/digest — утренний «инвесторский» дайджест (по людям).\n"
+    "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
     "/init_sheet — создать/проверить лист в Google Sheets.\n"
     "/sheet_test — записать тестовую строку в лист.\n"
     "/diag — диагностика LLM и Google Sheets.\n"
@@ -301,16 +320,34 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Если пользователь написал "pro" → отдаём прежний краткий/профи вариант через LLM
+    args = (update.message.text or "").split()
+    pro = len(args) > 1 and args[1].lower() == "pro"
+
+    if pro:
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+            txt = await generate_digest(
+                symbols=SYMBOLS,
+                model=LLM_MINI,
+                token_budget=LLM_TOKEN_BUDGET_PER_DAY,
+            )
+            await update.message.reply_text(txt)
+        except Exception as e:
+            await update.message.reply_text(f"LLM ошибка: {e}")
+        return
+
+    # Инвесторский режим (локально, без LLM)
+    sh, _src = build_sheets_client(SHEET_ID)
+    if not sh:
+        await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
+        return
+
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        txt = await generate_digest(
-            symbols=SYMBOLS,
-            model=LLM_MINI,
-            token_budget=LLM_TOKEN_BUDGET_PER_DAY,
-        )
-        await update.message.reply_text(txt)
+        msg = build_investor_digest(sh)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"LLM ошибка: {e}")
+        await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
 
 
 def sheets_diag_text() -> str:
@@ -385,6 +422,222 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
 
+# ---------- Digest helpers (инвесторский режим) ----------
+
+def _to_float(x, default=0.0) -> float:
+    try:
+        s = str(x).strip().replace(",", ".")
+        return float(s)
+    except Exception:
+        return default
+
+
+def _last_record(ws):
+    """Вернуть последнюю строку как dict через get_all_records()."""
+    try:
+        rows = ws.get_all_records()
+        return rows[-1] if rows else None
+    except Exception:
+        return None
+
+
+def get_last_bmr_row(sh, symbol: str) -> Optional[dict]:
+    sheet_name = BMR_SHEETS.get(symbol)
+    if not sheet_name:
+        return None
+    try:
+        ws = sh.worksheet(sheet_name)
+        return _last_record(ws)
+    except Exception:
+        return None
+
+
+def map_fa_level(risk: str) -> str:
+    r = (risk or "").strip().lower()
+    if r.startswith("red"):
+        return "HIGH"
+    if r.startswith("yellow") or r.startswith("amber"):
+        return "CAUTION"
+    return "OK"
+
+
+def map_fa_bias(bias: str) -> str:
+    b = (bias or "").strip().lower()
+    if b.startswith("long"):
+        return "LONG"
+    if b.startswith("short"):
+        return "SHORT"
+    return "BOTH"
+
+
+def policy_from_level(level: str) -> Dict[str, object]:
+    L = (level or "OK").upper()
+    if L == "HIGH":
+        return {"quiet_min": (45, 60), "reserve_off": True,  "dca_scale": 0.50, "icon": "🚧", "label": "высокий риск"}
+    if L == "CAUTION":
+        return {"quiet_min": (30, 45), "reserve_off": False, "dca_scale": 0.75, "icon": "⚠️", "label": "умеренный риск"}
+    return {"quiet_min": (0, 0), "reserve_off": False, "dca_scale": 1.00, "icon": "✅", "label": "фон спокойный"}
+
+
+def supertrend_dir(val: str) -> str:
+    v = (val or "").strip().lower()
+    return "up" if "up" in v else "down" if "down" in v else "flat"
+
+
+def market_phrases(adx: float, st_dir: str, vol_z: float, atr1h: float) -> str:
+    # Инвесторские формулировки
+    trend_txt = "умеренное" if adx < 20 else "заметное" if adx < 25 else "выраженное"
+    dir_txt = "вверх" if st_dir == "up" else "вниз" if st_dir == "down" else "вбок"
+    vola_txt = "ниже нормы" if atr1h < 0.8 else "около нормы" if atr1h < 1.2 else "выше нормы"
+    noise_txt = "низкий" if vol_z < 0.5 else "умеренный" if vol_z < 1.5 else "повышенный"
+    return f"{trend_txt} движение {dir_txt}; колебания {vola_txt}; рыночный шум {noise_txt}"
+
+
+def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
+                        vol_z: float, atr1h: float, rsi: float, red_event_soon: bool) -> int:
+    # База
+    P = 55
+    against_dir = "down" if (side or "").upper() == "LONG" else "up"
+
+    # FA bias
+    if (fa_bias == "LONG" and against_dir == "up") or (fa_bias == "SHORT" and against_dir == "down"):
+        P += 10
+    elif fa_bias in ("LONG", "SHORT"):
+        P -= 15
+
+    # ADX
+    if adx >= 25:
+        P += 6
+    elif adx >= 20:
+        P += 3
+    else:
+        P -= 5
+
+    # Supertrend
+    if st_dir == against_dir:
+        P += 5
+    else:
+        P -= 5
+
+    # Vol_z
+    if vol_z < 0.3:
+        P -= 3
+    elif vol_z < 1.5:
+        P += 3
+    elif vol_z > 2.5:
+        P -= 7
+
+    # ATR_1h (как z-скор)
+    if atr1h > 1.2:
+        P += 4
+    elif atr1h < 0.8:
+        P -= 4
+    else:
+        P += 1
+
+    # RSI экстремы против позиции
+    side_up = (side or "").upper() == "SHORT"  # против short = вверх
+    if side_up:
+        if rsi > 65: P += 3
+        if rsi < 35: P -= 4
+    else:
+        if rsi < 35: P += 3
+        if rsi > 65: P -= 4
+
+    if red_event_soon:
+        P -= 7
+
+    P = max(35, min(75, int(round(P))))
+    return P
+
+
+def action_text(P: int, quiet_now: bool, level: str) -> str:
+    if level == "HIGH":
+        # в HIGH не обещаем 2 шага
+        if P >= 64:
+            return "готовьтесь добирать 1 шаг (после снятия ограничений и вне тихого окна)"
+    if P >= 64:
+        return "готовьтесь добирать 2 шага" + (" (вне тихого окна)" if quiet_now else "")
+    if P >= 58:
+        return "готовьтесь добирать 1 шаг" + (" (вне тихого окна)" if quiet_now else "")
+    if P >= 50:
+        return "базовый план"
+    return "дополнительные доборы не приоритетны"
+
+
+def delta_marker(target: float, fact: float) -> str:
+    if target <= 0:
+        return "—"
+    delta_pct = (fact - target) / target
+    ap = abs(delta_pct)
+    if ap <= 0.02:
+        return "✅"
+    if ap <= 0.05:
+        return f"⚠️ небольшое отклонение ({delta_pct:+.1%})"
+    return f"🚧 существенное отклонение ({delta_pct:+.1%})"
+
+
+def build_investor_digest(sh) -> str:
+    # Заголовок с локальным временем
+    now_utc = datetime.utcnow()
+    if LOCAL_TZ:
+        now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(LOCAL_TZ)
+        header = f"🧭 Утренний фон — {now_local:%A, %d %B %Y, %H:%M} (Europe/Belgrade)"
+    else:
+        header = f"🧭 Утренний фон — {now_utc.strftime('%A, %d %B %Y, %H:%M')} (UTC)"
+
+    blocks = [header]
+
+    # TODO: календарь и событие_рядом (пока без внешнего API)
+    red_event_soon = False  # заглушка
+    quiet_now = False       # заглушка
+
+    for sym in SYMBOLS:
+        row = get_last_bmr_row(sh, sym) or {}
+        side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
+        avg = _to_float(row.get("Avg_Price"))
+        next_dca = _to_float(row.get("Next_DCA_Price"))
+
+        adx = _to_float(row.get("ADX_5m"))
+        rsi = _to_float(row.get("RSI_5m"), 50.0)
+        volz = _to_float(row.get("Vol_z"))
+        atr1h = _to_float(row.get("ATR_1h"), 1.0)  # трактуем как z-скор ~1.0
+        st = supertrend_dir(row.get("Supertrend"))
+
+        fa_level = map_fa_level(row.get("FA_Risk"))
+        fa_bias = map_fa_bias(row.get("FA_Bias"))
+
+        policy = policy_from_level(fa_level)
+        quiet_from, quiet_to = policy["quiet_min"]
+        reserve = "OFF" if policy["reserve_off"] else "ON"
+        dca_scale = policy["dca_scale"]
+        icon = policy["icon"]
+        label = policy["label"]
+
+        P = probability_against(side, fa_bias, adx, st, volz, atr1h, rsi, red_event_soon)
+        act = action_text(P, quiet_now, fa_level)
+
+        target = _to_float(row.get("Bank_Target_USDT"))
+        fact = _to_float(row.get("Bank_Fact_USDT"))
+        marker = delta_marker(target, fact)
+
+        pair_pretty = f"{sym[:3]}/{sym[3:]}"
+        blocks.append(
+f"""**{pair_pretty} — {icon} {label}, bias: {fa_bias}**
+• **Фундаментально:** { 'нейтрально' if fa_level=='OK' else ('умеренные риски' if fa_level=='CAUTION' else 'высокие риски') }.
+• **Рынок сейчас:** {market_phrases(adx, st, volz, atr1h)}.
+• **Наша позиция:** **{side}**, средняя {avg:.5f}; следующий добор {next_dca:.5f}.
+• **Что делаем сейчас:** {"тихое окно не требуется" if quiet_from==0 and quiet_to==0 else f"тихое окно [{-quiet_from:+d};+{quiet_to:d}] мин"}; reserve **{reserve}**; dca_scale **{dca_scale:.2f}**.
+• **Вероятность против позиции:** ≈ **{P}%** → {act}.
+• **Цель vs факт:** Target **{target:g}** / Fact **{fact:g}** — {marker}"""
+        )
+
+    # Блок ближайших событий можно добавить здесь после подключения календаря
+    # blocks.append("\n📅 Ближайшие события: —")
+
+    return "\n\n".join(blocks)
+
+
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
     cmds = [
@@ -395,7 +648,7 @@ async def _set_bot_commands(app: Application):
         BotCommand("setweights", "Задать целевые веса (мастер-чат)"),
         BotCommand("weights", "Показать целевые веса"),
         BotCommand("alloc", "Рассчитать распределение банка"),
-        BotCommand("digest", "Короткий фундаментальный дайджест"),
+        BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
         BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
         BotCommand("sheet_test", "Тестовая запись в лист"),
         BotCommand("diag", "Диагностика LLM и Sheets"),
@@ -404,6 +657,40 @@ async def _set_bot_commands(app: Application):
         await app.bot.set_my_commands(cmds)
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
+
+
+async def morning_digest_scheduler(app: Application):
+    """Ежедневный автопост инвесторского дайджеста в MASTER_CHAT_ID в 09:30 Europe/Belgrade."""
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timedelta as _td, time as _time
+
+    while True:
+        now = _dt.now(LOCAL_TZ) if LOCAL_TZ else _dt.utcnow()
+        target = _dt.combine(now.date(), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)) if LOCAL_TZ else _dt.utcnow()
+        if not LOCAL_TZ:
+            # без zoneinfo просто шлём через ~24 часа от старта
+            target = now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
+            if now >= target:
+                target = target + _td(days=1)
+        else:
+            if now >= target:
+                target = target + _td(days=1)
+
+        wait_s = (target - now).total_seconds()
+        await _asyncio.sleep(max(1.0, wait_s))
+
+        try:
+            sh, _src = build_sheets_client(SHEET_ID)
+            if sh:
+                msg = build_investor_digest(sh)
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
+        except Exception as e:
+            try:
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+            except Exception:
+                pass
 
 
 def build_application() -> Application:
@@ -436,6 +723,7 @@ async def main_async():
     await _set_bot_commands(app)
     await app.initialize()
     await app.start()
+    asyncio.create_task(morning_digest_scheduler(app))
     await app.updater.start_polling()
     await asyncio.Event().wait()
 
