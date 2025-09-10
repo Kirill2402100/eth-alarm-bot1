@@ -76,7 +76,7 @@ log = logging.getLogger("fund_bot")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_TOKEN", "").strip()
 MASTER_CHAT_ID = int(os.getenv("MASTER_CHAT_ID", "0") or "0")
 
-SHEET_ID = os.getenv("SHEET_ID", "").strip()                       # только ID (между /d/ и /edit)
+SHEET_ID = os.getenv("SHEET_ID", "").strip()                      # только ID (между /d/ и /edit)
 SHEET_WS = os.getenv("SHEET_WS", "FUND_BOT").strip() or "FUND_BOT"  # имя листа/вкладки по умолчанию
 
 _DEFAULT_WEIGHTS_RAW = os.getenv("DEFAULT_WEIGHTS", "").strip()
@@ -107,9 +107,11 @@ BMR_SHEETS = {
 TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
 TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
 TE_KEY = os.getenv("TE_KEY", "guest").strip()
-CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))     # окно для вывода событий (+/-)
+CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))    # окно для вывода событий (+/-)
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))  # тихое окно ДО high-релиза
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))  # тихое окно ПОСЛЕ high-релиза
+CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()    # auto | te | fmp
+FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -584,8 +586,7 @@ def importance_is_high(val) -> bool:
     return "high" in s or s == "3"
 
 
-def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """Вернуть события TE для списка стран в интервале [d1; d2]. Если requests недоступен — вернуть []."""
+def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
     if not _REQUESTS_AVAILABLE:
         return []
     try:
@@ -605,15 +606,12 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
             return []
         events = []
         for it in data:
-            # нормализуем время
-            # TE обычно даёт "Date" в локали и "DateUtc" — берём UTC, иначе пробуем "Date"
             dt_utc = None
             for k in ("DateUtc", "Date", "DateUTC"):
                 val = it.get(k)
                 if not val:
                     continue
                 try:
-                    # Примеры: "2025-09-10T14:00:00", "2025-09-10 14:00:00"
                     s = str(val).replace(" ", "T")
                     dt_utc = datetime.fromisoformat(s)
                     if dt_utc.tzinfo is None:
@@ -636,8 +634,73 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
             })
         return events
     except Exception as e:
-        log.warning("calendar fetch failed: %s", e)
+        log.warning("calendar fetch (TE) failed: %s", e)
         return []
+
+
+def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    """FMP fallback: https://financialmodelingprep.com/api/v3/economic_calendar?from=YYYY-MM-DD&to=YYYY-MM-DD&apikey=KEY"""
+    if not (_REQUESTS_AVAILABLE and FMP_API_KEY):
+        return []
+    try:
+        url = "https://financialmodelingprep.com/api/v3/economic_calendar"
+        params = {
+            "from": d1.strftime("%Y-%m-%d"),
+            "to":   d2.strftime("%Y-%m-%d"),
+            "apikey": FMP_API_KEY,
+        }
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        want = [c.lower() for c in countries]
+        events = []
+        for it in data:
+            # поля у FMP: 'event', 'country', 'date' (UTC), 'impact' = Low/Medium/High
+            ctry = (it.get("country") or "").lower()
+            if not any(w in ctry for w in want):
+                continue
+            impact = (it.get("impact") or "").lower()
+            if "high" not in impact:
+                continue
+            val = it.get("date")  # "2025-09-10 14:00:00"
+            if not val:
+                continue
+            try:
+                dt_utc = datetime.fromisoformat(str(val).replace(" ", "T"))
+                if dt_utc.tzinfo is None:
+                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                else:
+                    dt_utc = dt_utc.astimezone(timezone.utc)
+            except Exception:
+                continue
+            title = it.get("event") or "Event"
+            events.append({
+                "utc": dt_utc,
+                "country": it.get("country") or "",
+                "title": str(title),
+                "importance": "High",
+            })
+        return [e for e in events if d1 <= e["utc"] <= d2]
+    except Exception as e:
+        log.warning("calendar fetch (FMP) failed: %s", e)
+        return []
+
+
+def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
+    """Роутер провайдеров: TE → FMP, либо принудительно через CAL_PROVIDER."""
+    prov = CAL_PROVIDER
+    if prov == "te":
+        return fetch_calendar_events_te(countries, d1, d2)
+    if prov == "fmp":
+        return fetch_calendar_events_fmp(countries, d1, d2)
+
+    # auto: сначала TE, если пусто — FMP
+    ev = fetch_calendar_events_te(countries, d1, d2)
+    if ev:
+        return ev
+    return fetch_calendar_events_fmp(countries, d1, d2)
 
 
 def build_calendar_for_symbols(symbols: List[str]) -> Dict[str, dict]:
