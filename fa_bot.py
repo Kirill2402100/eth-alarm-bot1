@@ -3,7 +3,8 @@ import os
 import json
 import base64
 import logging
-from time import time  # <-- Добавлено
+from math import floor # <-- Добавлено
+from time import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
 
@@ -234,6 +235,21 @@ def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, f
         "EURUSD": round(total * weights.get("EUR", 0) / s, 2),
         "GBPUSD": round(total * weights.get("GBP", 0) / s, 2),
     }
+
+
+def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
+    """Вернёт 'через 1 ч 05 мин' или '2 ч 17 мин назад' для локального текста."""
+    now = now or datetime.now(timezone.utc)
+    sec = int((dt_to - now).total_seconds())
+    sign = "через" if sec >= 0 else "назад"
+    sec = abs(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    if h and m:
+        return f"{'через ' if sign=='через' else ''}{h} ч {m:02d} мин" if sign=='через' else f"{h} ч {m:02d} мин назад"
+    if h:
+        return f"{'через ' if sign=='через' else ''}{h} ч" if sign=='через' else f"{h} ч назад"
+    return f"{'через ' if sign=='через' else ''}{m} мин" if sign=='через' else f"{m} мин назад"
 
 
 def assert_master_chat(update: Update) -> bool:
@@ -788,53 +804,84 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
     return fetch_calendar_events_ff(countries, d1, d2)
 
 
-def build_calendar_for_symbols(symbols: List[str]) -> Dict[str, dict]:
+def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = None) -> Dict[str, dict]:
     """
-    Собирает события для каждой пары в окне +/- CAL_WINDOW_MIN минут.
-    Возвращает dict[symbol] = {
-        "events": [ { "utc": dt, "local": dt_local, "title": str, "country": str, "importance": imp }, ...] (отсортированы),
-        "red_event_soon": bool (<=60 мин от сейчас),
-        "quiet_from_to": (before, after),
-        "quiet_now": bool (находимся ли мы прямо сейчас в тихом окне),
-    }
+    Для каждой пары:
+      - events: High-события внутри локального окна ±window_min (по умолчанию CAL_WINDOW_MIN)
+      - red_event_soon / quiet_*: как раньше
+      - nearest_prev: последний High (в пределах ~вчера→завтра), если нет событий в окне
+      - nearest_next: ближайший следующий High (то же), если нет событий в окне
     """
     now = datetime.now(timezone.utc)
-    d1 = now - timedelta(minutes=CAL_WINDOW_MIN)
-    d2 = now + timedelta(minutes=CAL_WINDOW_MIN)
+    w = window_min if window_min is not None else CAL_WINDOW_MIN
+    d1 = now - timedelta(minutes=w)
+    d2 = now + timedelta(minutes=w)
+
+    # Расширенный горизонт для «контекста», чтобы найти прошлое/будущее событие,
+    # если в основном окне пусто. Берём вчера 00:00…завтра 23:59 по локальной TZ.
+    if LOCAL_TZ:
+        now_loc = now.astimezone(LOCAL_TZ)
+        day_start_loc = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
+        d1_ext = day_start_loc.add(days=-1) if hasattr(day_start_loc, "add") else (day_start_loc - timedelta(days=1))
+        d2_ext = day_start_loc + timedelta(days=2)
+        d1_ext = d1_ext.astimezone(timezone.utc)
+        d2_ext = d2_ext.astimezone(timezone.utc)
+    else:
+        d1_ext = now - timedelta(hours=36)
+        d2_ext = now + timedelta(hours=36)
 
     out: Dict[str, dict] = {}
     for sym in symbols:
         countries = PAIR_COUNTRIES.get(sym, [])
-        raw = fetch_calendar_events(countries, d1, d2)
-        items = []
+        # Сначала — широкий сбор, чтобы было из чего выбирать.
+        raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
+
+        def _is_high(ev): return importance_is_high(ev.get("importance"))
+
+        # События в узком окне
+        around = []
         red_soon = False
         quiet_now = False
-        for ev in raw:
-            if not importance_is_high(ev.get("importance")):
+
+        for ev in raw_all:
+            if not _is_high(ev):
                 continue
-            # попадает в окно
             t_utc = ev["utc"]
-            t_local = t_utc.astimezone(LOCAL_TZ) if LOCAL_TZ else t_utc
-            items.append({**ev, "local": t_local})
+            if d1 <= t_utc <= d2:
+                t_local = t_utc.astimezone(LOCAL_TZ) if LOCAL_TZ else t_utc
+                around.append({**ev, "local": t_local})
+                # флаг «в ближайшие 60 мин»
+                if abs((t_utc - now).total_seconds())/60.0 <= 60:
+                    red_soon = True
+                # тихое окно вокруг события
+                start = t_utc - timedelta(minutes=QUIET_BEFORE_MIN)
+                end   = t_utc + timedelta(minutes=QUIET_AFTER_MIN)
+                if start <= now <= end:
+                    quiet_now = True
 
-            # флаг "в ближайшие 60 минут"
-            diff_min = abs((t_utc - now).total_seconds()) / 60.0
-            if diff_min <= 60:
-                red_soon = True
+        around.sort(key=lambda x: x["utc"])
 
-            # тихое окно вокруг события
-            start = t_utc - timedelta(minutes=QUIET_BEFORE_MIN)
-            end = t_utc + timedelta(minutes=QUIET_AFTER_MIN)
-            if start <= now <= end:
-                quiet_now = True
+        # Если в окне пусто — поищем «последний» и «следующий»
+        nearest_prev = None
+        nearest_next = None
+        if not around:
+            past = [ev for ev in raw_all if _is_high(ev) and ev["utc"] < now]
+            futr = [ev for ev in raw_all if _is_high(ev) and ev["utc"] >= now]
+            if past:
+                p = max(past, key=lambda e: e["utc"])
+                nearest_prev = {**p, "local": p["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else p["utc"]}
+            if futr:
+                n = min(futr, key=lambda e: e["utc"])
+                nearest_next = {**n, "local": n["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]}
 
-        items.sort(key=lambda x: x["utc"])
-        quiet_from_to = (QUIET_BEFORE_MIN, QUIET_AFTER_MIN) if items else (0, 0)
+        quiet_from_to = (QUIET_BEFORE_MIN, QUIET_AFTER_MIN) if around else (0, 0)
         out[sym] = {
-            "events": items,
+            "events": around,
             "red_event_soon": red_soon,
             "quiet_from_to": quiet_from_to,
             "quiet_now": quiet_now,
+            "nearest_prev": nearest_prev,
+            "nearest_next": nearest_next,
         }
     return out
 
@@ -982,11 +1029,21 @@ def build_investor_digest(sh) -> str:
         ev_line = ""
         events = c.get("events") or []
         if events:
-            # покажем самое близкое по времени к текущему моменту
-            now = datetime.now(timezone.utc)
-            nearest = min(events, key=lambda e: abs((e["utc"] - now).total_seconds()))
+            # как было: ближайшее по модулю к now
+            nowu = datetime.now(timezone.utc)
+            nearest = min(events, key=lambda e: abs((e["utc"] - nowu).total_seconds()))
             tloc = nearest["local"]
             ev_line = f"\n• **Событие (Белград):** {tloc:%H:%M} — {nearest['country']}: {nearest['title']} (High)"
+        else:
+            # окна пусты → покажем контекст
+            prev_ev = c.get("nearest_prev")
+            next_ev = c.get("nearest_next")
+            if prev_ev:
+                dtloc = prev_ev["local"]
+                ev_line += f"\n• **Последний High:** {dtloc:%H:%M} — {prev_ev['country']}: {prev_ev['title']} ({_fmt_tdelta_human(prev_ev['utc'])})."
+            if next_ev:
+                dtloc = next_ev["local"]
+                ev_line += f"\n• **Ближайший High:** {dtloc:%H:%M} — {next_ev['country']}: {next_ev['title']} ({_fmt_tdelta_human(next_ev['utc'])})."
 
         blocks.append(
 f"""**{pair_pretty} — {icon} {label}, bias: {fa_bias}**
@@ -1001,13 +1058,24 @@ f"""**{pair_pretty} — {icon} {label}, bias: {fa_bias}**
     # Сводка ближайших событий по всем парам (внизу)
     summary_lines: List[str] = []
     all_events = []
+
+    nowu = datetime.now(timezone.utc)
+    # Сначала добавим всё, что в окне (если есть)
     for sym in SYMBOLS:
-        for ev in cal.get(sym, {}).get("events", []):
+        for ev in cal.get(sym, {}).get("events", []) or []:
             all_events.append((ev["utc"], ev["local"], sym, ev["country"], ev["title"]))
+
+    # Если в окне пусто вообще — добавим по одному ближайшему вперёд (nearest_next) с каждой пары
+    if not all_events:
+        for sym in SYMBOLS:
+            n = cal.get(sym, {}).get("nearest_next")
+            if n:
+                all_events.append((n["utc"], n["local"], sym, n["country"], n["title"]))
+
     all_events.sort(key=lambda x: x[0])
 
     if all_events:
-        summary_lines.append("\n📅 **Ближайшие High-события (Белград, ±{} мин):**".format(CAL_WINDOW_MIN))
+        summary_lines.append("\n📅 **Ближайшие High-события (Белград):**")
         for _, tloc, sym, cty, title in all_events[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
