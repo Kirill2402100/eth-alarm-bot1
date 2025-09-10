@@ -78,6 +78,7 @@ MASTER_CHAT_ID = int(os.getenv("MASTER_CHAT_ID", "0") or "0")
 
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_WS = os.getenv("SHEET_WS", "FUND_BOT").strip() or "FUND_BOT"
+SHEET_CAL_WS = os.getenv("SHEET_CAL_WS", "CAL_EVENTS").strip()  # Лист с ручным бэкапом календаря
 
 _DEFAULT_WEIGHTS_RAW = os.getenv("DEFAULT_WEIGHTS", "").strip()
 if _DEFAULT_WEIGHTS_RAW:
@@ -108,19 +109,21 @@ TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
 TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
 TE_KEY = os.getenv("TE_KEY", "guest").strip()
 
-CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "720"))  # разумный дефолт для дайджеста
+CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "720"))  # дефолт — 12 часов до/после
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
 CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
 
 FMP_API_KEY      = os.getenv("FMP_API_KEY", "").strip()
 FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "").strip()
+CAL_TTL_SEC      = int(os.getenv("CAL_TTL_SEC", "600") or "600")
 
-CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
-
-# Опциональный «официальный бэкап» — JSON с массивом событий
+# Опциональный «официальный» бэкап: JSON с массивом событий
 OFF_BACKUP_JSON     = os.getenv("OFFICIAL_BACKUP_JSON", "").strip()
 OFF_BACKUP_JSON_B64 = os.getenv("OFFICIAL_BACKUP_JSON_B64", "").strip()
+
+# Форс-прокси для FF (если сделаешь Cloudflare Worker): FF_PROXY='https://your-worker.example.com'
+FF_PROXY = os.getenv("FF_PROXY", "").strip()
 
 COUNTRY_BY_CCY = {
     "USD": "united states",
@@ -129,7 +132,6 @@ COUNTRY_BY_CCY = {
     "GBP": "united kingdom",
     "AUD": "australia",
 }
-# FF: код → каноническое название
 FF_CODE2NAME = {
     "usd": "united states",
     "jpy": "japan",
@@ -137,7 +139,6 @@ FF_CODE2NAME = {
     "gbp": "united kingdom",
     "aud": "australia",
 }
-
 PAIR_COUNTRIES = {
     "USDJPY": [COUNTRY_BY_CCY["USD"], COUNTRY_BY_CCY["JPY"]],
     "AUDUSD": [COUNTRY_BY_CCY["AUD"], COUNTRY_BY_CCY["USD"]],
@@ -224,8 +225,9 @@ def ensure_worksheet(sh, title: str):
         for ws in sh.worksheets():
             if ws.title == title:
                 return ws, False
-        ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(SHEET_HEADERS)))
-        ws.update("A1", [SHEET_HEADERS])
+        ws = sh.add_worksheet(title=title, rows=200, cols=20)
+        if title == SHEET_WS:
+            ws.update("A1", [SHEET_HEADERS])
         return ws, True
     except Exception as e:
         raise RuntimeError(f"ensure_worksheet error: {e}")
@@ -487,7 +489,7 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
 
-# ---------- Digest helpers (инвесторский режим) ----------
+# ---------- Digest helpers ----------
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
 
@@ -587,7 +589,6 @@ def importance_is_high(val) -> bool:
 
 # -------------------- КАЛЕНДАРИ --------------------
 def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """TradingEconomics (как правило 403 на гостевом для календаря)."""
     if not _REQUESTS_AVAILABLE:
         return []
     try:
@@ -618,7 +619,6 @@ def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -
 
 
 def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """FinancialModelingPrep (часто 403 на бесплатном ключе)."""
     if not (_REQUESTS_AVAILABLE and FMP_API_KEY):
         return []
     try:
@@ -633,7 +633,7 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
             if cty not in want:
                 continue
             dt_s = it.get("date")
-            tm_s = it.get("time")  # "13:30"
+            tm_s = it.get("time")
             if not dt_s:
                 continue
             try:
@@ -656,7 +656,6 @@ def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) 
 
 
 def fetch_calendar_events_finnhub(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """Finnhub (экономкалендарь платный; на free обычно 403)."""
     if not (_REQUESTS_AVAILABLE and FINNHUB_API_KEY):
         return []
     try:
@@ -668,14 +667,10 @@ def fetch_calendar_events_finnhub(countries: List[str], d1: datetime, d2: dateti
         want = {c.lower() for c in countries}
         out = []
         for it in arr:
-            # Finnhub country может быть в ISO2/ISO3/названии — нормализуем по ключевым
             cty_raw = (it.get("country") or it.get("region") or "").strip().lower()
-            cty = cty_raw
-            if cty in FF_CODE2NAME:
-                cty = FF_CODE2NAME[cty]
+            cty = FF_CODE2NAME.get(cty_raw, cty_raw)
             if cty not in want:
                 continue
-            # datetime
             dt_s = it.get("time") or it.get("datetime") or it.get("date")
             dt_utc = None
             if dt_s:
@@ -702,44 +697,49 @@ def fetch_calendar_events_finnhub(countries: List[str], d1: datetime, d2: dateti
         return []
 
 
-# ---------- Бесплатный источник: ForexFactory weekly JSON ----------
+# ---------- Бесплатный ForexFactory: много эндпоинтов ----------
+def _ff_endpoints() -> List[str]:
+    # можно переопределить через FF_PROXY (например, твой CF Worker проксирует путь один в один)
+    base_list = [
+        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_nextweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_lastweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_lastweek.json",
+    ]
+    if FF_PROXY:
+        proxied = []
+        for u in base_list:
+            proxied.append(FF_PROXY.rstrip("/") + "/" + u.split("/", 3)[-1])
+        return proxied + base_list
+    return base_list
+
+
 def _ff_parse_dt(date_s: str, time_s: Optional[str]) -> Optional[datetime]:
-    """
-    Преобразуем связку date/time в UTC.
-    В weekly JSON время иногда даётся в локальном формате сайта; если есть timestamp — используем его.
-    Здесь бэкап: считаем, что время — UTC. Для All Day/Tentative без времени ставим 00:00 UTC.
-    """
     try:
         if not date_s:
             return None
         date_s = str(date_s).strip()
         if time_s:
             t = str(time_s).strip().lower()
-            # Примеры: "8:30am", "14:00", "All Day", "Tentative"
             if t in ("all day", "allday", "tentative"):
                 dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
             else:
-                # нормализуем am/pm
                 if "am" in t or "pm" in t:
-                    # "8:30am" → 08:30, "12:00pm" → 12:00
                     tnum = t.replace(" ", "")
                     am = tnum.endswith("am")
                     pm = tnum.endswith("pm")
                     tnum = tnum[:-2]
                     hh, mm = tnum.split(":") if ":" in tnum else (tnum, "00")
-                    h = int(hh)
-                    m = int(mm)
-                    if pm and h < 12:
-                        h += 12
-                    if am and h == 12:
-                        h = 0
+                    h = int(hh); m = int(mm)
+                    if pm and h < 12: h += 12
+                    if am and h == 12: h = 0
                     dt = datetime.fromisoformat(f"{date_s}T{h:02d}:{m:02d}:00+00:00")
                 else:
-                    # уже 24h формат
                     if ":" in t:
                         hh, mm = t.split(":", 1)
-                        h = int(hh)
-                        m = int(mm.split()[0])
+                        h = int(hh); m = int(mm.split()[0])
                         dt = datetime.fromisoformat(f"{date_s}T{h:02d}:{m:02d}:00+00:00")
                     else:
                         dt = datetime.fromisoformat(f"{date_s}T00:00:00+00:00")
@@ -751,73 +751,73 @@ def _ff_parse_dt(date_s: str, time_s: Optional[str]) -> Optional[datetime]:
 
 
 def fetch_calendar_events_ff_all() -> list[dict]:
-    """
-    Тянем недельный JSON FF c кешом/бэкоффом. Поддерживаем:
-      - запись с 'timestamp'
-      - запись с 'date' + 'time' (All Day/Tentative)
-    Поля вывода: utc, country, title, importance
-    """
+    """Пробуем несколько зеркал и недель (this/next/last). Кеш + backoff."""
     if not _REQUESTS_AVAILABLE:
         return _FF_CACHE["data"]
     now = int(datetime.now(tz=timezone.utc).timestamp())
 
-    # локальный негативный кеш на 429
     if _FF_NEG["until"] and now < _FF_NEG["until"]:
         return _FF_CACHE["data"]
 
-    # валидный кеш
     if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
         return _FF_CACHE["data"]
 
-    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-        if r.status_code == 429:
-            _FF_NEG["until"] = now + 120
-            log.warning("calendar fetch (FF) 429: backoff 120s")
-            return _FF_CACHE["data"]
-        r.raise_for_status()
+    headers = {
+        "User-Agent": "fund-bot/1.0 (+https://example.local)",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
-        raw = r.json() or []
-        data = []
-        for it in raw:
-            # 1) timestamp (приоритет)
-            ts = it.get("timestamp")
-            dt_utc: Optional[datetime] = None
-            if ts is not None:
-                try:
-                    dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-                except Exception:
-                    dt_utc = None
-
-            # 2) date + time
-            if dt_utc is None:
-                dt_utc = _ff_parse_dt(it.get("date") or it.get("dateStr") or "", it.get("time"))
-
-            if dt_utc is None:
+    endpoints = _ff_endpoints()
+    for url in endpoints:
+        try:
+            # Анти-кеш
+            sep = "&" if "?" in url else "?"
+            full = f"{url}{sep}_={now%1000000}"
+            r = requests.get(full, timeout=12, headers=headers)
+            if r.status_code == 429:
+                _FF_NEG["until"] = now + 120
+                log.warning("calendar fetch (FF) 429 on %s: backoff 120s", url)
                 continue
+            r.raise_for_status()
+            raw = r.json() or []
+            data = []
+            for it in raw:
+                dt_utc = None
+                ts = it.get("timestamp")
+                if ts is not None:
+                    try:
+                        dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                    except Exception:
+                        dt_utc = None
+                if dt_utc is None:
+                    dt_utc = _ff_parse_dt(it.get("date") or it.get("dateStr") or "", it.get("time"))
+                if dt_utc is None:
+                    continue
+                country_raw = (it.get("country") or "").strip()
+                country = FF_CODE2NAME.get(country_raw.lower(), country_raw).lower()
+                title = it.get("title") or it.get("event") or it.get("impactTitle") or "Event"
+                impact = it.get("impact") or it.get("impactText") or ""
+                data.append({
+                    "utc": dt_utc,
+                    "country": country,
+                    "title": title,
+                    "importance": impact,
+                })
+            if data:
+                _FF_CACHE["data"] = data
+                _FF_CACHE["at"] = now
+                _FF_NEG["until"] = 0
+                log.info("FF weekly: loaded %d events from %s", len(data), url)
+                return data
+            else:
+                log.info("FF weekly: %s returned 0 events", url)
+        except Exception as e:
+            log.warning("calendar fetch (FF) failed on %s: %s", url, e)
 
-            country_raw = (it.get("country") or "").strip()
-            country = FF_CODE2NAME.get(country_raw.lower(), country_raw).lower()
-
-            title = it.get("title") or it.get("event") or it.get("impactTitle") or "Event"
-            impact = it.get("impact") or it.get("impactText") or ""
-
-            data.append({
-                "utc": dt_utc,
-                "country": country,
-                "title": title,
-                "importance": impact,
-            })
-
-        _FF_CACHE["data"] = data
-        _FF_CACHE["at"] = now
-        _FF_NEG["until"] = 0
-        log.info("FF weekly: loaded %d events", len(data))
-        return data
-    except Exception as e:
-        log.warning("calendar fetch (FF) failed: %s", e)
-        return _FF_CACHE["data"]
+    # Ничего не дали — оставляем прежний кеш (возможно пустой)
+    return _FF_CACHE["data"]
 
 
 def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: list[dict]) -> list[dict]:
@@ -832,9 +832,6 @@ def _filter_events_by(countries: list[str], d1: datetime, d2: datetime, events: 
 
 
 def _load_official_backup_all() -> List[dict]:
-    """Опциональный бэкап: OFFICIAL_BACKUP_JSON(_B64) = JSON-массив событий.
-       Формат элементов: { "utc": "2025-09-10T12:30:00Z", "country": "united states", "title": "...", "importance": "High" }
-    """
     src = OFF_BACKUP_JSON or ""
     if not src and OFF_BACKUP_JSON_B64:
         try:
@@ -862,11 +859,54 @@ def _load_official_backup_all() -> List[dict]:
         return []
 
 
+def _load_sheet_calendar_backup(d1: datetime, d2: datetime, countries: List[str]) -> List[dict]:
+    """Бесплатный и стабильный способ: лист CAL_EVENTS в твоём Google Sheet."""
+    if not SHEET_ID or not _GSHEETS_AVAILABLE:
+        return []
+    try:
+        sh, _ = build_sheets_client(SHEET_ID)
+        if not sh:
+            return []
+        ws, _ = ensure_worksheet(sh, SHEET_CAL_WS)
+        rows = ws.get_all_records()  # ожидаем колонки: utc,country,title,importance
+        want = {c.lower() for c in countries}
+        out = []
+        for r in rows:
+            utc_s = (r.get("utc") or r.get("UTC") or "").strip()
+            if not utc_s:
+                continue
+            try:
+                dt_utc = datetime.fromisoformat(utc_s.replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                continue
+            cty = (r.get("country") or r.get("COUNTRY") or "").strip().lower()
+            if cty not in want:
+                continue
+            if not (d1 <= dt_utc <= d2):
+                continue
+            out.append({
+                "utc": dt_utc,
+                "country": cty,
+                "title": (r.get("title") or r.get("TITLE") or "Event").strip(),
+                "importance": (r.get("importance") or r.get("IMPACT") or "High").strip(),
+            })
+        if out:
+            log.info("Sheet calendar backup: %d events from '%s'", len(out), SHEET_CAL_WS)
+        return out
+    except Exception as e:
+        log.warning("Sheet calendar backup failed: %s", e)
+        return []
+
+
 def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    """Комбинированный фетч по провайдеру/фоллбэкам."""
     prov = CAL_PROVIDER
     if prov == "ff":
-        return _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+        ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+        if not ev:
+            ev = _load_sheet_calendar_backup(d1, d2, countries)
+        if not ev:
+            ev = _filter_events_by(countries, d1, d2, _load_official_backup_all())
+        return ev
     if prov == "te":
         return fetch_calendar_events_te(countries, d1, d2)
     if prov == "fmp":
@@ -874,16 +914,18 @@ def fetch_calendar_events(countries: List[str], d1: datetime, d2: datetime) -> L
     if prov == "finnhub":
         return fetch_calendar_events_finnhub(countries, d1, d2)
 
-    # auto: бесплатный FF → TE → FMP → Finnhub → официальный бэкап
+    # auto: FF → Sheet backup → Official backup → TE → FMP → Finnhub
     ev = _filter_events_by(countries, d1, d2, fetch_calendar_events_ff_all())
+    if not ev:
+        ev = _load_sheet_calendar_backup(d1, d2, countries)
+    if not ev:
+        ev = _filter_events_by(countries, d1, d2, _load_official_backup_all())
     if not ev:
         ev = fetch_calendar_events_te(countries, d1, d2)
     if not ev:
         ev = fetch_calendar_events_fmp(countries, d1, d2)
     if not ev:
         ev = fetch_calendar_events_finnhub(countries, d1, d2)
-    if not ev:
-        ev = _filter_events_by(countries, d1, d2, _load_official_backup_all())
     return ev
 
 
@@ -904,7 +946,6 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
 
     out: Dict[str, dict] = {}
 
-    # Если используем FF/auto — выгодно один раз подтянуть weekly и дальше фильтровать.
     all_raw_ff = fetch_calendar_events_ff_all() if CAL_PROVIDER in ("ff", "auto") else None
 
     for sym in symbols:
@@ -916,7 +957,6 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
         else:
             sym_raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
 
-        # события внутри окна ±w
         around = [
             {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
             for ev in sym_raw_all
@@ -930,7 +970,6 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
             for ev in around
         )
 
-        # если в окне нет событий — всё равно найдём «последнее/ближайшее» High
         nearest_prev = nearest_next = None
         if not around:
             high_events = [ev for ev in sym_raw_all if importance_is_high(ev.get("importance"))]
@@ -957,7 +996,6 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
     for sym, pack in out.items():
         log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
                  sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
-
     return out
 
 
@@ -986,7 +1024,7 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
     elif atr1h < 0.8: P -= 4
     else: P += 1
 
-    side_up = (side or "").upper() == "SHORT"  # «против SHORT» = вверх
+    side_up = (side or "").upper() == "SHORT"
     if side_up:
         if rsi > 65: P += 3
         if rsi < 35: P -= 4
@@ -995,7 +1033,6 @@ def probability_against(side: str, fa_bias: str, adx: float, st_dir: str,
         if rsi > 65: P -= 4
 
     if red_event_soon: P -= 7
-
     return max(35, min(75, int(round(P))))
 
 
@@ -1073,7 +1110,6 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
 • **Цель vs факт:** {banks_line}{ev_line}"""
         )
 
-    # Сводка ближайших событий по всем символам
     summary_lines: List[str] = []
     all_events = []
     for sym in SYMBOLS:
@@ -1094,7 +1130,6 @@ f"""**{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bias
         for _, tloc, sym, cty, title in list(unique_events.values())[:8]:
             summary_lines.append(f"• {tloc:%H:%M} — {sym}: {cty}: {title}")
 
-    # ВАЖНО: не возвращаем пустой текст (исправление "Message text is empty")
     parts = list(blocks)
     if summary_lines:
         parts.append("\n".join(summary_lines))
@@ -1167,7 +1202,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
-
     return app
 
 
