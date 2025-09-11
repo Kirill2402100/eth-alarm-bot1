@@ -1028,10 +1028,15 @@ async def morning_digest_scheduler(app: Application):
                 pass
 
 
+async def _post_init(app: Application):
+    await _set_bot_commands(app)
+    app.create_task(morning_digest_scheduler(app))
+
 def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
     builder = Application.builder().token(BOT_TOKEN)
     if _RATE_LIMITER_AVAILABLE: builder = builder.rate_limiter(AIORateLimiter())
+    builder = builder.post_init(_post_init)
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1047,18 +1052,10 @@ def build_application() -> Application:
     return app
 
 
-async def main_async():
+def main():
     log.info("Fund bot is running…")
     app = build_application()
-    await _set_bot_commands(app)
-    asyncio.create_task(morning_digest_scheduler(app))
-    await app.run_polling()
-
-
-def main():
-    try: asyncio.run(main_async())
-    except KeyboardInterrupt: pass
-
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
