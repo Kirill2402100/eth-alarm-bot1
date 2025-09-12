@@ -1,40 +1,35 @@
-# fa_bot.py
+# fa_bot.py — фонд-бот: аллокации и утренний инвесторский дайджест
 # -*- coding: utf-8 -*-
+
 import os
 import json
 import base64
 import logging
 import re
-import time  # для backoff в main()
+import time
 from html import escape as _html_escape
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
 
 import asyncio
 
+# --- Telegram ---
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError, RetryAfter
 
 # --- Таймзона ---
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
+
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else None
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
 
-# --- FA badges (трёхстатусная шкала) ---
-FA_BADGE = {
-    "Green": "✅ спокойно",
-    "Amber": "🟡 осторожно",
-    "Red":   "🛑 стоп докупок",
-}
-
-# --- Лимитер Telegram (может быть не установлен) ---
+# --- Лимитер Telegram (опционально) ---
 try:
     from telegram.ext import AIORateLimiter
     _RATE_LIMITER_AVAILABLE = True
@@ -52,11 +47,19 @@ except Exception:
     service_account = None
     _GSHEETS_AVAILABLE = False
 
+# --- LLM-клиент (опционально) ---
+try:
+    from llm_client import generate_digest, llm_ping
+except Exception:
+    async def generate_digest(*args, **kwargs) -> str:
+        return "⚠️ LLM сейчас недоступен (нет llm_client.py)."
+
+    async def llm_ping() -> bool:
+        return bool(os.getenv("OPENAI_API_KEY"))
+
 # -------------------- ЛОГИ --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("fund_bot")
 
 # -------------------- ENV --------------------
@@ -82,7 +85,7 @@ LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
-# --- Названия листов с логами по парам (переопределяются через ENV) ---
+# --- Листы по парам для БМР/логов ---
 BMR_SHEETS = {
     "USDJPY": os.getenv("BMR_SHEET_USDJPY", "BMR_DCA_USDJPY"),
     "AUDUSD": os.getenv("BMR_SHEET_AUDUSD", "BMR_DCA_AUDUSD"),
@@ -93,7 +96,7 @@ BMR_SHEETS = {
 # --- Календарь ---
 CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
 
-# страны по парам — для фильтрации NEWS/CALENDAR
+# Страны по парам — для NEWS/CALENDAR
 PAIR_COUNTRIES = {
     "USDJPY": {"united states", "japan"},
     "AUDUSD": {"australia", "united states"},
@@ -101,22 +104,29 @@ PAIR_COUNTRIES = {
     "GBPUSD": {"united kingdom", "united states"},
 }
 
-# те же ключевые слова/источники, что в calendar_collector.py
+# Ключевые слова и источники (выровнены с calendar_collector.py + расширены)
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
-    # расширено: policy statement(s), cash rate, fomc/mpc
+    # добавлено: fomc/mpc, policy statement(s), rate statement, cash rate
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
     "intervention|FX intervention|press conference|policy statement|policy statements|"
     "rate statement|cash rate|fomc|mpc"
 ), re.I)
+
 ALLOWED_SOURCES = {
     s.strip().upper()
-    for s in os.getenv("FA_NEWS_SOURCES", "US_FED_PR,ECB_PR,BOE_PR,BOJ_PR,RBA_MR,US_TREASURY,JP_MOF_FX").split(",")
+    for s in os.getenv(
+        "FA_NEWS_SOURCES",
+        "US_FED_PR,ECB_PR,BOE_PR,BOJ_PR,RBA_MR,US_TREASURY,JP_MOF_FX"
+    ).split(",")
     if s.strip()
 }
 NEWS_TTL_MIN = int(os.getenv("FA_NEWS_TTL_MIN", "120") or "120")
 
-# -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
+# Для /diag
+DIGEST_NEWS_LOOKBACK_MIN = int(os.getenv("DIGEST_NEWS_LOOKBACK_MIN", "180") or "180")
+
+# -------------------- ГЛОБАЛЬНОЕ СОСТОЯНИЕ --------------------
 STATE = {
     "total": 0.0,
     "weights": DEFAULT_WEIGHTS.copy(),
@@ -130,7 +140,7 @@ def _env(name: str) -> str:
     return v if isinstance(v, str) else ""
 
 def _decode_b64_maybe_padded(s: str) -> str:
-    s = s.strip()
+    s = (s or "").strip()
     if not s:
         return ""
     padded = s + "=" * ((4 - len(s) % 4) % 4)
@@ -182,64 +192,77 @@ async def get_sheets():
     sh, _ = build_sheets_client(SHEET_ID)
     return sh
 
-# ---------- Sheets helpers ----------
+# ---------- Helpers: лист FUND_BOT ----------
 SHEET_HEADERS = ["ts", "chat_id", "action", "total", "weights_json", "note"]
 
 def ensure_worksheet(sh, title: str):
-    try:
-        for ws in sh.worksheets():
-            if ws.title == title:
-                return ws, False
-        ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(SHEET_HEADERS)))
-        ws.update("A1", [SHEET_HEADERS])
-        return ws, True
-    except Exception as e:
-        raise RuntimeError(f"ensure_worksheet error: {e}")
+    for ws in sh.worksheets():
+        if ws.title == title:
+            return ws, False
+    ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(SHEET_HEADERS)))
+    ws.update("A1", [SHEET_HEADERS])
+    return ws, True
 
 def append_row(sh, title: str, row: list):
     ws, _ = ensure_worksheet(sh, title)
     ws.append_row(row, value_input_option="RAW")
 
-# --- helpers: Google Sheets → FA/NEWS -------------------------------------------------
+# ---------- Helpers: NEWS/CALENDAR -----------
 def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
+def _read_news_rows(sh) -> List[dict]:
+    """Безопасное чтение NEWS (для /diag и топ-новостей)."""
+    try:
+        rows = sh.worksheet("NEWS").get_all_records()
+        norm = []
+        for r in rows:
+            try:
+                ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                continue
+            norm.append({
+                "ts_utc": ts,
+                "source": str(r.get("source","")).upper().strip(),
+                "title":  str(r.get("title","")).strip(),
+                "url":    str(r.get("url","")).strip(),
+                "countries": {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()},
+                "ccy":    str(r.get("ccy","")).upper().strip(),
+                "tags":   str(r.get("tags","")).strip(),
+            })
+        return norm
+    except Exception:
+        return []
+
 def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
     """
-    Возвращает строку вида 'HH:MM — Title (SRC)' для КОНКРЕТНОЙ пары.
+    Возвращает строку 'HH:MM — Title (SRC)' для КОНКРЕТНОЙ пары.
     1) Ищем свежую high-новость из NEWS за TTL (по странам пары).
-    2) Если нет — ближайшее событие из CALENDAR (по странам пары) или крайнее прошедшее.
+    2) Если нет — ближайшее будущее событие из CALENDAR (по странам пары).
+    3) Если нет — ближайшее прошлое событие из CALENDAR (как фолбэк).
     """
     now_utc = now_utc or datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(minutes=NEWS_TTL_MIN)
     countries = PAIR_COUNTRIES.get(pair, set())
 
-    # 1) NEWS
-    try:
-        rows = sh.worksheet("NEWS").get_all_records()
-    except Exception:
-        rows = []
+    # 1) NEWS: свежие релевантные записи
     best = None
-    for r in rows:
-        try:
-            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
-            continue
+    for r in _read_news_rows(sh):
+        ts = r["ts_utc"]
         if ts < cutoff:
             continue
-        src = str(r.get("source", "")).upper().strip()
+        src = r["source"]
         if ALLOWED_SOURCES and src not in ALLOWED_SOURCES:
             continue
-        title = str(r.get("title", "")).strip()
-        tags  = str(r.get("tags", "")).strip()
+        title = r["title"]
+        tags = r["tags"]
         kw_ok = bool(KW_RE.search(f"{title} {tags}"))
-        # ЦБ-источники пропускаем даже без ключевых слов (якорные релизы)
-        if not kw_ok and src in {"US_FED_PR","ECB_PR","BOE_PR","RBA_MR","BOJ_PR"}:
+        # Разрешаем «якорные» источники ЦБ даже без явных ключевых слов
+        if not kw_ok and src in {"US_FED_PR", "ECB_PR", "BOE_PR", "RBA_MR", "BOJ_PR"}:
             kw_ok = True
         if not kw_ok:
             continue
-        row_cty = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
-        if not (row_cty & countries):
+        if not (r["countries"] & countries):
             continue
         if (best is None) or (ts > best["ts"]):
             best = {"ts": ts, "title": title, "src": src}
@@ -247,26 +270,31 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
         lt = best["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else best["ts"]
         return f"{lt:%H:%M} — {best['title']} ({best['src']})"
 
-    # 2) CALENDAR (fallback)
+    # 2-3) CALENDAR
     try:
         events = sh.worksheet(CAL_WS_OUT).get_all_records()
     except Exception:
         events = []
-    soon = None
-    last_past = None
+
+    soon = None        # ближайшее будущее событие
+    last_past = None   # ближайшее прошедшее
     for e in events:
         try:
-            dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z", "+00:00")).astimezone(timezone.utc)
+            dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z","+00:00")).astimezone(timezone.utc)
         except Exception:
             continue
-        if str(e.get("country","")).strip().lower() not in countries:
+        country = str(e.get("country","")).strip().lower()
+        if country not in countries:
             continue
-        if dt <= now_utc:
-            if last_past is None or dt > last_past["ts"]:
-                last_past = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
-        else:
+        title = str(e.get("title","")).strip()
+        src = str(e.get("source","")).strip() or "cal"
+        if dt > now_utc:
             if (soon is None) or (dt < soon["ts"]):
-                soon = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
+                soon = {"ts": dt, "title": title, "src": src}
+        else:
+            if (last_past is None) or (dt > last_past["ts"]):
+                last_past = {"ts": dt, "title": title, "src": src}
+
     if soon:
         lt = soon["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else soon["ts"]
         return f"{lt:%Y-%m-%d %H:%M} — {soon['title']} ({soon['src']})"
@@ -298,8 +326,7 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
         except Exception:
             upd_ts = None
         if ttl and upd_ts and now > upd_ts + timedelta(minutes=ttl):
-            # протухло — игнорируем
-            continue
+            continue  # протухло
         out[pair] = {
             "risk":        (str(r.get("risk", "Green")).capitalize()),
             "bias":        (str(r.get("bias", "neutral")).lower()),
@@ -310,25 +337,9 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
         }
     return out
 
-# -------------------- УТИЛИТЫ --------------------
+# -------------------- Общие утилиты --------------------
 def _h(x) -> str:
     return _html_escape(str(x), quote=True)
-
-async def safe_send_message(bot, chat_id: int, **kwargs):
-    """Sends a message with retry logic for network errors."""
-    delay = 1.0
-    for attempt in range(5):
-        try:
-            return await bot.send_message(chat_id=chat_id, **kwargs)
-        except RetryAfter as e:
-            log.warning("send_message: hit rate limit, sleeping for %s seconds", e.retry_after)
-            await asyncio.sleep(e.retry_after + 1)
-        except (TimedOut, NetworkError) as e:
-            log.warning("send_message: network error '%s', attempt %d/5, sleeping for %.1f s", e, attempt + 1, delay)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30)
-    log.error("send_message: gave up after 5 retries (chat_id=%s)", chat_id)
-
 
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
@@ -342,167 +353,22 @@ def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, f
         "GBPUSD": round(total * weights.get("GBP", 0) / s, 2),
     }
 
-def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
-    now = now or datetime.now(timezone.utc)
-    sec = int((dt_to - now).total_seconds())
-    sign = "через" if sec >= 0 else "назад"
-    sec = abs(sec)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    if h and m:
-        return f"{h} ч {m:02d} мин {sign}"
-    if h:
-        return f"{h} ч {sign}"
-    return f"{m} мин {sign}"
-
-def assert_master_chat(update: Update) -> bool:
-    if MASTER_CHAT_ID and update.effective_chat:
-        return update.effective_chat.id == MASTER_CHAT_ID
-    return True
-
-def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
-    parts, cur = [], []
-    cur_len = 0
-    for para in msg.split("\n\n"):
-        block = (para + "\n\n")
-        if cur_len + len(block) > limit and cur:
-            parts.append("".join(cur).rstrip())
-            cur, cur_len = [], 0
-        cur.append(block)
-        cur_len += len(block)
-    if cur:
-        parts.append("".join(cur).rstrip())
-    return parts
-
-# -------------------- КОМАНДЫ --------------------
-HELP_TEXT = (
-    "Что я умею\n"
-    "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
-    "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
-    "/weights — показать целевые веса.\n"
-    "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
-    "/digest — утренний дайджест (человеческий язык + события + новости).\n"
-    "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
-    "/init_sheet — создать/проверить лист в Google Sheets.\n"
-    "/sheet_test — записать тестовую строку в лист.\n"
-    "/diag — диагностика LLM / Sheets / NEWS.\n"
-)
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help"
-    await safe_send_message(context.bot, update.effective_chat.id, text=msg, parse_mode=ParseMode.HTML)
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_message(context.bot, update.effective_chat.id, text=HELP_TEXT)
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_message(context.bot, update.effective_chat.id, text="pong")
-
-async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not assert_master_chat(update):
-        await safe_send_message(context.bot, update.effective_chat.id, text="Эта команда доступна только в мастер-чате.")
-        return
-    try:
-        parts = update.message.text.strip().split()
-        if len(parts) < 2:
-            raise ValueError
-        total = float(parts[1])
-    except Exception:
-        await safe_send_message(context.bot, update.effective_chat.id, text="Пример: /settotal 2800")
-        return
-
-    STATE["total"] = total
-    await safe_send_message(context.bot, update.effective_chat.id, text=f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
-
-async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not assert_master_chat(update):
-        await safe_send_message(context.bot, update.effective_chat.id, text="Эта команда доступна только в мастер-чате.")
-        return
-
-    text = update.message.text[len("/setweights"):].strip().lower()
-    new_w = STATE["weights"].copy()
-    try:
-        for token in text.split():
-            if "=" not in token:
-                continue
-            k, v = token.split("=", 1)
-            k = k.strip().upper()
-            v = int(v.strip())
-            if k in ("JPY", "AUD", "EUR", "GBP"):
-                new_w[k] = v
-    except Exception:
-        await safe_send_message(context.bot, update.effective_chat.id, text="Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
-        return
-
-    STATE["weights"] = new_w
-    await safe_send_message(
-        context.bot,
-        update.effective_chat.id,
-        text=f"Целевые веса обновлены: {human_readable_weights(new_w)}"
-    )
-
-async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send_message(context.bot, update.effective_chat.id, text=f"Целевые веса: {human_readable_weights(STATE['weights'])}")
-
-async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = float(STATE["total"])
-    if total <= 0:
-        await safe_send_message(context.bot, update.effective_chat.id, text="Сначала задайте общий банк: /settotal 2800")
-        return
-
-    w = STATE["weights"]
-    alloc = split_total_by_weights(total, w)
-
-    lines = [
-        f"Целевые веса: {human_readable_weights(w)}",
-        "",
-        "Распределение:",
-    ]
-    for sym in SYMBOLS:
-        lines.append(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}")
-    msg = "\n".join(lines)
-    await safe_send_message(context.bot, update.effective_chat.id, text=msg)
-
-    sh, _src = build_sheets_client(SHEET_ID)
-    if sh:
-        try:
-            append_row(
-                sh,
-                SHEET_WS,
-                [
-                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                    str(update.effective_chat.id),
-                    "alloc",
-                    f"{total:.2f}",
-                    json.dumps(w, ensure_ascii=False),
-                    json.dumps(alloc, ensure_ascii=False),
-                ],
-            )
-        except Exception as e:
-            log.warning("append_row alloc failed: %s", e)
-
-# ---------- Вспомогательные для «инвесторского» дайджеста ----------
-_RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-_RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
-
-def header_ru(dt) -> str:
-    wd = _RU_WD[dt.weekday()]
-    mm = _RU_MM[dt.month - 1]
-    return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
-
 def _to_float(x, default: Optional[float] = 0.0) -> Optional[float]:
     try:
         return float(str(x).strip().replace(",", "."))
     except Exception:
         return default
 
-def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
+def get_last_nonempty_row(sh, symbol: str,
+                          needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return None
+    if not sheet_name:
+        return None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows: return None
+        if not rows:
+            return None
         for r in reversed(rows):
             if any(r.get(f) not in (None, "", 0, "0", "0.0") for f in needed_fields):
                 return r
@@ -512,11 +378,13 @@ def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_
 
 def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return None, None
+    if not sheet_name:
+        return None, None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows: return None, None
+        if not rows:
+            return None, None
         tgt = fac = None
         for r in reversed(rows):
             if tgt is None and r.get("Bank_Target_USDT") not in (None, "", 0, "0", "0.0"):
@@ -530,28 +398,30 @@ def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[
         return None, None
 
 def price_fmt(symbol: str, value: Optional[float]) -> str:
-    if value is None: return "—"
+    if value is None:
+        return "—"
     return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
 
-def _symbol_hints(symbol: str) -> tuple[str,str]:
+def _symbol_hints(symbol: str) -> tuple[str, str]:
     if symbol == "USDJPY":
         return (
             "до решения ФРС сильного тренда не ждём. Резкие слова ФРС — укрепляют доллар (часто рост USD/JPY); мягкие — ослабляют доллар (падение USD/JPY).",
-            "если ФРС жёстче ожидаемого — доллар дороже; мягче — доллар дешевле."
+            "если ФРС жёстче ожидаемого — доллар дороже; мягче — доллар дешевле.",
         )
     if symbol == "AUDUSD":
         return (
             "комментарии РБА, намекающие «держим ставку дольше», обычно поддерживают AUD (AUD/USD может подрасти).",
-            "если РБА не спешит снижать ставку — австралийский доллар сильнее."
+            "если РБА не спешит снижать ставку — австралийский доллар сильнее.",
         )
     if symbol == "EURUSD":
         return (
             "публикации ЕЦБ про экономику без сюрпризов — нейтрально; жёсткий тон ЕЦБ — поддержка евро (EUR/USD вверх), мягкий — давление на евро (вниз).",
-            "ищем намёки — «больше боимся инфляции» → евро сильнее; «больше боимся слабой экономики» → евро слабее."
+            "ищем намёки — «больше боимся инфляции» → евро сильнее; «больше боимся слабой экономики» → евро слабее.",
         )
+    # GBPUSD
     return (
         "если представители Банка Англии говорят «зарплаты и услуги давят на инфляцию», рынок ждёт ставку повыше дольше — фунт крепче (GBP/USD вверх). Мягче — фунт слабее.",
-        "больше тревоги по инфляции — фунт сильнее; меньше — слабее."
+        "больше тревоги по инфляции — фунт сильнее; меньше — слабее.",
     )
 
 def _pair_to_title(symbol: str) -> str:
@@ -567,9 +437,12 @@ def _plan_vs_fact_line(sh, symbol: str) -> str:
         return f"план {tt:g} / факт {ff:g} — —."
     delta = 0 if tt == 0 else (ff - tt) / tt
     ap = abs(delta)
-    if ap <= 0.02: mark = "✅ в норме."
-    elif ap <= 0.05: mark = f"⚠️ {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
-    else: mark = f"🚧 {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
+    if ap <= 0.02:
+        mark = "✅ в норме."
+    elif ap <= 0.05:
+        mark = f"⚠️ {'ниже' if delta < 0 else 'выше'} плана ({delta:+.0%})."
+    else:
+        mark = f"🚧 {'ниже' if delta < 0 else 'выше'} плана ({delta:+.0%})."
     return f"план {tt:g} / факт {ff:g} — {mark}"
 
 def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
@@ -599,35 +472,150 @@ def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     lines.append(f"•\tЧто это значит для цены: {what_means}")
     lines.append(f"•\tПлан vs факт по банку: {plan_fact}.")
     lines.append(f"Простыми словами: {simple_words}")
-
     return "\n".join(lines)
 
-# ---------- Digest helpers ----------
+# ---------- Digest сборка ----------
+_RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+_RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
+
+def header_ru(dt) -> str:
+    wd = _RU_WD[dt.weekday()]
+    mm = _RU_MM[dt.month - 1]
+    return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
+
 def build_digest_text(sh, fa_sheet_data: dict) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
 
     parts: List[str] = [header]
-
     for i, sym in enumerate(SYMBOLS):
         row = get_last_nonempty_row(sh, sym) or {}
         fa_data = fa_sheet_data.get(sym, {})
-        block = render_morning_pair_block(sh, sym, row, fa_data)
-        parts.append(block)
+        parts.append(render_morning_pair_block(sh, sym, row, fa_data))
         if i < len(SYMBOLS) - 1:
             parts.append("⸻")
-
     parts.append("Главная мысль дня: до ФРС — аккуратно; после пресс-конференции вернёмся к обычному режиму, если не будет сюрпризов.")
     return "\n".join(parts)
 
-# -------------------- /digest --------------------
-try:
-    from llm_client import generate_digest, llm_ping
-except Exception:
-    async def generate_digest(*args, **kwargs) -> str:
-        return "⚠️ LLM сейчас недоступен (нет llm_client.py)."
-    async def llm_ping() -> bool:
-        return bool(os.getenv("OPENAI_API_KEY"))
+# -------------------- Безопасная отправка в TG --------------------
+async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode=ParseMode.HTML):
+    """Отправка с простым экспоненциальным ретраем (на случай сетевых таймаутов)."""
+    delay = 1.0
+    for attempt in range(4):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            return
+        except Exception as e:
+            if attempt == 3:
+                log.warning("send_message final fail: %s", e)
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+# -------------------- КОМАНДЫ --------------------
+HELP_TEXT = (
+    "Что я умею\n"
+    "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
+    "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
+    "/weights — показать целевые веса.\n"
+    "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
+    "/digest — утренний дайджест (человеческий язык + события + новости).\n"
+    "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
+    "/init_sheet — создать/проверить лист в Google Sheets.\n"
+    "/sheet_test — записать тестовую строку в лист.\n"
+    "/diag — диагностика LLM / Sheets / NEWS.\n"
+)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
+
+async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MASTER_CHAT_ID and update.effective_chat and update.effective_chat.id != MASTER_CHAT_ID:
+        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
+        return
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) < 2:
+            raise ValueError
+        total = float(parts[1])
+    except Exception:
+        await update.message.reply_text("Пример: /settotal 2800")
+        return
+
+    STATE["total"] = total
+    await update.message.reply_text(f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
+
+async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MASTER_CHAT_ID and update.effective_chat and update.effective_chat.id != MASTER_CHAT_ID:
+        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
+        return
+
+    text = update.message.text[len("/setweights"):].strip().lower()
+    new_w = STATE["weights"].copy()
+    try:
+        for token in text.split():
+            if "=" not in token:
+                continue
+            k, v = token.split("=", 1)
+            k = k.strip().upper()
+            v = int(v.strip())
+            if k in ("JPY", "AUD", "EUR", "GBP"):
+                new_w[k] = v
+    except Exception:
+        await update.message.reply_text("Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
+        return
+
+    STATE["weights"] = new_w
+    await update.message.reply_text(f"Целевые веса обновлены: {human_readable_weights(new_w)}")
+
+async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Целевые веса: {human_readable_weights(STATE['weights'])}")
+
+async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = float(STATE["total"])
+    if total <= 0:
+        await update.message.reply_text("Сначала задайте общий банк: /settotal 2800")
+        return
+
+    w = STATE["weights"]
+    alloc = split_total_by_weights(total, w)
+
+    lines = [
+        f"Целевые веса: {human_readable_weights(w)}",
+        "",
+        "Распределение:",
+    ]
+    for sym in SYMBOLS:
+        lines.append(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}")
+    msg = "\n".join(lines)
+    await update.message.reply_text(msg)
+
+    sh, _src = build_sheets_client(SHEET_ID)
+    if sh:
+        try:
+            append_row(
+                sh,
+                SHEET_WS,
+                [
+                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    str(update.effective_chat.id),
+                    "alloc",
+                    f"{total:.2f}",
+                    json.dumps(w, ensure_ascii=False),
+                    json.dumps(alloc, ensure_ascii=False),
+                ],
+            )
+        except Exception as e:
+            log.warning("append_row alloc failed: %s", e)
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = (update.message.text or "").split()
@@ -636,29 +624,25 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pro:
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-            txt = await generate_digest(
-                symbols=SYMBOLS,
-                model=LLM_MINI,
-                token_budget=LLM_TOKEN_BUDGET_PER_DAY,
-            )
-            await safe_send_message(context.bot, update.effective_chat.id, text=txt)
+            txt = await generate_digest(symbols=SYMBOLS, model=LLM_MINI, token_budget=LLM_TOKEN_BUDGET_PER_DAY)
+            await update.message.reply_text(txt)
         except Exception as e:
-            await safe_send_message(context.bot, update.effective_chat.id, text=f"LLM ошибка: {e}")
+            await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
     sh = await get_sheets()
     if not sh:
-        await safe_send_message(context.bot, update.effective_chat.id, text="Sheets недоступен: не могу собрать инвесторский дайджест.")
+        await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
         return
 
     try:
         fa_sheet = _read_fa_signals_from_sheet(sh)
         msg = build_digest_text(sh, fa_sheet)
         for chunk in _split_for_tg_html(msg, 3500):
-            await safe_send_message(context.bot, update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
+            await safe_send_message(context, update.effective_chat.id, chunk, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("Ошибка сборки дайджеста")
-        await safe_send_message(context.bot, update.effective_chat.id, text=f"Ошибка сборки дайджеста: {e}")
+        await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
 
 # -------------------- Диагностика --------------------
 def sheets_diag_text() -> str:
@@ -685,11 +669,8 @@ async def _diag_news_line() -> str:
         sh, _ = build_sheets_client(SHEET_ID)
         if not sh:
             return "NEWS: ❌ Sheets недоступен"
-        try:
-            n = len(sh.worksheet("NEWS").get_all_records())
-        except Exception:
-            n = 0
-        return f"NEWS: {'✅' if n else '⚠️'} {n} строк на листе NEWS; окно {NEWS_TTL_MIN} мин."
+        rows = _read_news_rows(sh)
+        return f"NEWS: ✅ {len(rows)} строк; окно {DIGEST_NEWS_LOOKBACK_MIN} мин."
     except Exception as e:
         return f"NEWS: ❌ ошибка: {e}"
 
@@ -701,30 +682,26 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         llm_line = "LLM: ❌ error"
     sheets_line = sheets_diag_text()
     news_line = await _diag_news_line()
-    await safe_send_message(context.bot, update.effective_chat.id, text=f"{llm_line}\n{sheets_line}\n{news_line}")
+    await update.message.reply_text(f"{llm_line}\n{sheets_line}\n{news_line}")
 
 async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not SHEET_ID:
-        await safe_send_message(context.bot, update.effective_chat.id, text="SHEET_ID не задан.")
+        await update.message.reply_text("SHEET_ID не задан.")
         return
     sh, src = build_sheets_client(SHEET_ID)
     if not sh:
-        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ {src}")
+        await update.message.reply_text(f"Sheets: ❌ {src}")
         return
     try:
         ws, created = ensure_worksheet(sh, SHEET_WS)
-        await safe_send_message(
-            context.bot,
-            update.effective_chat.id,
-            text=f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
-        )
+        await update.message.reply_text(f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})")
     except Exception as e:
-        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ ошибка создания листа: {e}")
+        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
 
 async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sh, src = build_sheets_client(SHEET_ID)
     if not sh:
-        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ {src}")
+        await update.message.reply_text(f"Sheets: ❌ {src}")
         return
     try:
         append_row(
@@ -739,32 +716,28 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "manual /sheet_test",
             ],
         )
-        await safe_send_message(context.bot, update.effective_chat.id, text="Sheets: ✅ записано (test row).")
+        await update.message.reply_text("Sheets: ✅ записано (test row).")
     except Exception as e:
-        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ ошибка записи: {e}")
+        await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
-# -------------------- СТАРТ --------------------
-async def _set_bot_commands(app: Application):
-    cmds = [
-        BotCommand("start", "Запуск бота"),
-        BotCommand("help", "Список команд"),
-        BotCommand("ping", "Проверка связи"),
-        BotCommand("settotal", "Задать общий банк (мастер-чат)"),
-        BotCommand("setweights", "Задать целевые веса (мастер-чат)"),
-        BotCommand("weights", "Показать целевые веса"),
-        BotCommand("alloc", "Рассчитать распределение банка"),
-        BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
-        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
-        BotCommand("sheet_test", "Тестовая запись в лист"),
-        BotCommand("diag", "Диагностика LLM и Sheets"),
-    ]
-    try:
-        await app.bot.set_my_commands(cmds)
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
+# -------------------- Планировщик утреннего дайджеста --------------------
+def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
+    parts, cur = [], []
+    cur_len = 0
+    for para in msg.split("\n\n"):
+        block = (para + "\n\n")
+        if cur_len + len(block) > limit and cur:
+            parts.append("".join(cur).rstrip())
+            cur, cur_len = [], 0
+        cur.append(block)
+        cur_len += len(block)
+    if cur:
+        parts.append("".join(cur).rstrip())
+    return parts
 
 async def morning_digest_scheduler(app: Application):
     from datetime import datetime as _dt, timedelta as _td, time as _time
+    import asyncio as _asyncio
     while True:
         if LOCAL_TZ:
             now = _dt.now(LOCAL_TZ)
@@ -776,45 +749,69 @@ async def morning_digest_scheduler(app: Application):
         if now >= target:
             target += _td(days=1)
         wait_s = (target - now).total_seconds()
-        await asyncio.sleep(max(1.0, wait_s))
+        await _asyncio.sleep(max(1.0, wait_s))
         try:
             sh, _ = build_sheets_client(SHEET_ID)
             if sh:
                 fa_sheet_data = _read_fa_signals_from_sheet(sh)
                 msg = build_digest_text(sh, fa_sheet_data)
                 for chunk in _split_for_tg_html(msg):
-                    await safe_send_message(app.bot, MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
+                    await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
             else:
-                await safe_send_message(app.bot, MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
         except Exception as e:
             try:
-                await safe_send_message(app.bot, MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
             except Exception:
                 pass
 
 async def _post_init(app: Application):
-    await _set_bot_commands(app)
+    # Команды
+    cmds = [
+        BotCommand("start", "Запуск бота"),
+        BotCommand("help", "Список команд"),
+        BotCommand("ping", "Проверка связи"),
+        BotCommand("settotal", "Задать общий банк (мастер-чат)"),
+        BotCommand("setweights", "Задать целевые веса (мастер-чат)"),
+        BotCommand("weights", "Показать целевые веса"),
+        BotCommand("alloc", "Рассчитать распределение банка"),
+        BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
+        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
+        BotCommand("sheet_test", "Тестовая запись в лист"),
+        BotCommand("diag", "Диагностика LLM / Sheets / NEWS"),
+    ]
+    try:
+        await app.bot.set_my_commands(cmds)
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+
+    # Фоновый планировщик
     app.create_task(morning_digest_scheduler(app))
 
+# -------------------- Сборка приложения --------------------
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
+    # Болеe терпеливые таймауты + ретраи для Telegram API
     req = HTTPXRequest(
-        connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "20")),  # было 10 → 20
+        connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "20")),
         read_timeout=float(os.getenv("TG_READ_TIMEOUT", "60")),
         write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "60")),
         pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
         connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
-        http_version="1.1",  # иногда HTTP/2 handshakes ведут себя хуже в PaaS
+        retries=int(os.getenv("TG_HTTP_RETRIES", "3")),
+        http_version="1.1",
+        trust_env=True,
     )
 
     builder = Application.builder().token(BOT_TOKEN).request(req)
     if _RATE_LIMITER_AVAILABLE:
         builder = builder.rate_limiter(AIORateLimiter())
     builder = builder.post_init(_post_init)
-
     app = builder.build()
+
+    # Хендлеры
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -828,6 +825,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
     return app
 
+# -------------------- main --------------------
 def main():
     log.info("Fund bot is running…")
     backoff = 5
@@ -837,9 +835,9 @@ def main():
             app.run_polling(
                 drop_pending_updates=True,
                 poll_interval=float(os.getenv("TG_POLL_INTERVAL", "2")),
-                timeout=int(os.getenv("TG_LONGPOLL_TIMEOUT", "30")),  # getUpdates timeout
+                timeout=int(os.getenv("TG_LONGPOLL_TIMEOUT", "30")),
             )
-            backoff = 5  # если отработал штатно — сброс бэкоффа
+            backoff = 5  # если завершился штатно — сброс бэкоффа
         except Exception as e:
             log.exception("Polling crashed on startup: %s. Retry in %ss", e, backoff)
             time.sleep(backoff)
