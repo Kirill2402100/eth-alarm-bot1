@@ -154,46 +154,105 @@ _BOE_SITEMAPS = [
     "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/sitemap.xml",
 ]
 
-# всё, что явно про MPC/Bank Rate/MPS — считаем high
 def _boe_is_high(url: str, title: str) -> bool:
-    if "monetary-policy-summary-and-minutes" in url:
-        return True
     hay = f"{title} {url}".lower()
-    return bool(KW_RE.search(hay))
+    # всё, что про MPC/Bank Rate/MPS — high
+    return (
+        "monetary-policy-summary-and-minutes" in hay
+        or "bank rate" in hay
+        or "mpc" in hay
+        or bool(KW_RE.search(hay))
+    )
 
 def _slug_to_title(url: str) -> str:
     slug = url.rstrip("/").split("/")[-1]
     t = re.sub(r"[-_]+", " ", slug).strip()
-    # немного гуманизации
     return t[:1].upper() + t[1:] if t else "BoE item"
+
+def _boe_from_sitemaps(now: datetime) -> List[NewsItem]:
+    items: List[NewsItem] = []
+    seen: set[str] = set()
+    for sm in _BOE_SITEMAPS:
+        xml, code, _ = fetch_text(sm)
+        # у них бывает 302→500 — пробуем Jina-прокси вручную
+        if code != 200:
+            try_xml, try_code, _ = fetch_text(os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/" + sm)
+            if try_code == 200 and try_xml:
+                xml, code = try_xml, 200
+        if code != 200 or not xml:
+            continue
+        for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, flags=re.I):
+            u = loc.strip()
+            if "bankofengland.co.uk" not in u:
+                continue
+            # берем только реально контентные страницы
+            if ("/news/" in u or "/monetary-policy-summary-and-minutes/" in u) and re.search(r"/20\d{2}/", u):
+                if u in seen:
+                    continue
+                seen.add(u)
+                title = _slug_to_title(u)
+                imp = "high" if _boe_is_high(u, title) else "medium"
+                items.append(NewsItem(
+                    ts_utc=now, source="BOE_PR", title=title, url=u,
+                    countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
+                ))
+    return items
+
+def _ddg_links(query: str) -> List[str]:
+    # DuckDuckGo HTML выдаёт статические ссылки вида /l/?uddg=<url>
+    import urllib.parse as _up
+    url = "https://duckduckgo.com/html/?q=" + _up.quote_plus(query)
+    html, code, _ = fetch_text(url)
+    out: List[str] = []
+    if not code or not html:
+        return out
+    for m in re.finditer(r'href="(?:/l/)?\?uddg=([^"&]+)"', html):
+        target = _up.unquote(m.group(1))
+        if "bankofengland.co.uk" in target:
+            out.append(target)
+    for m in re.finditer(r'href="(https://www\.bankofengland\.co\.uk/[^"]+)"', html):
+        out.append(m.group(1))
+    # лёгкий дедуп
+    uniq: List[str] = []
+    seen = set()
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+def _boe_from_search(now: datetime) -> List[NewsItem]:
+    items: List[NewsItem] = []
+    queries = [
+        'site:bankofengland.co.uk "Monetary Policy Summary" 2025',
+        'site:bankofengland.co.uk "Monetary Policy Committee" 2025',
+        'site:bankofengland.co.uk "Bank Rate" "Monetary Policy" 2025',
+        'site:bankofengland.co.uk/monetary-policy-summary-and-minutes 2025',
+    ]
+    seen: set[str] = set()
+    for q in queries:
+        for u in _ddg_links(q):
+            if u in seen:
+                continue
+            seen.add(u)
+            title = _slug_to_title(u)
+            imp = "high" if _boe_is_high(u, title) else "medium"
+            items.append(NewsItem(
+                ts_utc=now, source="BOE_PR", title=title, url=u,
+                countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
+            ))
+    return items
 
 def collect_boe() -> List[NewsItem]:
     now = datetime.now(timezone.utc)
-    items: List[NewsItem] = []
-    seen: set[str] = set()
-
-    for sm in _BOE_SITEMAPS:
-        xml, code, _ = fetch_text(sm)
-        if not code or not xml:
-            continue
-        # простенький XML-парсер по <loc> (без зависимостей)
-        for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, flags=re.I):
-            url = loc.strip()
-            if "bankofengland.co.uk" not in url:
-                continue
-            # интересуют новости и MPS-страницы с годом в пути
-            if ("/news/" in url or "/monetary-policy-summary-and-minutes/" in url) and re.search(r"/20\d{2}/", url):
-                if url in seen:
-                    continue
-                seen.add(url)
-                title = _slug_to_title(url)
-                imp = "high" if _boe_is_high(url, title) else "medium"
-                items.append(NewsItem(
-                    ts_utc=now, source="BOE_PR", title=title, url=url,
-                    countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
-                ))
-
-    log.info("news_augment: BOE via sitemap collected: %d", len(items))
+    # 1) пробуем sitemap
+    items = _boe_from_sitemaps(now)
+    if items:
+        log.info("news_augment: BOE via sitemap collected: %d", len(items))
+        return items
+    # 2) fallback: DuckDuckGo
+    items = _boe_from_search(now)
+    log.info("news_augment: BOE via search collected: %d", len(items))
     return items
     
 # ====== JPY: Bank of Japan + MoF ======
