@@ -137,7 +137,7 @@ PAIR_COUNTRIES = {
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
 _FF_CACHE = {"at": 0, "data": []}
-_FF_NEG   = {"until": 0}
+_FF_NEG    = {"until": 0}
 
 STATE = {
     "total": 0.0,
@@ -235,6 +235,21 @@ DIGEST_NEWS_KEYWORDS = re.compile(
     re.I
 )
 
+# --- ВСТАВИТЬ РЯДОМ С ДРУГИМИ УТИЛИТАМИ ДАТЫ ---
+def _norm_iso_to_utc_dt(s: str):
+    import re
+    s = str(s or "").strip()
+    if not s:
+        return None
+    # нормализация форматов: "YYYY-MM-DD HH:MM:SS+0000" → "YYYY-MM-DDTHH:MM:SS+00:00"
+    s = s.replace(" ", "T").replace("Z", "+00:00")
+    s = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', s)
+    try:
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+# --- ЗАМЕНИ read_news_rows целиком ---
 def read_news_rows(sh) -> List[dict]:
     try:
         ws = sh.worksheet(NEWS_WS)
@@ -243,9 +258,8 @@ def read_news_rows(sh) -> List[dict]:
         return []
     out = []
     for r in rows:
-        try:
-            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z","+00:00")).astimezone(timezone.utc)
-        except Exception:
+        ts = _norm_iso_to_utc_dt(r.get("ts_utc"))
+        if not ts:
             continue
         ctries = [c.strip().lower() for c in str(r.get("countries","")).split(",") if c.strip()]
         out.append({
@@ -560,22 +574,22 @@ def fetch_calendar_events_ff_all() -> List[dict]:
         log.warning("calendar fetch (FF) failed: %s", e)
         return _FF_CACHE["data"] or []
 
+# --- ЗАМЕНИ read_calendar_rows_sheet целиком ---
 def read_calendar_rows_sheet(sh) -> List[dict]:
     try:
         ws = sh.worksheet(CAL_WS)
-        vals = ws.get_all_records()
+        rows = ws.get_all_records()
     except Exception:
         return []
     out = []
-    for r in vals:
-        try:
-            utc = datetime.fromisoformat(str(r.get("utc_iso")).replace("Z","+00:00")).astimezone(timezone.utc)
-        except Exception:
+    for r in rows:
+        utc = _norm_iso_to_utc_dt(r.get("utc_iso"))
+        if not utc:
             continue
         out.append({
             "utc": utc,
             "country": str(r.get("country","")).strip().lower(),
-            "title": str(r.get("title","")).strip(),
+            "title":   str(r.get("title","")).strip(),
             "importance": str(r.get("impact","")).strip(),
         })
     return out
