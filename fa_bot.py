@@ -806,7 +806,6 @@ def build_application() -> Application:
         write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "60")),
         pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
         connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
-        retries=int(os.getenv("TG_HTTP_RETRIES", "3")),  # ключевое: ретраи на коннекте
         http_version="1.1",  # иногда HTTP/2 handshakes ведут себя хуже в PaaS
         trust_env=True,      # если Railway задаёт прокси/сетевые переменные — использовать
     )
