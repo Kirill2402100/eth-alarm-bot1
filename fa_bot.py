@@ -8,8 +8,6 @@ from html import escape as _html_escape
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
 
-import asyncio
-
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -18,7 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# --- Таймзона Белграда ---
+# ============== Timezone & schedule ==============
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:  # pragma: no cover
@@ -28,7 +26,7 @@ LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else N
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
 
-# --- Лимитер Telegram (может быть не установлен) ---
+# ============== Optional rate limiter ==============
 try:
     from telegram.ext import AIORateLimiter
     _RATE_LIMITER_AVAILABLE = True
@@ -36,7 +34,7 @@ except Exception:  # pragma: no cover
     AIORateLimiter = None
     _RATE_LIMITER_AVAILABLE = False
 
-# --- Google Sheets ---
+# ============== Google Sheets ==============
 try:
     import gspread
     from google.oauth2 import service_account
@@ -46,7 +44,7 @@ except Exception:
     service_account = None
     _GSHEETS_AVAILABLE = False
 
-# --- HTTP для календаря ---
+# ============== HTTP for calendars ==============
 try:
     import requests
     _REQUESTS_AVAILABLE = True
@@ -54,7 +52,7 @@ except Exception:
     requests = None
     _REQUESTS_AVAILABLE = False
 
-# --- LLM-клиент ---
+# ============== LLM client (optional) ==============
 try:
     from llm_client import generate_digest, llm_ping
 except Exception:
@@ -64,14 +62,14 @@ except Exception:
     async def llm_ping() -> bool:
         return bool(os.getenv("OPENAI_API_KEY"))
 
-# -------------------- ЛОГИ --------------------
+# ============== Logging ==============
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("fund_bot")
 
-# -------------------- ENV --------------------
+# ============== ENV ==============
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("TELEGRAM_TOKEN", "").strip()
 MASTER_CHAT_ID = int(os.getenv("MASTER_CHAT_ID", "0") or "0")
 
@@ -94,7 +92,7 @@ LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
-# --- Названия листов с логами по парам (переопределяются через ENV) ---
+# Sheet names for pairs (overridable via ENV)
 BMR_SHEETS = {
     "USDJPY": os.getenv("BMR_SHEET_USDJPY", "BMR_DCA_USDJPY"),
     "AUDUSD": os.getenv("BMR_SHEET_AUDUSD", "BMR_DCA_AUDUSD"),
@@ -102,14 +100,14 @@ BMR_SHEETS = {
     "GBPUSD": os.getenv("BMR_SHEET_GBPUSD", "BMR_DCA_GBPUSD"),
 }
 
-# --- Календарь ---
+# ============== Calendar config ==============
 TE_BASE = os.getenv("TE_BASE", "https://api.tradingeconomics.com").rstrip("/")
 TE_CLIENT = os.getenv("TE_CLIENT", "guest").strip()
 TE_KEY = os.getenv("TE_KEY", "guest").strip()
 CAL_WINDOW_MIN = int(os.getenv("CAL_WINDOW_MIN", "120"))
 QUIET_BEFORE_MIN = int(os.getenv("QUIET_BEFORE_MIN", "45"))
 QUIET_AFTER_MIN  = int(os.getenv("QUIET_AFTER_MIN",  "45"))
-CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()
+CAL_PROVIDER = os.getenv("CAL_PROVIDER", "auto").lower()  # te|fmp|ff|auto
 FMP_API_KEY  = os.getenv("FMP_API_KEY", "").strip()
 CAL_TTL_SEC = int(os.getenv("CAL_TTL_SEC", "600") or "600")
 CAL_WS = os.getenv("CAL_WS", "CALENDAR").strip() or "CALENDAR"
@@ -135,7 +133,7 @@ PAIR_COUNTRIES = {
     "GBPUSD": [COUNTRY_BY_CCY["GBP"], COUNTRY_BY_CCY["USD"]],
 }
 
-# -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
+# ============== Global state ==============
 _FF_CACHE = {"at": 0, "data": []}
 _FF_NEG   = {"until": 0}
 
@@ -144,7 +142,7 @@ STATE = {
     "weights": DEFAULT_WEIGHTS.copy(),
 }
 
-# -------------------- GOOGLE CREDS LOADER --------------------
+# ============== Google creds loader ==============
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
@@ -205,7 +203,7 @@ def build_sheets_client(sheet_id: str):
         return None, f"auth/open error: {e}"
 
 
-# ---------- Sheets helpers ----------
+# ============== Sheets helpers ==============
 SHEET_HEADERS = ["ts", "chat_id", "action", "total", "weights_json", "note"]
 
 
@@ -246,7 +244,7 @@ def read_calendar_rows_sheet(sh) -> List[dict]:
         })
     return out
 
-# ---------- News (READ FROM SHEET) ----------
+# ============== News (from sheet) ==============
 NEWS_WS = os.getenv("NEWS_WS", "NEWS").strip() or "NEWS"
 DIGEST_NEWS_LOOKBACK_MIN = int(os.getenv("DIGEST_NEWS_LOOKBACK_MIN", "720") or "720")
 DIGEST_NEWS_ALLOWED_SOURCES = {
@@ -331,7 +329,7 @@ def choose_top_news_for_symbol(symbol: str, news_rows: List[dict], now_utc: date
     best["ru_title"] = _ru_title_hint(best["title"])
     return best
 
-# -------------------- УТИЛИТЫ --------------------
+# ============== Utils ==============
 def _h(x) -> str:
     return _html_escape(str(x), quote=True)
 
@@ -384,7 +382,7 @@ def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
     return parts
 
 
-# -------------------- КОМАНДЫ --------------------
+# ============== Commands ==============
 HELP_TEXT = (
     "Что я умею\n"
     "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
@@ -601,7 +599,7 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
 
-# ---------- Digest helpers (инвесторский режим) ----------
+# ============== Digest helpers (investor mode) ==============
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
 
@@ -756,12 +754,12 @@ def delta_marker(target: float, fact: float) -> str:
 
 
 def fetch_calendar_events_te(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    # ... (implementation remains the same)
+    # Placeholder for TradingEconomics integration
     return []
 
 
 def fetch_calendar_events_fmp(countries: List[str], d1: datetime, d2: datetime) -> List[dict]:
-    # ... (implementation remains the same)
+    # Placeholder for FMP integration
     return []
 
 
@@ -846,9 +844,9 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
         d1_ext, d2_ext = now - timedelta(hours=36), now + timedelta(hours=36)
 
     out: Dict[str, dict] = {}
-    
+
     all_raw_events = fetch_calendar_events_ff_all() if CAL_PROVIDER in ('ff', 'auto') else None
-    
+
     if (all_raw_events is not None) and not all_raw_events:
         sh, _ = build_sheets_client(SHEET_ID)
         if sh:
@@ -856,13 +854,13 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
 
     for sym in symbols:
         countries = PAIR_COUNTRIES.get(sym, [])
-        
+
         if all_raw_events is not None:
             want = {c.lower() for c in countries}
             sym_raw_all = [ev for ev in all_raw_events if ev["country"].lower() in want]
         else:
             sym_raw_all = fetch_calendar_events(countries, d1_ext, d2_ext)
-            
+
         around = [
             {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
             for ev in sym_raw_all
@@ -896,13 +894,13 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
             "nearest_prev": nearest_prev,
             "nearest_next": nearest_next,
         }
-        
+
     log.info("calendar: provider=%s, window=±%s min, utc=%s..%s",
              CAL_PROVIDER, w, d1.isoformat(timespec="minutes"), d2.isoformat(timespec="minutes"))
     for sym, pack in out.items():
         log.info("calendar[%s]: events=%d, red_soon=%s, quiet_now=%s",
                  sym, len(pack.get("events") or []), pack.get("red_event_soon"), pack.get("quiet_now"))
-                 
+
     return out
 
 
@@ -944,7 +942,7 @@ def build_investor_digest(sh) -> str:
                 ev_line += f"\n• <b>Последний High:</b> {prev_ev['local']:%H:%M} — {_h(prev_ev['country'])}: {_h(prev_ev['title'])} ({_fmt_tdelta_human(prev_ev['utc'])})."
             if next_ev := c.get("nearest_next"):
                 ev_line += f"\n• <b>Ближайший High:</b> {next_ev['local']:%H:%M} — {_h(next_ev['country'])}: {_h(next_ev['title'])} ({_fmt_tdelta_human(next_ev['utc'])})."
-        
+
         best_news = choose_top_news_for_symbol(sym, news_rows, now_utc)
         news_line = ""
         if best_news:
@@ -977,7 +975,7 @@ f"""<b>{sym[:3]}/{sym[3:]} — {policy['icon']} {policy['label']}, bias: {fa_bia
     return "\n\n".join(blocks + ["\n".join(summary_lines)] if summary_lines else blocks)
 
 
-# -------------------- СТАРТ --------------------
+# ============== Startup ==============
 async def _set_bot_commands(app: Application):
     cmds = [
         BotCommand("start", "Запуск бота"),
@@ -1032,6 +1030,7 @@ async def _post_init(app: Application):
     await _set_bot_commands(app)
     app.create_task(morning_digest_scheduler(app))
 
+
 def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
     builder = Application.builder().token(BOT_TOKEN)
@@ -1056,6 +1055,7 @@ def main():
     log.info("Fund bot is running…")
     app = build_application()
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
