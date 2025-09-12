@@ -1,4 +1,3 @@
-# calendar_collector.py
 from __future__ import annotations
 
 import os, re, json, base64, time, logging
@@ -38,7 +37,8 @@ log = logging.getLogger("calendar_collector")
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 
 CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
-CAL_WS_RAW = os.getenv("CAL_WS_RAW", "CALENDAR_RAW").strip() or "CALENDAR_RAW"  # не обязателен; можно не использовать
+CAL_WS_RAW = os.getenv("CAL_WS_RAW", "CALENDAR_RAW").strip() or "CALENDAR_RAW"  # опционально
+NEWS_WS    = os.getenv("NEWS_WS", "NEWS").strip() or "NEWS"  # <<< НОВОЕ: имя листа новостей
 
 RUN_FOREVER = (os.getenv("RUN_FOREVER", "1").lower() in ("1","true","yes","on"))
 COLLECT_EVERY_MIN = int(os.getenv("COLLECT_EVERY_MIN", "20") or "20")
@@ -146,7 +146,6 @@ def fetch_text(url: str, timeout=15.0) -> tuple[str, int, str]:
         with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent":"Mozilla/5.0 (compatible; LPBot/1.0)"}) as cli:
             r = cli.get(url)
             if r.status_code in (403,404):
-                # proxy
                 pr = cli.get(JINA_PROXY + url.replace("://", "://"))
                 return pr.text, pr.status_code, pr.url.__str__()
             return r.text, r.status_code, r.url.__str__()
@@ -157,12 +156,12 @@ def fetch_text(url: str, timeout=15.0) -> tuple[str, int, str]:
 # ---------------- Models ----------------
 @dataclass
 class CalEvent:
-    utc: datetime             # UTC datetime
-    country: str              # 'united states'
-    currency: str             # 'USD' (может быть пусто)
-    title: str                # 'FOMC Meeting / Rate Decision'
-    impact: str               # 'high'
-    source: str               # 'FOMC'
+    utc: datetime
+    country: str
+    currency: str
+    title: str
+    impact: str
+    source: str
     url: str
 
     def to_row(self) -> List[str]:
@@ -178,14 +177,7 @@ CAL_HEADERS = ["utc_iso","local_time","country","currency","title","impact","sou
 NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
 
 # ---------------- Calendar scrapers ----------------
-_MONTHS = {m.lower(): i for i, m in enumerate(
-    ["January","February","March","April","May","June","July","August","September","October","November","December"], start=1)}
-
 def _parse_month_day_year(s: str) -> Optional[datetime]:
-    """
-    Парсит строки вида 'September 11, 2025' | 'Sep 11, 2025' | 'Sept 11, 2025'
-    """
-    s = s.strip()
     m = re.search(r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:–\d{1,2})?,\s*(20\d{2})", s, re.I)
     if not m:
         return None
@@ -195,13 +187,9 @@ def _parse_month_day_year(s: str) -> Optional[datetime]:
         return None
     day = int(m.group(2))
     year = int(m.group(3))
-    # время для решения: 18:00Z / 14:00Z очень плавает; ставим 14:00Z как безопасную «середину»
     return datetime(year, month, day, 14, 0, 0, tzinfo=timezone.utc)
 
 def parse_fomc_calendar(text: str, url: str) -> List[CalEvent]:
-    """
-    Простая эвристика: собираем все 'Month DD, YYYY' возле слов 'Meeting'/'FOMC'
-    """
     out: List[CalEvent] = []
     for m in re.finditer(r"(?:FOMC|Meeting)[^<>\n]{0,80}?(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:–\d{1,2})?,\s*20\d{2}", text, re.I):
         dt = _parse_month_day_year(m.group(0))
@@ -210,25 +198,20 @@ def parse_fomc_calendar(text: str, url: str) -> List[CalEvent]:
                 utc=dt, country="united states", currency="USD",
                 title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
             ))
-    # Дедуп по дате
     uniq = {}
     for ev in out:
         uniq[ev.utc.date()] = ev
     return list(uniq.values())
 
 def parse_boj_calendar(text: str, url: str) -> List[CalEvent]:
-    """
-    BoJ: ищем шаблоны yyyy.mm.dd вокруг 'Monetary Policy Meeting'.
-    """
     out: List[CalEvent] = []
     for m in re.finditer(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2}).{0,64}?Monetary Policy Meeting", text, re.I):
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        dt = datetime(y, mo, d, 3, 0, 0, tzinfo=timezone.utc)  # утро по Токио ≈ 03:00Z
+        dt = datetime(y, mo, d, 3, 0, 0, tzinfo=timezone.utc)
         out.append(CalEvent(
             utc=dt, country="japan", currency="JPY",
             title="BoJ Monetary Policy Meeting", impact="high", source="BoJ", url=url
         ))
-    # иногда страница без «Meeting» — соберём явные yyyy.mm.dd в таблицах, но ограничим кол-во
     if not out:
         for m in re.finditer(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", text):
             try:
@@ -240,7 +223,6 @@ def parse_boj_calendar(text: str, url: str) -> List[CalEvent]:
                 ))
             except Exception:
                 pass
-    # дедуп
     uniq = {}
     for ev in out:
         uniq[ev.utc.date()] = ev
@@ -249,7 +231,6 @@ def parse_boj_calendar(text: str, url: str) -> List[CalEvent]:
 def collect_calendar() -> List[CalEvent]:
     events: List[CalEvent] = []
 
-    # FOMC
     url_fomc = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
     txt, code, f_url = fetch_text(url_fomc)
     if code:
@@ -257,7 +238,6 @@ def collect_calendar() -> List[CalEvent]:
         log.info("FOMC parsed: %d", len(ev))
         events += ev
 
-    # BoJ
     url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
     txt, code, f_url = fetch_text(url_boj)
     if code:
@@ -265,12 +245,10 @@ def collect_calendar() -> List[CalEvent]:
         log.info("BoJ parsed: %d", len(ev))
         events += ev
 
-    # ECB / BoE заглушки (не падаем)
     try:
         url_ecb = "https://www.ecb.europa.eu/press/calendars/mgc/html/index.en.html"
         txt, code, f_url = fetch_text(url_ecb)
         if code and "Governing Council" in txt:
-            # можно доработать при необходимости
             log.info("ECB parsed: heuristic=0")
     except Exception:
         pass
@@ -314,7 +292,6 @@ class NewsItem:
         ]
 
 def _parse_time_attr(html: str) -> Optional[datetime]:
-    # простая попытка вытащить datetime из <time datetime="...">
     m = re.search(r'<time[^>]+datetime="([^"]+)"', html, re.I)
     if not m:
         return None
@@ -330,7 +307,6 @@ def collect_news() -> List[NewsItem]:
     # --- FED PR
     txt, code, url = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
     if code:
-        # Берём первые 10 ссылок из списка
         for m in re.finditer(r'<a[^>]+href="(/newsevents/pressreleases/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://www.federalreserve.gov" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
@@ -373,12 +349,10 @@ def collect_news() -> List[NewsItem]:
             ts = now
             items.append(NewsItem(ts,"RBA_MR",t,u,"australia","AUD","rba","high" if KW_RE.search(t) else "medium"))
 
-    # --- JP MoF FX intervention page (общая страница, без дат — просто флаг)
+    # --- JP MoF FX intervention page
     txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.html")
-    if code:
-        # Если на странице появились слова 'intervention'/ 'announcement' — добавим один пункт
-        if re.search(r"intervention|announcement", txt, re.I):
-            items.append(NewsItem(now,"JP_MOF_FX","FX intervention reference page",url,"japan","JPY","mof","high"))
+    if code and re.search(r"intervention|announcement", txt, re.I):
+        items.append(NewsItem(now,"JP_MOF_FX","FX intervention reference page",url,"japan","JPY","mof","high"))
 
     log.info("NEWS collected: %d items", len(items))
     return items
@@ -392,7 +366,7 @@ def _news_is_high(row: dict) -> bool:
 
 def _read_news_rows(sh) -> List[dict]:
     try:
-        ws = sh.worksheet("NEWS")
+        ws = sh.worksheet(NEWS_WS)  # <<< НОВОЕ: используем NEWS_WS
     except Exception:
         return []
     rows = ws.get_all_records()
@@ -416,8 +390,6 @@ def _read_news_rows(sh) -> List[dict]:
 def compute_fa_from_news(all_news: List[dict], now_utc: datetime) -> Dict[str, dict]:
     window_start = now_utc - timedelta(minutes=FA_NEWS_RECENT_MIN)
     recent = [r for r in all_news if r["ts_utc"] >= window_start and _news_is_high(r)]
-
-    # агрегируем по странам
     cty_hits: dict[str, int] = {}
     for r in recent:
         for c in [x.strip() for x in (r["countries"] or "").split(",") if x.strip()]:
@@ -493,8 +465,8 @@ def write_investor_digest(sh, fa_signals: Dict[str, dict]):
 # ---------------- Main collection pass ----------------
 def collect_once():
     log.info(
-        "collector… sheet=%s ws=%s tz=%s window=[-%dd, +%dd]",
-        SHEET_ID, CAL_WS_OUT, (LOCAL_TZ.key if LOCAL_TZ else "UTC"),
+        "collector… sheet=%s ws=%s news=%s tz=%s window=[-%dd, +%dd]",
+        SHEET_ID, CAL_WS_OUT, NEWS_WS, (LOCAL_TZ.key if LOCAL_TZ else "UTC"),
         FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS
     )
     sh, _ = build_sheets_client(SHEET_ID)
@@ -505,7 +477,6 @@ def collect_once():
     # --- CALENDAR
     cal_events = _calendar_window_filter(collect_calendar())
     ws_cal, _ = ensure_worksheet(sh, CAL_WS_OUT, CAL_HEADERS)
-    # дедуп по utc_iso+title
     try:
         existing = ws_cal.get_all_records()
         seen = { (r["utc_iso"], r.get("title","")) for r in existing }
@@ -523,8 +494,8 @@ def collect_once():
 
     # --- NEWS
     news = collect_news()
-    ws_news, _ = ensure_worksheet(sh, "NEWS", NEWS_HEADERS)
-    existing_hash = _read_existing_hashes(ws_news, "I")  # кол. I = hash
+    ws_news, _ = ensure_worksheet(sh, NEWS_WS, NEWS_HEADERS)  # <<< НОВОЕ
+    existing_hash = _read_existing_hashes(ws_news, "I")       # I = hash
     news_rows = []
     for n in news:
         if n.key_hash() not in existing_hash:
@@ -539,9 +510,7 @@ def collect_once():
     fa = compute_fa_from_news(all_news, now)
     write_fa_signals(sh, fa)
 
-    # (опционально) короткий агрегат в INVESTOR_DIGEST — оставлю, чтобы было видно, что живёт
     write_investor_digest(sh, fa)
-
     log.info("cycle done.")
 
 # ---------------- Entrypoint ----------------
