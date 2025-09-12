@@ -1,175 +1,59 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-news_augment.py — добавляет «недостающие» источники в лист NEWS (GBP/JPY),
-не меняя существующий рабочий collector.
 
-Источники:
-- Bank of England (BoE): /news/* списки + site search (строгая фильтрация по ключевым словам)
-- Bank of Japan (BoJ): Monetary Policy Releases + Schedules/Minutes/Summary of Opinions
-- Japan MoF FX: reference page для интервенций (устойчивый перебор путей + fallback)
+"""
+news_augment.py — собирает ссылки с первичных источников
+(BoE, BoJ, JP MoF FX) и докладывает недостающее в CSV лист NEWS.
+
+Главные фишки:
+- STRICT_BOE (ENV): 1 — строгий фильтр (только MPC/Bank Rate/Minutes/Decision/Summary),
+                    0 — широкий охват (в т.ч. Monetary Policy Report и др.)
+- JP MoF FX: фикс распознавания ссылок с дефисами И подчёркиваниями.
+- Дедуп по hash = "{source}|{url}".
+- Пишет/дополняет CSV с колонками:
+  ts_utc, source, title, url, countries, ccy, tags, importance_guess, hash
 
 ENV:
-  SHEET_ID=...                        (обязателен)
-  GOOGLE_CREDENTIALS_JSON_B64=...     (или GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS)
-  NEWS_WS=NEWS                        (имя листа)
-  LOG_LEVEL=INFO
-  JINA_PROXY=https://r.jina.ai/http/   (для обхода 403/404)
-  STRICT_BOE=1                        (строгая фильтрация BoE: 1 — строго, 0 — шире)
+  STRICT_BOE=1|0
+  NEWS_CSV=./news.csv
 """
 
-import os, re, json, base64, logging, html as _html
+from __future__ import annotations
+
+import csv
+import os
+import re
+import sys
+import time
+import logging
+import urllib.parse
 from dataclasses import dataclass
-from typing import List, Tuple, Iterable, Optional, Dict
-from urllib.parse import urljoin, urlparse
 from datetime import datetime, timezone
+from typing import Iterable, Iterator, List, Optional, Tuple
 
 import httpx
 
-try:
-    import gspread
-    from google.oauth2 import service_account
-    _GSHEETS_AVAILABLE = True
-except Exception:
-    gspread = None
-    service_account = None
-    _GSHEETS_AVAILABLE = False
+# ---------- logging ----------
+LOG = logging.getLogger("news_augment")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+# Включим и httpx логи, чтобы были строки как в примерах
+logging.getLogger("httpx").setLevel(logging.INFO)
 
-# --------- ENV / CONST ----------
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
-NEWS_WS  = os.getenv("NEWS_WS", "NEWS").strip() or "NEWS"
+# ---------- config ----------
+STRICT_BOE = os.getenv("STRICT_BOE", "1").strip() == "1"
+NEWS_CSV = os.getenv("NEWS_CSV", "news.csv")
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("news_augment")
-
-JINA_PROXY = os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/"
-STRICT_BOE = os.getenv("STRICT_BOE", "1").lower() in ("1", "true", "yes", "on")
-
-# Те же ключевые слова, что у основного collector, но добавим пару боевских терминов.
-KW_RE = re.compile(
-    r"(rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
-    r"press conference|policy statement|policy statements|minutes|mpc|fomc|"
-    r"monetary policy summary|interest rate|statement|decision)",
-    re.I
+HTTP_TIMEOUT = 20.0
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-NEWS_HEADERS = ["ts_utc", "source", "title", "url", "countries", "ccy", "tags", "importance_guess", "hash"]
+# ---------- utils ----------
 
-
-# --------- Google Sheets helpers ----------
-def _decode_b64_to_json(s: str) -> Optional[dict]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    s += "=" * ((4 - len(s) % 4) % 4)
-    try:
-        return json.loads(base64.b64decode(s).decode("utf-8", "strict"))
-    except Exception:
-        return None
-
-
-def _load_service_info() -> Optional[dict]:
-    info = _decode_b64_to_json(os.getenv("GOOGLE_CREDENTIALS_JSON_B64", ""))
-    if info:
-        return info
-    for k in ("GOOGLE_CREDENTIALS_JSON", "GOOGLE_CREDENTIALS"):
-        raw = os.getenv(k, "").strip()
-        if raw:
-            try:
-                return json.loads(raw)
-            except Exception:
-                pass
-    return None
-
-
-def build_sheets_client(sheet_id: str):
-    if not _GSHEETS_AVAILABLE:
-        return None, "gsheets libs not installed"
-    if not sheet_id:
-        return None, "SHEET_ID empty"
-    info = _load_service_info()
-    if not info:
-        return None, "no service account json"
-    try:
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        gc = gspread.authorize(creds)
-        return gc.open_by_key(sheet_id), "ok"
-    except Exception as e:
-        return None, f"auth/open error: {e}"
-
-
-def ensure_worksheet(sh, title: str, headers: List[str]):
-    for ws in sh.worksheets():
-        if ws.title == title:
-            try:
-                cur = ws.get_values("A1:Z1") or [[]]
-                if not cur or cur[0] != headers:
-                    ws.update(range_name="A1", values=[headers])
-            except Exception:
-                pass
-            return ws, False
-    ws = sh.add_worksheet(title=title, rows=200, cols=max(10, len(headers)))
-    ws.update(range_name="A1", values=[headers])
-    return ws, True
-
-
-def _read_existing_hashes(ws, hash_col_letter: str) -> set:
-    try:
-        rng = f"{hash_col_letter}2:{hash_col_letter}100000"
-        col = ws.get_values(rng)
-        return {r[0] for r in col if r and r[0]}
-    except Exception:
-        return set()
-
-
-# --------- HTTP / HTML helpers ----------
-def fetch_text(url: str, timeout=15.0) -> Tuple[str, int, str]:
-    """GET c fallback через Jina proxy на 403/404."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (LPBot/news_augment)"}
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as cli:
-            r = cli.get(url)
-            if r.status_code in (403, 404):
-                pr = cli.get(JINA_PROXY + url)
-                return pr.text, pr.status_code, str(pr.url)
-            return r.text, r.status_code, str(r.url)
-    except Exception as e:
-        log.warning("fetch failed %s: %s", url, e)
-        return "", 0, url
-
-
-def _html_to_text(s: str) -> str:
-    if not s:
-        return ""
-    s = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", s, flags=re.I)
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = _html.unescape(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _iter_links(html: str, base_url: str, domain_must: Optional[str] = None) -> List[Tuple[str, str]]:
-    """Возвращает [(url, title_text)], с абсолютными URL. Простая regex-выборка."""
-    out: List[Tuple[str, str]] = []
-    for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, re.I | re.S):
-        href = m.group(1)
-        text = re.sub(r"<[^>]+>", " ", m.group(2) or "")
-        text = _html.unescape(re.sub(r"\s+", " ", text)).strip()
-        url = urljoin(base_url, href)
-        if domain_must:
-            try:
-                if urlparse(url).netloc and domain_must not in urlparse(url).netloc:
-                    continue
-            except Exception:
-                continue
-        out.append((url, text))
-    return out
-
-
-# --------- Models ----------
 @dataclass
 class NewsItem:
     ts_utc: datetime
@@ -181,79 +65,161 @@ class NewsItem:
     tags: str
     importance_guess: str
 
-    def key_hash(self) -> str:
-        base = f"{self.source}|{self.url}"
-        return re.sub(r"\s+", " ", base.strip())[:180]
+    @property
+    def hash(self) -> str:
+        return f"{self.source}|{self.url}"
 
     def to_row(self) -> List[str]:
-        clean_title = re.sub(r"<[^>]+>", "", self.title or "").strip()
         return [
             self.ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             self.source,
-            clean_title,
+            self.title,
             self.url,
             self.countries,
             self.ccy,
             self.tags,
             self.importance_guess,
-            self.key_hash(),
+            self.hash,
         ]
 
 
-# --------- Collectors ----------
-def _boe_is_relevant(title: str, url: str) -> bool:
-    hay = f"{title} {url}"
+def _http_client() -> httpx.Client:
+    return httpx.Client(
+        headers={"User-Agent": UA, "Accept-Language": "en, *;q=0.1"},
+        follow_redirects=True,
+        timeout=HTTP_TIMEOUT,
+        verify=True,
+    )
+
+
+def _log_http(url: str, status: int, phrase: str = "") -> None:
+    logging.getLogger("httpx").info(
+        'HTTP Request: GET %s "HTTP/1.1 %s %s"',
+        url, status, phrase or "OK"
+    )
+
+
+def fetch_text(url: str) -> Tuple[str, int, str]:
+    """GET текст + простой fallback через r.jina.ai/http/…"""
+    try:
+        with _http_client() as cl:
+            r = cl.get(url)
+            _log_http(url, r.status_code, r.reason_phrase or "")
+            if r.status_code == 200 and r.text:
+                return r.text, r.status_code, str(r.url)
+    except Exception as e:
+        LOG.info("fetch_text: primary GET failed: %s", e)
+
+    # fallback через r.jina.ai
+    try:
+        wrap = f"https://r.jina.ai/http/{url}"
+        with _http_client() as cl:
+            r = cl.get(wrap)
+            _log_http(wrap, r.status_code, r.reason_phrase or "")
+            if r.status_code == 200 and r.text:
+                return r.text, r.status_code, url
+            return (r.text or ""), r.status_code, url
+    except Exception as e:
+        LOG.info("fetch_text: fallback GET failed: %s", e)
+        return "", 0, url
+
+
+def _abs_url(base: str, href: str) -> str:
+    try:
+        return urllib.parse.urljoin(base, href)
+    except Exception:
+        return href
+
+
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", " ", s or "")
+
+
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _iter_links(html: str, base_url: str, domain_must: Optional[str] = None) -> Iterator[Tuple[str, str]]:
+    """Грубый парс ссылок из HTML: (abs_url, anchor_text)."""
+    if not html:
+        return
+    for m in re.finditer(r"<a\s+[^>]*href\s*=\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>", html, re.I | re.S):
+        href = m.group(1)
+        txt = _norm_space(_strip_tags(m.group(2)))
+        if not href:
+            continue
+        full = _abs_url(base_url, href)
+        if domain_must and urllib.parse.urlparse(full).netloc.find(domain_must) == -1:
+            continue
+        yield full, txt
+
+
+# ---------- collectors ----------
+
+def _boe_keep(url: str, title: str) -> bool:
+    u = url.lower()
+    t = title.lower()
+    # Чистим явный мусор (pdf, если не policy-материал и т.п. не выкидываем агрессивно)
+    if not (u.startswith("https://www.bankofengland.co.uk/") or u.startswith("http://www.bankofengland.co.uk/")):
+        return False
+
+    # Строгий набор
+    strict_pat = re.compile(
+        r"(monetary\s+policy\s+(summary|statement|committee|minutes|decision)|"
+        r"\bbank\s+rate\b|"
+        r"\bmpc\b|"
+        r"interest\s+rate\s+decision|"
+        r"\bminutes\b)", re.I
+    )
+    # Широкий набор
+    broad_pat = re.compile(
+        r"(monetary\s+policy|bank\s+rate|mpc|"
+        r"monetary\s+policy\s+report\b|mpr\b|"
+        r"press\s+conference|governing\s+council|"
+        r"policy\s+statement|policy\s+summary)", re.I
+    )
+
     if STRICT_BOE:
-        # Строго: нужны явные намёки на MPC / Bank Rate / Monetary Policy / Minutes / Summary / Decision
-        strict = re.compile(
-            r"(monetary policy summary|monetary policy committee|bank rate|mpc|minutes|policy decision|rate decision)",
-            re.I
-        )
-        return bool(strict.search(hay))
+        return bool(strict_pat.search(t) or strict_pat.search(u))
     else:
-        return bool(KW_RE.search(hay))
+        return bool(broad_pat.search(t) or broad_pat.search(u))
 
 
 def collect_boe(now: datetime) -> List[NewsItem]:
-    base = "https://www.bankofengland.co.uk"
+    """Bank of England — листинги + site search, с фильтрацией по MPC/Bank Rate/etc."""
     sections = [
-        "/news/news",
-        "/news/publications",
-        "/news/speeches",
-        "/news/statistics",
-        "/news/prudential-regulation",
-        "/news/upcoming",
+        "https://www.bankofengland.co.uk/news/news",
+        "https://www.bankofengland.co.uk/news/publications",
+        "https://www.bankofengland.co.uk/news/speeches",
+        "https://www.bankofengland.co.uk/news/statistics",
+        "https://www.bankofengland.co.uk/news/prudential-regulation",
+        "https://www.bankofengland.co.uk/news/upcoming",
     ]
-    pages = ["", "?page=2", "?page=3"]
 
-    kept: Dict[str, NewsItem] = {}
-
-    # 1) Списки разделов
-    kept_total = 0
-    for path in sections:
-        for pg in pages:
-            url = f"{base}{path}{pg}"
-            html, code, final = fetch_text(url)
-            if code != 200 or not html:
+    def scan_list(url: str) -> List[Tuple[str, str]]:
+        html, code, final = fetch_text(url)
+        kept: List[Tuple[str, str]] = []
+        anchors = 0
+        seen = set()
+        for u, t in _iter_links(html, final, domain_must="bankofengland.co.uk"):
+            anchors += 1
+            key = (u, t)
+            if key in seen:
                 continue
-            links = _iter_links(html, final, domain_must="bankofengland.co.uk")
-            anchors = len(links)
-            added = 0
-            for u, t in links:
-                if not _boe_is_relevant(t, u):
-                    continue
-                key = f"BOE|{u}"
-                if key in kept:
-                    continue
-                kept[key] = NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", "high")
-                added += 1
-            log.info("news_augment: BOE list %s: anchors=%d kept=%d", final, anchors, added)
-            kept_total += added
+            seen.add(key)
+            if _boe_keep(u, t):
+                kept.append((u, t))
+        LOG.info("news_augment: BOE list %s: anchors=%d kept=%d", url, anchors, len(kept))
+        return kept
 
-    if kept_total > 0:
-        log.info("news_augment: BOE HTML lists kept total: %d", kept_total)
+    kept_total: List[Tuple[str, str]] = []
+    for sec in sections:
+        kept_total.extend(scan_list(sec))
+        # пагинация до 3 страниц (как в логах)
+        for page in (2, 3):
+            kept_total.extend(scan_list(f"{sec}?page={page}"))
 
-    # 2) Site search — добираем, если что-то пропустили
+    # site search — набор запросов
     queries = [
         "Monetary Policy Summary 2025",
         "Monetary Policy Committee 2025",
@@ -262,178 +228,213 @@ def collect_boe(now: datetime) -> List[NewsItem]:
         "interest rate decision MPC",
     ]
     for q in queries:
-        url = f"{base}/search?query={q.replace(' ', '+')}"
+        url = f"https://www.bankofengland.co.uk/search?query={urllib.parse.quote(q)}"
         html, code, final = fetch_text(url)
-        if code != 200 or not html:
-            continue
-        links = _iter_links(html, final, domain_must="bankofengland.co.uk")
-        anchors = len(links)
-        added = 0
-        for u, t in links:
-            if not _boe_is_relevant(t, u):
-                continue
-            key = f"BOE|{u}"
-            if key in kept:
-                continue
-            kept[key] = NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", "high")
-            added += 1
-        log.info("news_augment: BOE site search '%s': links=%d kept=%d", q, anchors, added)
+        links = list(_iter_links(html, final, domain_must="bankofengland.co.uk"))
+        kept = [(u, t) for (u, t) in links if _boe_keep(u, t)]
+        LOG.info("news_augment: BOE site search '%s': links=%d kept=%d", q, len(links), len(kept))
+        kept_total.extend(kept)
 
-    log.info("news_augment: BOE collected total: %d", len(kept))
-    return list(kept.values())
+    # в NewsItem
+    items: List[NewsItem] = []
+    seen_u = set()
+    for u, t in kept_total:
+        if u in seen_u:
+            continue
+        seen_u.add(u)
+        items.append(NewsItem(
+            ts_utc=now,
+            source="BOE_PR",
+            title=t if t else "Bank of England",
+            url=u,
+            countries="united kingdom",
+            ccy="GBP",
+            tags="boe",
+            importance_guess="medium" if STRICT_BOE else "high"
+        ))
+
+    LOG.info("news_augment: BOE collected total: %d", len(items))
+    return items
 
 
 def collect_boj(now: datetime) -> List[NewsItem]:
+    """Bank of Japan — решения/минуты/summary of opinions."""
     items: List[NewsItem] = []
-
-    # Monetary Policy Releases (решения, стейтменты и т.п.)
-    u1 = "https://www.boj.or.jp/en/mopo/mpmdeci/index.htm"
-    html, code, final = fetch_text(u1)
-    if code == 200 and html:
-        links = _iter_links(html, final, domain_must="boj.or.jp")
-        cnt = 0
+    pages = [
+        ("https://www.boj.or.jp/en/mopo/mpmdeci/index.htm", "mpmdeci"),
+        ("https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm", "mpmsche_minu"),
+    ]
+    total_kept = 0
+    for url, tag in pages:
+        html, code, final = fetch_text(url)
+        links = list(_iter_links(html, final, domain_must="boj.or.jp"))
+        # берём всё из этих разделов
+        kept = []
+        seen = set()
         for u, t in links:
-            if not re.search(r"/mopo/(mpmdeci|mpmsche_minu)/", u, re.I) and not re.search(r"/mopo/mpmdeci/", u, re.I):
+            if (u, t) in seen:
                 continue
-            # Явные подпути года/решений/стейтментов
-            if any(x in u for x in (
-                "/mpr_", "/state_", "/other", "/ope_col_", "/transparency", "/index.htm", "/index.html"
-            )):
-                items.append(NewsItem(now, "BOJ_PR", t, u, "japan", "JPY", "boj mpm", "high"))
-                cnt += 1
-        log.info("news_augment: BoJ mpmdeci: %d", cnt)
-
-    # Schedules / Minutes / Summary of Opinions
-    u2 = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
-    html, code, final = fetch_text(u2)
-    if code == 200 and html:
-        links = _iter_links(html, final, domain_must="boj.or.jp")
-        cnt = 0
-        for u, t in links:
-            if re.search(r"/mpmsche_minu/", u, re.I) and any(s in u for s in (
-                "/opinion_", "/minu_", "/past", "/opinion_all", "/minu_all", "/index.htm", "/index.html"
-            )):
-                items.append(NewsItem(now, "BOJ_PR", t, u, "japan", "JPY", "boj mpm", "high"))
-                cnt += 1
-        log.info("news_augment: BoJ mpmsche_minu: %d", cnt)
-
-    # Убираем дубляжи по URL
-    uniq: Dict[str, NewsItem] = {}
-    for it in items:
-        uniq[it.url] = it
-    out = list(uniq.values())
-    log.info("news_augment: BoJ collected: %d", len(out))
-    return out
+            seen.add((u, t))
+            kept.append((u, t))
+        total_kept += len(kept)
+        LOG.info("news_augment: BoJ %s: %d", tag, len(kept))
+        for u, t in kept:
+            items.append(NewsItem(
+                ts_utc=now,
+                source="BOJ_PR",
+                title=t if t else "Bank of Japan",
+                url=u,
+                countries="japan",
+                ccy="JPY",
+                tags="boj mpm",
+                importance_guess="high"
+            ))
+    LOG.info("news_augment: BoJ collected: %d", total_kept)
+    return items
 
 
 def collect_mof_fx(now: datetime) -> List[NewsItem]:
-    """Устойчивый поиск reference-страницы по интервенциям MoF."""
+    """
+    JP Ministry of Finance FX interventions reference — фикс под дефисы и подчёркивания.
+    Ищем разные варианты путей + fallback с родительских страниц.
+    """
     candidates = [
-        # EN новые/старые пути с index.htm(l)
+        # EN новые/старые пути с index.htm(l) — и с дефисами, и с подчёркиваниями
+        "https://www.mof.go.jp/en/policy/international_policy/reference/foreign-exchange-intervention/index.htm",
+        "https://www.mof.go.jp/en/policy/international_policy/reference/foreign-exchange-intervention/index.html",
+        "https://www.mof.go.jp/english/policy/international_policy/reference/foreign-exchange-intervention/index.htm",
+        "https://www.mof.go.jp/english/policy/international_policy/reference/foreign-exchange-intervention/index.html",
+
         "https://www.mof.go.jp/en/policy/international_policy/reference/foreign_exchange_intervention/index.htm",
         "https://www.mof.go.jp/en/policy/international_policy/reference/foreign_exchange_intervention/index.html",
         "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.htm",
         "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.html",
-        # JP-ветка (иногда только она живая)
+
+        # JP-ветка
+        "https://www.mof.go.jp/policy/international_policy/reference/foreign-exchange-intervention/index.htm",
+        "https://www.mof.go.jp/policy/international_policy/reference/foreign-exchange-intervention/index.html",
         "https://www.mof.go.jp/policy/international_policy/reference/foreign_exchange_intervention/index.htm",
         "https://www.mof.go.jp/policy/international_policy/reference/foreign_exchange_intervention/index.html",
     ]
-    items: List[NewsItem] = []
-    found_url = None
 
-    # 1) прямые хиты
+    items: List[NewsItem] = []
+    found_url: Optional[str] = None
+
+    # 1) прямые варианты
+    fx_body_pat = re.compile(r"(intervention|為替介入|foreign[-_ ]exchange)", re.I)
     for url in candidates:
         html_src, code, final = fetch_text(url)
-        if code == 200 and html_src and re.search(r"(intervention|為替介入|foreign exchange)", html_src, re.I):
+        if code == 200 and html_src and fx_body_pat.search(html_src):
             found_url = final
             break
 
-    # 2) fallback: на уровень выше и ищем ссылку с нужным хвостом
+    # 2) fallback: поднимаемся на уровень выше и ищем ссылку
     if not found_url:
         parents = [
             "https://www.mof.go.jp/en/policy/international_policy/reference/",
             "https://www.mof.go.jp/english/policy/international_policy/reference/",
             "https://www.mof.go.jp/policy/international_policy/reference/",
         ]
+        fx_pat = re.compile(r"foreign[-_]?exchange[-_]?intervention", re.I)
         for p in parents:
             html_src, code, final = fetch_text(p)
             if code != 200 or not html_src:
                 continue
-            links = _iter_links(html_src, final, domain_must="mof.go.jp")
-            fx_links = [u for (u, t) in links if "foreign_exchange_intervention" in u]
-            # приоритет вариантам с index.htm(l)
-            fx_links = sorted(
-                fx_links,
-                key=lambda u: (("index.htm" in u or "index.html" in u) == False, len(u))
-            )
-            if fx_links:
-                found_url = fx_links[0]
+            for u, t in _iter_links(html_src, final, domain_must="mof.go.jp"):
+                if fx_pat.search(u) or fx_pat.search(t):
+                    found_url = u
+                    break
+            if found_url:
                 break
 
     if found_url:
         items.append(NewsItem(
-            now, "JP_MOF_FX", "FX intervention reference page", found_url,
-            "japan", "JPY", "mof", "high"
+            ts_utc=now,
+            source="JP_MOF_FX",
+            title="FX intervention reference page",
+            url=found_url,
+            countries="japan",
+            ccy="JPY",
+            tags="mof",
+            importance_guess="high",
         ))
-        log.info("news_augment: JP MoF FX collected: 1 (url=%s)", found_url)
+        LOG.info("news_augment: JP MoF FX collected: 1 (url=%s)", found_url)
     else:
-        log.info("news_augment: JP MoF FX collected: 0")
+        LOG.info("news_augment: JP MoF FX collected: 0")
 
     return items
 
 
-# --------- Write to NEWS ----------
-def write_news_rows(sh, items: List[NewsItem]):
-    ws, _ = ensure_worksheet(sh, NEWS_WS, NEWS_HEADERS)
-    existing_hash = _read_existing_hashes(ws, "I")
-    new_rows = [n.to_row() for n in items if n.key_hash() not in existing_hash]
-    if new_rows:
-        ws.append_rows(new_rows, value_input_option="RAW")
-    log.info("news_augment: NEWS augment: +%d rows", len(new_rows))
+# ---------- append to NEWS CSV ----------
+
+HEADER = [
+    "ts_utc", "source", "title", "url",
+    "countries", "ccy", "tags", "importance_guess", "hash"
+]
 
 
-# --------- Main ----------
-def main():
-    log.info("news_augment: Starting Container")
-    if not SHEET_ID:
-        raise RuntimeError("SHEET_ID env empty")
-    sh, status = build_sheets_client(SHEET_ID)
-    if not sh:
-        raise RuntimeError(f"Sheets not available: {status}")
+def _read_existing_hashes(csv_path: str) -> set[str]:
+    hashes: set[str] = set()
+    if not os.path.exists(csv_path):
+        return hashes
+    try:
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            for row in rd:
+                h = (row.get("hash") or "").strip()
+                if h:
+                    hashes.add(h)
+    except Exception as e:
+        LOG.info("read_existing: failed: %s", e)
+    return hashes
 
+
+def _append_rows(csv_path: str, items: List[NewsItem]) -> int:
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    exists = os.path.exists(csv_path)
+    added = 0
+    mode = "a" if exists else "w"
+    with open(csv_path, mode, newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        if not exists:
+            wr.writerow(HEADER)
+        for it in items:
+            wr.writerow(it.to_row())
+            added += 1
+    return added
+
+
+def augment_news(items: List[NewsItem]) -> int:
+    existing = _read_existing_hashes(NEWS_CSV)
+    new_items = [i for i in items if i.hash not in existing]
+    if not new_items:
+        LOG.info("news_augment: NEWS augment: +0 rows")
+        return 0
+    added = _append_rows(NEWS_CSV, new_items)
+    LOG.info("news_augment: NEWS augment: +%d rows", added)
+    return added
+
+
+# ---------- main ----------
+
+def main() -> None:
+    LOG.info("news_augment: Starting Container")
     now = datetime.now(timezone.utc)
 
     all_items: List[NewsItem] = []
-    # GBP / BoE
-    try:
-        boe_items = collect_boe(now)
-        all_items.extend(boe_items)
-    except Exception:
-        log.exception("collect_boe failed")
+    # BoE
+    all_items.extend(collect_boe(now))
+    # BoJ
+    all_items.extend(collect_boj(now))
+    # JP MoF FX (фикс дефисы/подчёркивания)
+    all_items.extend(collect_mof_fx(now))
 
-    # JPY / BoJ
-    try:
-        boj_items = collect_boj(now)
-        all_items.extend(boj_items)
-    except Exception:
-        log.exception("collect_boj failed")
-
-    # JPY / MoF FX
-    try:
-        mof_items = collect_mof_fx(now)
-        all_items.extend(mof_items)
-    except Exception:
-        log.exception("collect_mof_fx failed")
-
-    # Дедуп по hash внутри батча
-    uniq: Dict[str, NewsItem] = {}
-    for it in all_items:
-        uniq[it.key_hash()] = it
-    deduped = list(uniq.values())
-    log.info("news_augment: augment collected: %d new candidates", len(deduped))
-
-    write_news_rows(sh, deduped)
+    LOG.info("news_augment: augment collected: %d new candidates", len(all_items))
+    augment_news(all_items)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
