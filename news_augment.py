@@ -156,12 +156,11 @@ _BOE_SITEMAPS = [
 
 def _boe_is_high(url: str, title: str) -> bool:
     hay = f"{title} {url}".lower()
-    # всё, что про MPC/Bank Rate/MPS — high
     return (
-        "monetary-policy-summary-and-minutes" in hay
-        or "bank rate" in hay
-        or "mpc" in hay
-        or bool(KW_RE.search(hay))
+        "monetary-policy-summary-and-minutes" in hay or
+        "bank rate" in hay or
+        "mpc" in hay or
+        bool(KW_RE.search(hay))
     )
 
 def _slug_to_title(url: str) -> str:
@@ -174,85 +173,113 @@ def _boe_from_sitemaps(now: datetime) -> List[NewsItem]:
     seen: set[str] = set()
     for sm in _BOE_SITEMAPS:
         xml, code, _ = fetch_text(sm)
-        # у них бывает 302→500 — пробуем Jina-прокси вручную
-        if code != 200:
-            try_xml, try_code, _ = fetch_text(os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/" + sm)
-            if try_code == 200 and try_xml:
-                xml, code = try_xml, 200
+        if code != 200 or not xml:
+            # у них часто 302→500; пробуем через Jina
+            jxml, jcode, _ = fetch_text(os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/" + sm)
+            if jcode == 200 and jxml:
+                xml, code = jxml, 200
         if code != 200 or not xml:
             continue
         for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, flags=re.I):
             u = loc.strip()
             if "bankofengland.co.uk" not in u:
                 continue
-            # берем только реально контентные страницы
-            if ("/news/" in u or "/monetary-policy-summary-and-minutes/" in u) and re.search(r"/20\d{2}/", u):
+            # берём только контентные страницы с датой
+            if ("/monetary-policy-summary-and-minutes/" in u or "/news/" in u) and re.search(r"/20\d{2}", u):
+                if u in seen: 
+                    continue
+                seen.add(u)
+                title = _slug_to_title(u)
+                imp = "high" if _boe_is_high(u, title) else "medium"
+                items.append(NewsItem(now, "BOE_PR", title, u, "united kingdom", "GBP", "boe", imp))
+    return items
+
+def _boe_from_site_search(now: datetime) -> List[NewsItem]:
+    """Поиск на самом сайте BoE (серверный HTML)."""
+    queries = [
+        "Monetary Policy Summary 2025",
+        "Monetary Policy Committee 2025",
+        "Bank Rate Monetary Policy 2025",
+        "Monetary Policy Summary 2024",  # небольшой бэкоф
+    ]
+    items: List[NewsItem] = []
+    seen: set[str] = set()
+
+    def _abs(u: str) -> str:
+        return u if u.startswith("http") else ("https://www.bankofengland.co.uk" + u)
+
+    for q in queries:
+        url = "https://www.bankofengland.co.uk/search?query=" + re.sub(r"\s+", "+", q)
+        html, code, _ = fetch_text(url)
+        if code != 200 or not html:
+            continue
+        # тащим все <a ... href="...">
+        for m in re.finditer(r'href="([^"#]+)"', html, flags=re.I):
+            u = _abs(m.group(1).strip())
+            if "www.bankofengland.co.uk" not in u:
+                continue
+            # фильтр по разделам и наличию года в ссылке
+            if (
+                ("/monetary-policy-summary-and-minutes/" in u or "/news/" in u or "/speeches/" in u) 
+                and re.search(r"/20\d{2}", u)
+            ):
                 if u in seen:
                     continue
                 seen.add(u)
                 title = _slug_to_title(u)
                 imp = "high" if _boe_is_high(u, title) else "medium"
-                items.append(NewsItem(
-                    ts_utc=now, source="BOE_PR", title=title, url=u,
-                    countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
-                ))
+                items.append(NewsItem(now, "BOE_PR", title, u, "united kingdom", "GBP", "boe", imp))
     return items
 
-def _ddg_links(query: str) -> List[str]:
-    # DuckDuckGo HTML выдаёт статические ссылки вида /l/?uddg=<url>
+def _bing_links(query: str) -> List[str]:
     import urllib.parse as _up
-    url = "https://duckduckgo.com/html/?q=" + _up.quote_plus(query)
+    url = "https://www.bing.com/search?q=" + _up.quote_plus(query) + "&setlang=en&cc=US"
     html, code, _ = fetch_text(url)
     out: List[str] = []
-    if not code or not html:
-        return out
-    for m in re.finditer(r'href="(?:/l/)?\?uddg=([^"&]+)"', html):
-        target = _up.unquote(m.group(1))
-        if "bankofengland.co.uk" in target:
-            out.append(target)
-    for m in re.finditer(r'href="(https://www\.bankofengland\.co\.uk/[^"]+)"', html):
-        out.append(m.group(1))
-    # лёгкий дедуп
-    uniq: List[str] = []
-    seen = set()
+    if code and html:
+        # основные результаты
+        for m in re.finditer(r'href="(https://www\.bankofengland\.co\.uk/[^"]+)"', html):
+            out.append(m.group(1))
+    # дедуп
+    res, seen = [], set()
     for u in out:
         if u not in seen:
-            seen.add(u)
-            uniq.append(u)
-    return uniq
+            seen.add(u); res.append(u)
+    return res
 
-def _boe_from_search(now: datetime) -> List[NewsItem]:
+def _boe_from_bing(now: datetime) -> List[NewsItem]:
     items: List[NewsItem] = []
     queries = [
         'site:bankofengland.co.uk "Monetary Policy Summary" 2025',
         'site:bankofengland.co.uk "Monetary Policy Committee" 2025',
         'site:bankofengland.co.uk "Bank Rate" "Monetary Policy" 2025',
-        'site:bankofengland.co.uk/monetary-policy-summary-and-minutes 2025',
     ]
     seen: set[str] = set()
     for q in queries:
-        for u in _ddg_links(q):
-            if u in seen:
+        for u in _bing_links(q):
+            if u in seen: 
                 continue
             seen.add(u)
             title = _slug_to_title(u)
             imp = "high" if _boe_is_high(u, title) else "medium"
-            items.append(NewsItem(
-                ts_utc=now, source="BOE_PR", title=title, url=u,
-                countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
-            ))
+            items.append(NewsItem(now, "BOE_PR", title, u, "united kingdom", "GBP", "boe", imp))
     return items
 
 def collect_boe() -> List[NewsItem]:
     now = datetime.now(timezone.utc)
-    # 1) пробуем sitemap
+    # 1) сайт BoE (серверный поиск)
+    items = _boe_from_site_search(now)
+    if items:
+        log.info("news_augment: BOE via site search collected: %d", len(items))
+        return items
+    # 2) sitemap (если вдруг оживёт)
     items = _boe_from_sitemaps(now)
     if items:
         log.info("news_augment: BOE via sitemap collected: %d", len(items))
         return items
-    # 2) fallback: DuckDuckGo
-    items = _boe_from_search(now)
-    log.info("news_augment: BOE via search collected: %d", len(items))
+    # 3) Bing HTML как крайний фолбэк
+    items = _boe_from_bing(now)
+    log.info("news_augment: BOE via bing collected: %d", len(items))
     return items
     
 # ====== JPY: Bank of Japan + MoF ======
