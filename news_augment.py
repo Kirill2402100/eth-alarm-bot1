@@ -1,7 +1,7 @@
 # news_augment.py — дополняет лист NEWS локальными источниками (GBP/JPY), без изменений основного кода
 import os, re, json, base64, time, logging, html as _html
-from typing import Optional, List, Tuple
-from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Tuple, Iterable
+from datetime import datetime, timezone
 from html import unescape as _html_unescape
 
 import httpx
@@ -13,10 +13,8 @@ EVERY_MIN = int(os.getenv("NEWS_AUGMENT_EVERY_MIN","30") or "30")
 LOG_LEVEL = os.getenv("LOG_LEVEL","INFO").upper()
 JINA_PROXY = os.getenv("JINA_PROXY","https://r.jina.ai/http/").rstrip("/") + "/"
 
-# Совместимость с calendar_collector: тот же заголовок для NEWS
 NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
 
-# Ключевые слова «высокой важности» — совпадают с calendar_collector
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
@@ -24,7 +22,6 @@ KW_RE = re.compile(os.getenv(
     "rate statement|cash rate|fomc|mpc"
 ), re.I)
 
-# ====== Logging ======
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("news_augment")
 
@@ -150,50 +147,100 @@ def _importance(title: str, url: str) -> str:
     hay = f"{title} {url}"
     return "high" if KW_RE.search(hay) else "medium"
 
-# ====== Parsers we ДОБАВЛЯЕМ (GBP, JPY) ======
-
-def collect_boe() -> List[NewsItem]:
-    """Bank of England — GBP/UK. Собираем с /news (абсолютные и относительные ссылки)."""
-    base = "https://www.bankofengland.co.uk"
-    txt, code, _ = fetch_text(base + "/news")
-    out: List[NewsItem] = []
-    if code:
-        now = datetime.now(timezone.utc)
-        # 1) Абсолютные и относительные ссылки вида /news/20xx/...
-        for m in re.finditer(r'href="(?:(https?://www\.bankofengland\.co\.uk)?(/news/20\d{2}/[^"#?]+))"[^>]*>(.*?)</a>', txt, re.I):
-            abs_host, rel, label = m.group(1) or "", m.group(2), (m.group(3) or "").strip()
-            url = (abs_host or base) + rel
-            title = _clean_html_text(label) or rel.rsplit("/",1)[-1].replace("-", " ").title()
-            imp = _importance(title, url)
-            out.append(NewsItem(now, "BOE_PR", title, url, "united kingdom", "GBP", "boe", imp))
-
-        # 2) На некоторых страницах внутри карточки ссылка лежит в data-attribute:
-        for m in re.finditer(r'data-gtm-(?:link|cta)="[^"]*"\s+href="(?:(https?://www\.bankofengland\.co\.uk)?(/news/20\d{2}/[^"#?]+))"', txt, re.I):
-            abs_host, rel = m.group(1) or "", m.group(2)
-            url = (abs_host or base) + rel
-            title = url.rsplit("/",1)[-1].replace("-", " ").title()
-            imp = _importance(title, url)
-            out.append(NewsItem(now, "BOE_PR", title, url, "united kingdom", "GBP", "boe", imp))
-    log.info("BOE collected: %d", len(out))
+# ====== GBP: Bank of England ======
+def _boe_from_anchors(html: str) -> List[tuple[str,str]]:
+    out = []
+    # Любые ссылки, начинающиеся с /news/… либо абсолютные на боевском домене
+    for m in re.finditer(r'href="(?P<u>(?:https?://(?:www\.)?bankofengland\.co\.uk)?/news/(?!rss)[^"#?]+)"', html, re.I):
+        u = m.group("u")
+        if not u.startswith("http"):
+            u = "https://www.bankofengland.co.uk" + u
+        out.append((u, ""))  # title вытянем позже, если будет
     return out
 
+def _boe_from_ldjson(html: str) -> List[tuple[str,str]]:
+    out = []
+    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>([\s\S]*?)</script>', html, re.I):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        def walk(node):
+            if isinstance(node, dict):
+                t = str(node.get("@type",""))
+                if ("NewsArticle" in t or "Article" in t) and "url" in node:
+                    url = node["url"]
+                    if "bankofengland.co.uk" in url and "/news/" in url:
+                        title = node.get("headline") or node.get("name") or ""
+                        out.append((url, title))
+                for v in node.values(): walk(v)
+            elif isinstance(node, list):
+                for v in node: walk(v)
+        walk(data)
+    return out
+
+def _boe_from_mps(html: str, base_url: str) -> List[tuple[str,str]]:
+    out = []
+    # ссылки на MPS по годам/месяцам
+    for m in re.finditer(r'href="(?P<u>(?:https?://(?:www\.)?bankofengland\.co\.uk)?/monetary-policy-summary-and-minutes/[^"#?]+)"', html, re.I):
+        u = m.group("u")
+        if not u.startswith("http"):
+            u = "https://www.bankofengland.co.uk" + u
+        title = u.rsplit("/",1)[-1].replace("-", " ").title()
+        out.append((u, title))
+    return out
+
+def collect_boe() -> List[NewsItem]:
+    base = "https://www.bankofengland.co.uk"
+    now = datetime.now(timezone.utc)
+    out: List[NewsItem] = []
+
+    # 1) /news
+    txt, code, _ = fetch_text(base + "/news")
+    anchors = ldjson = []
+    if code:
+        anchors = _boe_from_anchors(txt)
+        ldjson  = _boe_from_ldjson(txt)
+    log.info("BOE /news: anchors=%d, ldjson=%d", len(anchors), len(ldjson))
+
+    seen = set()
+    for u, t in anchors + ldjson:
+        key = ("A", u)
+        if key in seen: continue
+        seen.add(key)
+        title = t or u.rsplit("/",1)[-1].replace("-", " ").title()
+        imp = _importance(title, u)
+        out.append(NewsItem(now, "BOE_PR", title, u, "united kingdom", "GBP", "boe", imp))
+
+    # 2) Fallback: корень MPS (даже если он редиректит или отдаёт обрезанную страницу)
+    mps_txt, mps_code, eff = fetch_text(base + "/monetary-policy-summary-and-minutes")
+    if mps_code:
+        mps_links = _boe_from_mps(mps_txt, eff)
+        log.info("BOE MPS: links=%d", len(mps_links))
+        for u, t in mps_links:
+            key = ("M", u)
+            if key in seen: continue
+            seen.add(key)
+            imp = _importance(t, u)
+            out.append(NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", imp))
+
+    log.info("BOE collected total: %d", len(out))
+    return out
+
+# ====== JPY: Bank of Japan + MoF ======
 def collect_boj() -> List[NewsItem]:
-    """Bank of Japan — JPY/JP. Берём два «якоря» раздела."""
     out: List[NewsItem] = []
     now = datetime.now(timezone.utc)
 
-    def _grab(url: str, tag: str):
+    def _grab(url: str):
         txt, code, _ = fetch_text(url)
         if not code: return
-        # ссылки на решения/заявления/списки по годам, pdf и htm
         for m in re.finditer(r'href="(?:(https?://www\.boj\.or\.jp)?(/en/mopo/(?:mpmdeci|mpmsche_minu)/[^"]+\.(?:htm|pdf)))"', txt, re.I):
             host, rel = m.group(1) or "https://www.boj.or.jp", m.group(2)
             u = host + rel
             t = rel.rsplit("/",1)[-1]
             title = _clean_html_text(t.replace("_"," ").replace("-", " ").split(".")[0]).title()
             out.append(NewsItem(now, "BOJ_PR", title or "BoJ document", u, "japan", "JPY", "boj mpm", "high"))
-
-        # и директории/«by year»
         for m in re.finditer(r'href="(?:(https?://www\.boj\.or\.jp)?(/en/mopo/(?:mpmdeci|mpmsche_minu)/[^"]+/))"', txt, re.I):
             host, rel = m.group(1) or "https://www.boj.or.jp", m.group(2)
             u = host + rel
@@ -201,14 +248,13 @@ def collect_boj() -> List[NewsItem]:
             title = _clean_html_text(seg.replace("_"," ").replace("-", " ")).title()
             out.append(NewsItem(now, "BOJ_PR", title or "BoJ page", u, "japan", "JPY", "boj mpm", "high"))
 
-    _grab("https://www.boj.or.jp/en/mopo/mpmdeci/index.htm", "mpmdeci")
-    _grab("https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm", "mpmsche_minu")
+    _grab("https://www.boj.or.jp/en/mopo/mpmdeci/index.htm")
+    _grab("https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm")
 
     log.info("BoJ collected: %d", len(out))
     return out
 
 def collect_jp_mof_fx() -> List[NewsItem]:
-    """MoF FX interventions — если страница доступна (часто 404)."""
     urls = [
         "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/",
         "https://www.mof.go.jp/policy/international_policy/reference/foreign_exchange_intervention/",
