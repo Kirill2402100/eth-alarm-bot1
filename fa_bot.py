@@ -104,10 +104,9 @@ PAIR_COUNTRIES = {
     "GBPUSD": {"united kingdom", "united states"},
 }
 
-# Ключевые слова и источники (выровнены с calendar_collector.py + расширены)
+# Ключевые слова и источники
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
-    # добавлено: fomc/mpc, policy statement(s), rate statement, cash rate
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
     "intervention|FX intervention|press conference|policy statement|policy statements|"
     "rate statement|cash rate|fomc|mpc"
@@ -122,8 +121,6 @@ ALLOWED_SOURCES = {
     if s.strip()
 }
 NEWS_TTL_MIN = int(os.getenv("FA_NEWS_TTL_MIN", "120") or "120")
-
-# Для /diag
 DIGEST_NEWS_LOOKBACK_MIN = int(os.getenv("DIGEST_NEWS_LOOKBACK_MIN", "180") or "180")
 
 # -------------------- ГЛОБАЛЬНОЕ СОСТОЯНИЕ --------------------
@@ -212,7 +209,6 @@ def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
 def _read_news_rows(sh) -> List[dict]:
-    """Безопасное чтение NEWS (для /diag и топ-новостей)."""
     try:
         rows = sh.worksheet("NEWS").get_all_records()
         norm = []
@@ -235,17 +231,10 @@ def _read_news_rows(sh) -> List[dict]:
         return []
 
 def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
-    """
-    Возвращает строку 'HH:MM — Title (SRC)' для КОНКРЕТНОЙ пары.
-    1) Ищем свежую high-новость из NEWS за TTL (по странам пары).
-    2) Если нет — ближайшее будущее событие из CALENDAR (по странам пары).
-    3) Если нет — ближайшее прошлое событие из CALENDAR (как фолбэк).
-    """
     now_utc = now_utc or datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(minutes=NEWS_TTL_MIN)
     countries = PAIR_COUNTRIES.get(pair, set())
 
-    # 1) NEWS: свежие релевантные записи
     best = None
     for r in _read_news_rows(sh):
         ts = r["ts_utc"]
@@ -257,7 +246,6 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
         title = r["title"]
         tags = r["tags"]
         kw_ok = bool(KW_RE.search(f"{title} {tags}"))
-        # Разрешаем «якорные» источники ЦБ даже без явных ключевых слов
         if not kw_ok and src in {"US_FED_PR", "ECB_PR", "BOE_PR", "RBA_MR", "BOJ_PR"}:
             kw_ok = True
         if not kw_ok:
@@ -270,14 +258,13 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
         lt = best["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else best["ts"]
         return f"{lt:%H:%M} — {best['title']} ({best['src']})"
 
-    # 2-3) CALENDAR
     try:
         events = sh.worksheet(CAL_WS_OUT).get_all_records()
     except Exception:
         events = []
 
-    soon = None        # ближайшее будущее событие
-    last_past = None   # ближайшее прошедшее
+    soon = None
+    last_past = None
     for e in events:
         try:
             dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z","+00:00")).astimezone(timezone.utc)
@@ -304,10 +291,6 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
     return ""
 
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
-    """
-    Лист FA_Signals: pair,risk,bias,ttl,updated_at,scan_lock_until,reserve_off,dca_scale,reason,risk_pct
-    Возвращает только НЕ протухшие по TTL записи.
-    """
     try:
         ws = sh.worksheet("FA_Signals")
         rows = ws.get_all_records()
@@ -326,7 +309,7 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
         except Exception:
             upd_ts = None
         if ttl and upd_ts and now > upd_ts + timedelta(minutes=ttl):
-            continue  # протухло
+            continue
         out[pair] = {
             "risk":        (str(r.get("risk", "Green")).capitalize()),
             "bias":        (str(r.get("bias", "neutral")).lower()),
@@ -418,7 +401,6 @@ def _symbol_hints(symbol: str) -> tuple[str, str]:
             "публикации ЕЦБ про экономику без сюрпризов — нейтрально; жёсткий тон ЕЦБ — поддержка евро (EUR/USD вверх), мягкий — давление на евро (вниз).",
             "ищем намёки — «больше боимся инфляции» → евро сильнее; «больше боимся слабой экономики» → евро слабее.",
         )
-    # GBPUSD
     return (
         "если представители Банка Англии говорят «зарплаты и услуги давят на инфляцию», рынок ждёт ставку повыше дольше — фунт крепче (GBP/USD вверх). Мягче — фунт слабее.",
         "больше тревоги по инфляции — фунт сильнее; меньше — слабее.",
@@ -499,7 +481,6 @@ def build_digest_text(sh, fa_sheet_data: dict) -> str:
 
 # -------------------- Безопасная отправка в TG --------------------
 async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode=ParseMode.HTML):
-    """Отправка с простым экспоненциальным ретраем (на случай сетевых таймаутов)."""
     delay = 1.0
     for attempt in range(4):
         try:
@@ -766,7 +747,6 @@ async def morning_digest_scheduler(app: Application):
                 pass
 
 async def _post_init(app: Application):
-    # Команды
     cmds = [
         BotCommand("start", "Запуск бота"),
         BotCommand("help", "Список команд"),
@@ -778,14 +758,13 @@ async def _post_init(app: Application):
         BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
         BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
         BotCommand("sheet_test", "Тестовая запись в лист"),
-        BotCommand("diag", "Диагностика LLM / Sheets / NEWS"),
+        BotCommand("diag", "Диагностика LLM и Sheets"),
     ]
     try:
         await app.bot.set_my_commands(cmds)
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
 
-    # Фоновый планировщик
     app.create_task(morning_digest_scheduler(app))
 
 # -------------------- Сборка приложения --------------------
@@ -793,16 +772,18 @@ def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
-    # Болеe терпеливые таймауты + ретраи для Telegram API
+    # Совместимый с разными версиями PTB набор аргументов:
     req = HTTPXRequest(
         connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "20")),
         read_timeout=float(os.getenv("TG_READ_TIMEOUT", "60")),
         write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "60")),
         pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
-        connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
-        retries=int(os.getenv("TG_HTTP_RETRIES", "3")),
+        # эти параметры есть во всех релизах v20.x:
+        # (если у тебя совсем старая версия — их можно убрать)
         http_version="1.1",
         trust_env=True,
+        # connection_pool_size есть, но если вдруг нет — просто закомментируй:
+        connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
     )
 
     builder = Application.builder().token(BOT_TOKEN).request(req)
@@ -811,7 +792,6 @@ def build_application() -> Application:
     builder = builder.post_init(_post_init)
     app = builder.build()
 
-    # Хендлеры
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -837,7 +817,7 @@ def main():
                 poll_interval=float(os.getenv("TG_POLL_INTERVAL", "2")),
                 timeout=int(os.getenv("TG_LONGPOLL_TIMEOUT", "30")),
             )
-            backoff = 5  # если завершился штатно — сброс бэкоффа
+            backoff = 5
         except Exception as e:
             log.exception("Polling crashed on startup: %s. Retry in %ss", e, backoff)
             time.sleep(backoff)
