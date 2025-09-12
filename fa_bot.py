@@ -807,7 +807,6 @@ def build_application() -> Application:
         pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
         connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
         http_version="1.1",  # иногда HTTP/2 handshakes ведут себя хуже в PaaS
-        trust_env=True,      # если Railway задаёт прокси/сетевые переменные — использовать
     )
 
     builder = Application.builder().token(BOT_TOKEN).request(req)
