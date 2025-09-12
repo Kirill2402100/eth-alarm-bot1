@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Iterable
 from datetime import datetime, timedelta, timezone
 from html import unescape as _html_unescape
+import html as _html
 
 try:
     from zoneinfo import ZoneInfo
@@ -92,12 +93,12 @@ def ensure_worksheet(sh, title: str, headers: List[str]):
             try:
                 cur = ws.get_values("A1:Z1") or [[]]
                 if not cur or cur[0] != headers:
-                    ws.update("A1", [headers])
+                    ws.update(range_name="A1", values=[headers])
             except Exception:
                 pass
             return ws, False
-    ws = sh.add_worksheet(title=title, rows=200, cols=max(10,len(headers)))
-    ws.update("A1", [headers])
+    ws = sh.add_worksheet(title=title, rows=200, cols=max(10, len(headers)))
+    ws.update(range_name="A1", values=[headers])
     return ws, True
 
 def _to_utc_iso(dt: datetime) -> str:
@@ -131,6 +132,17 @@ def fetch_text(url: str, timeout=15.0) -> tuple[str,int,str]:
         log.warning("fetch failed %s: %s", url, e)
         return "", 0, url
 
+def _html_to_text(s: str) -> str:
+    """Грубое, но очень устойчивое «выковыривание» текста из HTML."""
+    if not s:
+        return ""
+    # убираем теги и сжимаем пробелы/переносы
+    s = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = _html.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 # -------- Models --------
 @dataclass
 class CalEvent:
@@ -150,35 +162,83 @@ CAL_HEADERS  = ["utc_iso","local_time","country","currency","title","impact","so
 NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
 
 # -------- Calendar parsers (миним.) --------
-def _parse_month_day_year(s: str) -> Optional[datetime]:
-    m = re.search(r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:–\d{1,2})?,\s*(20\d{2})", s, re.I)
-    if not m: return None
-    month = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}[m.group(1).lower()[:3]]
-    return datetime(int(m.group(3)), month, int(m.group(2)), 14, 0, 0, tzinfo=timezone.utc)
+def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
+    """
+    Страница FOMC часто меняет верстку. Делаем устойчиво:
+    1) превращаем HTML в сплошной текст
+    2) ищем все шаблоны дат типа 'September 16–17, 2025' / 'Sep 16-17, 2025'
+    3) берем ПЕРВЫЙ день интервала как ориентир (14:00Z)
+    """
+    text = _html_to_text(html)
+    # Sep / September и т.п. + день (иногда диапазон) + год
+    pat = re.compile(
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+        r"Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
+        r"(\d{1,2})(?:\s*[–—\-]\s*(\d{1,2}))?,\s*(20\d{2})",
+        re.I
+    )
 
-def parse_fomc_calendar(text: str, url: str) -> List[CalEvent]:
     out: List[CalEvent] = []
-    for m in re.finditer(r"(?:FOMC|Meeting)[^<>\n]{0,80}?(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:–\d{1,2})?,\s*20\d{2}", text, re.I):
-        dt = _parse_month_day_year(m.group(0))
-        if dt:
-            out.append(CalEvent(utc=dt, country="united states", currency="USD", title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url))
-    uniq = {}; [uniq.setdefault(ev.utc.date(), ev) for ev in out]
+    for m in pat.finditer(text):
+        mon_s, d1_s, d2_s, y_s = m.group(1), m.group(2), m.group(3), m.group(4)
+        month = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,
+                 "sep":9,"oct":10,"nov":11,"dec":12}[mon_s.lower()[:3]]
+        day = int(d1_s)
+        year = int(y_s)
+        dt = datetime(year, month, day, 14, 0, 0, tzinfo=timezone.utc)
+        out.append(CalEvent(
+            utc=dt, country="united states", currency="USD",
+            title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
+        ))
+    # дедуп по дате
+    uniq = {}
+    for ev in out:
+        uniq[ev.utc.date()] = ev
     return list(uniq.values())
 
-def parse_boj_calendar(text: str, url: str) -> List[CalEvent]:
+def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
+    """
+    BoJ публикует «MPM schedule» в разных форматах. Берем все yyyy.mm.dd/ yyyy-mm-dd.
+    """
+    text = _html_to_text(html)
     out: List[CalEvent] = []
-    for m in re.finditer(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2}).{0,64}?Monetary Policy Meeting", text, re.I):
-        dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 3, 0, 0, tzinfo=timezone.utc)
-        out.append(CalEvent(utc=dt, country="japan", currency="JPY", title="BoJ Monetary Policy Meeting", impact="high", source="BoJ", url=url))
-    uniq = {}; [uniq.setdefault(ev.utc.date(), ev) for ev in out]
-    return list(uniq.values())[:20]
+
+    for m in re.finditer(r"(20\d{2})[./-]\s?(\d{1,2})[./-]\s?(\d{1,2})", text):
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            dt = datetime(y, mo, d, 3, 0, 0, tzinfo=timezone.utc)  # утро Токио ~03:00Z
+            out.append(CalEvent(
+                utc=dt, country="japan", currency="JPY",
+                title="BoJ Monetary Policy Meeting", impact="high", source="BoJ", url=url
+            ))
+        except Exception:
+            continue
+
+    # дедуп по дате и отсечка странных лет
+    uniq = {}
+    for ev in out:
+        if 2000 <= ev.utc.year <= 2100:
+            uniq[ev.utc.date()] = ev
+    return list(uniq.values())
 
 def collect_calendar() -> List[CalEvent]:
     events: List[CalEvent] = []
-    txt, code, u = fetch_text("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
-    if code: events += parse_fomc_calendar(txt, u)
-    txt, code, u = fetch_text("https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm")
-    if code: events += parse_boj_calendar(txt, u)
+
+    url_fomc = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+    txt, code, f_url = fetch_text(url_fomc)
+    if code:
+        f = parse_fomc_calendar(txt, f_url)
+        log.info("FOMC parsed: %d", len(f))
+        events += f
+
+    url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
+    txt, code, f_url = fetch_text(url_boj)
+    if code:
+        b = parse_boj_calendar(txt, f_url)
+        log.info("BoJ parsed: %d", len(b))
+        events += b
+
+    # (ECB/BoE оставляем заглушкой)
     return events
 
 # -------- NEWS scrapers --------
@@ -212,89 +272,71 @@ class NewsItem:
             self.key_hash()
         ]
 
-def _iter_links_with_time(html: str, href_re: str, time_first: bool = True):
-    """
-    Пытается спарсить пары (ts, href, text), где <time datetime="..."> рядом со ссылкой.
-    time_first=True — ищем <time> ... <a href=...>; иначе наоборот.
-    """
-    flags = re.I | re.S
-    if time_first:
-        pat = rf'<time[^>]+datetime="([^"]+)"[^>]*>.*?</time>.*?<a[^>]+href="({href_re})"[^>]*>(.*?)</a>'
-    else:
-        pat = rf'<a[^>]+href="({href_re})"[^>]*>(.*?)</a>.*?<time[^>]+datetime="([^"]+)"[^>]*>.*?</time>'
-    for m in re.finditer(pat, html, flags):
-        dt = _norm_iso_key(m.group(1) if time_first else m.group(3))
-        try:
-            ts = datetime.fromisoformat(dt.replace("Z","+00:00")).astimezone(timezone.utc)
-        except Exception:
-            ts = datetime.now(timezone.utc)
-        href = m.group(2 if time_first else 1)
-        text = m.group(3 if time_first else 2)
-        yield ts, href, text
-
 def collect_news() -> List[NewsItem]:
+    """
+    Собираем только релевант:
+    - Fed: ссылки вида /newsevents/pressreleases/20xx-press-*.htm и /20xx-press-fomc.htm
+    - ECB: press, govcdec, press_conference, monetary policy statements
+    - BoE: /news/20xx/*
+    - RBA: /media-releases/YYYY/*
+    - US Treasury: /news/press-releases/sb\d+
+    """
     items: List[NewsItem] = []
     now = datetime.now(timezone.utc)
 
-    # --- FED PR: только реальные релизы по монетарной политике/FOMC ---
+    # FED
     txt, code, url = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
     if code:
-        for ts, href, text in _iter_links_with_time(
-            txt,
-            href_re=r'/newsevents/pressreleases/(?:monetary|fomc)[^"]+?\.htm'
-        ):
-            u = "https://www.federalreserve.gov" + href
-            items.append(NewsItem(ts,"US_FED_PR",text,u,"united states","USD","policy",
-                                  "high" if KW_RE.search(text) else "medium"))
+        for m in re.finditer(r'href="(/newsevents/pressreleases/(?:20\d{2}-press-(?:fomc|monetary)|20\d{2}-press-\w+)\.htm)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.federalreserve.gov" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip() or "Fed press release"
+            items.append(NewsItem(now, "US_FED_PR", t, u, "united states", "USD", "policy", "high"))
 
-    # --- US Treasury: берём только конкретные пресс-релизы (sb####/jl####), без каталогов ---
+    # US Treasury
     txt, code, url = fetch_text("https://home.treasury.gov/news/press-releases")
     if code:
-        for ts, href, text in _iter_links_with_time(
-            txt,
-            href_re=r'/news/press-releases/(?:sb|jl)\d+[^"/]*'
-        ):
-            u = "https://home.treasury.gov" + href
-            items.append(NewsItem(ts,"US_TREASURY",text,u,"united states","USD","treasury",
-                                  "high" if KW_RE.search(text) else "medium"))
+        for m in re.finditer(r'href="(/news/press-releases/sb\d+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://home.treasury.gov" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            items.append(NewsItem(now, "US_TREASURY", t, u, "united states", "USD", "treasury", "medium"))
 
-    # --- ECB PR ---
+    # ECB (правление/заявления/конфы)
     txt, code, url = fetch_text("https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release")
     if code:
-        for ts, href, text in _iter_links_with_time(
-            txt,
-            href_re=r'/press/[^"]+?\.html'
-        ):
-            u = "https://www.ecb.europa.eu" + href
-            items.append(NewsItem(ts,"ECB_PR",text,u,"euro area","EUR","ecb",
-                                  "high" if KW_RE.search(text) else "medium"))
+        for m in re.finditer(r'href="(/press/(?:govcdec|press_conference|pr)/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.ecb.europa.eu" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            imp = "high" if KW_RE.search(t) else "medium"
+            items.append(NewsItem(now, "ECB_PR", t, u, "euro area", "EUR", "ecb", imp))
 
-    # --- BoE ---
+    # BoE
     txt, code, url = fetch_text("https://www.bankofengland.co.uk/news")
     if code:
-        for ts, href, text in _iter_links_with_time(
-            txt,
-            href_re=r'/news/\d{4}/[^"]+'
-        ):
-            u = "https://www.bankofengland.co.uk" + href
-            items.append(NewsItem(ts,"BOE_PR",text,u,"united kingdom","GBP","boe",
-                                  "high" if KW_RE.search(text) else "medium"))
+        for m in re.finditer(r'href="(/news/20\d{2}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.bankofengland.co.uk" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            imp = "high" if KW_RE.search(t) else "medium"
+            items.append(NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", imp))
 
-    # --- RBA ---
+    # RBA
     txt, code, url = fetch_text("https://www.rba.gov.au/media-releases/")
     if code:
-        for ts, href, text in _iter_links_with_time(
-            txt,
-            href_re=r'/media-releases/\d{4}/[^"]+'
-        ):
-            u = "https://www.rba.gov.au" + href
-            items.append(NewsItem(ts,"RBA_MR",text,u,"australia","AUD","rba",
-                                  "high" if KW_RE.search(text) else "medium"))
+        for m in re.finditer(r'href="(/media-releases/\d{4}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
+            u = "https://www.rba.gov.au" + m.group(1)
+            t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            imp = "high" if KW_RE.search(t) else "medium"
+            items.append(NewsItem(now, "RBA_MR", t, u, "australia", "AUD", "rba", imp))
 
-    # --- JP MoF FX (флажок страницы) ---
-    txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.html")
-    if code and re.search(r"intervention|announcement", txt, re.I):
-        items.append(NewsItem(now,"JP_MOF_FX","FX intervention reference page",url,"japan","JPY","mof","high"))
+    # JP MoF FX (страницу часто меняют; если код !=200 — просто пропускаем)
+    txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/")
+    if code == 200 and re.search(r"intervention|announcement", txt, re.I):
+        items.append(NewsItem(now, "JP_MOF_FX", "FX intervention reference page", url, "japan", "JPY", "mof", "high"))
+
+    # Легкая отсечка древности по названию (если вдруг соберем архив)
+    max_age_days = int(os.getenv("NEWS_MAX_AGE_DAYS", "90") or "90")
+    cutoff = now - timedelta(days=max_age_days)
+    # пока все ts = now — фильтр на будущее, если появится нормальный парсинг времени
+    items = [i for i in items if i.ts_utc >= cutoff]
 
     log.info("NEWS collected: %d items", len(items))
     return items
@@ -354,12 +396,18 @@ def write_fa_signals(sh, signals: Dict[str, dict]):
     for sym in order:
         s = signals.get(sym, {})
         values.append([
-            s.get("pair", sym), s.get("risk","Green"), s.get("bias","neutral"),
-            s.get("ttl",""), s.get("updated_at",""), s.get("scan_lock_until",""),
-            int(bool(s.get("reserve_off",0))), float(s.get("dca_scale",1.0)),
-            s.get("reason","base"), int(s.get("risk_pct",0)),
+            s.get("pair", sym),
+            s.get("risk", "Green"),
+            s.get("bias", "neutral"),
+            s.get("ttl", ""),
+            s.get("updated_at", ""),
+            s.get("scan_lock_until", ""),
+            int(bool(s.get("reserve_off", 0))),
+            float(s.get("dca_scale", 1.0)),
+            s.get("reason", "base"),
+            int(s.get("risk_pct", 0)),
         ])
-    ws.update("A2", values)
+    ws.update(range_name="A2", values=values)
 
 def _read_existing_hashes(ws, hash_col_letter: str) -> set[str]:
     try:
@@ -384,7 +432,6 @@ def collect_once():
 
     # CALENDAR
     ws_cal, _ = ensure_worksheet(sh, CAL_WS_OUT, CAL_HEADERS)
-    # --- CALENDAR: читаем существующие и строим ключи на нормализованном utc_iso ---
     try:
         existing = ws_cal.get_all_records()
         seen = {(_norm_iso_key(r.get("utc_iso")), (r.get("title") or "").strip()) for r in existing}
@@ -396,7 +443,7 @@ def collect_once():
         key = (_norm_iso_key(_to_utc_iso(ev.utc)), ev.title.strip())
         if key not in seen:
             new_rows.append(ev.to_row())
-            seen.add(key) # prevent duplicates in the same batch
+            seen.add(key)
 
     if new_rows:
         ws_cal.append_rows(new_rows, value_input_option="RAW")
