@@ -29,6 +29,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format="%(asctime)s %(l
 log = logging.getLogger("calendar_collector")
 
 SHEET_ID = os.getenv("SHEET_ID","").strip()
+INVESTOR_WS = (os.getenv("INVESTOR_WS","INVESTOR_DIGEST").strip() or "INVESTOR_DIGEST")
 
 CAL_WS_OUT = os.getenv("CAL_WS_OUT","CALENDAR").strip() or "CALENDAR"
 CAL_WS_RAW = os.getenv("CAL_WS_RAW","CALENDAR_RAW").strip() or "CALENDAR_RAW"
@@ -55,6 +56,9 @@ PAIR_COUNTRIES = {
     "EURUSD": {"euro area","united states"},
     "GBPUSD": {"united kingdom","united states"},
 }
+
+# emoji для рисков
+RISK_EMOJI = {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -437,6 +441,57 @@ def write_fa_signals(sh, signals: Dict[str, dict]):
         ])
     ws.update(range_name="A2", values=values)
 
+# ---------- INVESTOR_DIGEST ----------
+def _read_fa_signals_for_digest(sh) -> List[dict]:
+    """Читает лист FA_Signals как список dict'ов; если нет — возвращает пустой список."""
+    try:
+        ws = sh.worksheet("FA_Signals")
+        return ws.get_all_records()
+    except Exception:
+        return []
+
+def _build_investor_digest_text(rows: List[dict]) -> str:
+    """Строит компактную сводку по парам из FA_Signals."""
+    by_pair = {str(r.get("pair","")).upper(): r for r in rows}
+    lines = []
+    for sym in SYMBOLS:
+        r = by_pair.get(sym, {})
+        risk = str(r.get("risk","Green")).capitalize()
+        bias = str(r.get("bias","neutral")).lower()
+        reason = str(r.get("reason","")).strip()
+        dca = r.get("dca_scale", 1.0)
+        # хвост с деталями
+        tail = f" | {risk}/{bias}"
+        if reason:
+            tail += f" | {reason}"
+        try:
+            dca_val = float(dca)
+        except Exception:
+            dca_val = 1.0
+        if abs(dca_val - 1.0) > 1e-9:
+            # печатаем как 0.5 / 0.75 / 1.2 и т.п. без лишних нулей
+            dtxt = f"{dca_val:.3f}".rstrip("0").rstrip(".")
+            tail += f" | dca×{dtxt}"
+        emoji = RISK_EMOJI.get(risk, "🟢")
+        lines.append(f"• {sym}: {emoji}{tail}")
+    return "FA-сводка (aggregated):\n" + "\n".join(lines)
+
+def write_investor_digest(sh):
+    """Пишет одну запись в INVESTOR_DIGEST, если текст изменился со времени прошлой записи."""
+    ws, _ = ensure_worksheet(sh, INVESTOR_WS, ["ts_utc","text"])
+    text = _build_investor_digest_text(_read_fa_signals_for_digest(sh))
+    # проверка на дубликат: сравниваем с последней строкой (B2)
+    try:
+        last = ws.get_values("B2:B2")
+        if last and last[0] and (last[0][0] == text):
+            log.info("INVESTOR_DIGEST: unchanged")
+            return
+    except Exception:
+        pass
+    ts = _to_utc_iso(datetime.now(timezone.utc))
+    ws.insert_row([ts, text], index=2)
+    log.info("INVESTOR_DIGEST: +1 row")
+
 def _read_existing_hashes(ws, hash_col_letter: str) -> set[str]:
     try:
         rng = f"{hash_col_letter}2:{hash_col_letter}10000"
@@ -491,6 +546,11 @@ def collect_once():
     all_news = _read_news_rows(sh)
     fa = compute_fa_from_news(all_news, datetime.now(timezone.utc))
     write_fa_signals(sh, fa)
+    # INVESTOR_DIGEST: агрегированная строка на основе FA_Signals
+    try:
+        write_investor_digest(sh)
+    except Exception as e:
+        log.warning("INVESTOR_DIGEST write failed: %s", e)
     log.info("cycle done.")
 
 def main():
