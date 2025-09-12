@@ -772,24 +772,26 @@ def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
-    # Совместимый с разными версиями PTB набор аргументов:
-    req = HTTPXRequest(
-        connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "20")),
-        read_timeout=float(os.getenv("TG_READ_TIMEOUT", "60")),
-        write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "60")),
-        pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
-        # эти параметры есть во всех релизах v20.x:
-        # (если у тебя совсем старая версия — их можно убрать)
-        http_version="1.1",
-        trust_env=True,
-        # connection_pool_size есть, но если вдруг нет — просто закомментируй:
-        connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
-    )
+    # Совместимый со всеми версиями PTB (20.x) вариант:
+    try:
+        # Если класс есть — создаём без параметров (совместимо даже со старыми релизами)
+        from telegram.request import HTTPXRequest
+        req = HTTPXRequest()
+        builder = Application.builder().token(BOT_TOKEN).request(req)
+    except Exception:
+        # Если вдруг что-то не так — полагаемся на дефолтный Request внутри PTB
+        builder = Application.builder().token(BOT_TOKEN)
 
-    builder = Application.builder().token(BOT_TOKEN).request(req)
-    if _RATE_LIMITER_AVAILABLE:
+    # (опциональный) лимитер
+    try:
+        from telegram.ext import AIORateLimiter
         builder = builder.rate_limiter(AIORateLimiter())
+    except Exception:
+        pass
+
+    # пост-инициализация (команды + планировщик)
     builder = builder.post_init(_post_init)
+
     app = builder.build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -804,7 +806,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
     return app
-
+    
 # -------------------- main --------------------
 def main():
     log.info("Fund bot is running…")
