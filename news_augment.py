@@ -3,32 +3,29 @@
 
 """
 news_augment.py — дополняет лист NEWS локальными источниками под GBP/JPY:
-  • Bank of England (BoE) — GBP
+  • Bank of England (BoE) — GBP (HTML + RSS fallback)
   • Bank of Japan (BoJ) — JPY
   • Japan MoF FX (страница ссылок по интервенциям) — JPY
 
 Запускается отдельно от calendar_collector. Пишет ТОЛЬКО в лист NEWS.
-Дедупликация — по колонке hash ("source|url"), чтобы не плодить дублей.
+Дедупликация — по колонке hash ("source|url").
 
-Требуемые переменные окружения:
-  SHEET_ID                       — Google Sheet ID
-  GOOGLE_CREDENTIALS_JSON_B64    — service account creds в base64 (или GOOGLE_CREDENTIALS_JSON/GOOGLE_CREDENTIALS)
-Необязательные:
+ENV:
+  SHEET_ID
+  GOOGLE_CREDENTIALS_JSON_B64 (или GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS)
+Опционально:
   LOG_LEVEL=INFO|DEBUG
-  RUN_FOREVER=0/1                — если 1, будет крутиться в цикле
-  COLLECT_EVERY_MIN=20           — период опроса в минутах при RUN_FOREVER=1
-  NEWS_MAX_AGE_DAYS=365          — обрезка очень старых ссылок
-  JINA_PROXY=https://r.jina.ai/http/ — фолбэк-прокси на 403/404
-
-Формат NEWS:
-  ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
+  RUN_FOREVER=0/1
+  COLLECT_EVERY_MIN=20
+  NEWS_MAX_AGE_DAYS=365
+  JINA_PROXY=https://r.jina.ai/http/
 """
 
-import os, re, json, base64, time, logging
+import os, re, json, base64, time, logging, html
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta, timezone
-import html
+from urllib.parse import urljoin as _urljoin
 
 # ---- Logging ----
 logging.basicConfig(
@@ -50,7 +47,6 @@ import httpx
 UA = {"User-Agent": "Mozilla/5.0 (LPBot/1.0) news_augment"}
 
 def fetch_text(url: str, timeout: float = 20.0) -> Tuple[str, int, str]:
-    """GET с авто-редиректами. На 403/404 — пробуем Jina proxy."""
     try:
         with httpx.Client(follow_redirects=True, timeout=timeout, headers=UA) as cli:
             r = cli.get(url)
@@ -125,7 +121,7 @@ def ensure_worksheet(sh, title: str, headers: List[str]):
     for ws in sh.worksheets():
         if ws.title == title:
             try:
-                cur = ws.get_values("A1:I1") or [[]]
+                cur = ws.get_values(f"A1:{chr(ord('A')+len(headers)-1)}1") or [[]]
                 if not cur or cur[0] != headers:
                     ws.update(range_name="A1", values=[headers])
             except Exception:
@@ -164,18 +160,16 @@ class NewsItem:
         return [
             self.ts_utc.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             self.source,
-            self.title.strip(),
+            html.unescape(re.sub(r"<[^>]+>", "", self.title or "")).strip(),
             self.url.strip(),
-            self.countries.strip().lower(),
-            self.ccy.strip().upper(),
-            self.tags.strip(),
-            self.importance_guess.strip().lower(),
+            (self.countries or "").strip().lower(),
+            (self.ccy or "").strip().upper(),
+            (self.tags or "").strip(),
+            (self.importance_guess or "").strip().lower(),
             self.key_hash(),
         ]
 
 # ---- Link helpers ----
-from urllib.parse import urljoin as _urljoin
-
 _HREF_RE = re.compile(r'href\s*=\s*(["\'])([^"\']+)\1', re.I)
 
 def _iter_links(html_src: str, base: str, domain_must: Optional[str] = None) -> List[str]:
@@ -200,12 +194,11 @@ def _slug_to_title(u: str) -> str:
     s = s.strip() or u
     if len(s) < 4:
         return u
-    # Заглавные первые буквы
     return " ".join(w.capitalize() for w in s.split())
 
 # ---- Heuristics ----
 KW_HIGH = re.compile(
-    r"(monetary policy|bank rate|mpc|rate decision|policy decision|policy statement|"
+    r"(monetary policy|bank rate|mpc\b|rate decision|policy decision|policy statement|"
     r"press conference|minutes|summary of opinions|statement on monetary policy|"
     r"intervention|fx intervention)",
     re.I
@@ -217,67 +210,19 @@ def _importance_high(text: str) -> bool:
 def _boe_is_high(url: str, title: str) -> bool:
     return _importance_high(url + " " + title)
 
-# ---- Collectors ----
+# ---- BoE collectors (HTML + RSS fallback) ----
 
-def collect_boe(now: datetime) -> List[NewsItem]:
-    """
-    Bank of England:
-      1) внутренний поиск сайта (серверный HTML) — даёт стабильные ссылки
-      2) парсинг видимых разделов /news/... — вдруг что-то получится «в лоб»
-    """
+def _collect_boe_html(now: datetime) -> List[NewsItem]:
     base = "https://www.bankofengland.co.uk"
     items: List[NewsItem] = []
     seen: set[str] = set()
 
-    # 1) Внутренний поиск сайта по ключам/годам
-    search_queries = [
-        "Monetary Policy Summary 2025",
-        "Monetary Policy Committee 2025",
-        "Bank Rate Monetary Policy 2025",
-        "Monetary Policy Summary 2024",
-    ]
-
-    def _keep_boe(u: str) -> bool:
-        # Сохраняем всё релевантное политике/ставке/годам
-        if not any(p in u for p in (
-            "/monetary-policy-summary-and-minutes/",
-            "/monetary-policy/",
-            "/news/",
-            "/press/",
-            "/publication/",
-            "/speech/",
-            "/speeches/",
-        )):
-            return False
-        return bool(re.search(r"/20\d{2}\b|-20\d{2}-|\b20\d{2}\b", u))
-
-    for q in search_queries:
-        url = f"{base}/search?query=" + re.sub(r"\s+", "+", q)
-        html_src, code, final_url = fetch_text(url)
-        if code != 200 or not html_src:
-            continue
-        links = _iter_links(html_src, final_url, domain_must="bankofengland.co.uk")
-        # нормализация
-        links = [u.rstrip("/").split("?")[0] for u in links]
-        picked = [u for u in links if _keep_boe(u)]
-        log.info("news_augment: BOE site search '%s': links=%d kept=%d", q, len(links), len(picked))
-        for u in picked:
-            if u in seen:
-                continue
-            seen.add(u)
-            title = _slug_to_title(u)
-            imp = "high" if _boe_is_high(u, title) else "medium"
-            items.append(NewsItem(now, "BOE_PR", title, u, "united kingdom", "GBP", "boe", imp))
-
-    # 2) Разделы /news/... — иногда в HTML есть прямые <a>, иногда нет (JS). Пробуем всё равно.
+    # Секции /news/... — иногда пусто (JS-рендер), но попробуем
     sections = [
-        "/news/news",
-        "/news/publications",
-        "/news/speeches",
-        "/news/statistics",
-        "/news/prudential-regulation",
-        "/news/upcoming",
+        "/news/news", "/news/publications", "/news/speeches",
+        "/news/statistics", "/news/prudential-regulation", "/news/upcoming",
     ]
+    year_pat = re.compile(r"/20\d{2}\b|-20\d{2}-|\b20\d{2}\b")
     for path in sections:
         for p in ("", "?page=2", "?page=3"):
             url = base + path + p
@@ -285,8 +230,7 @@ def collect_boe(now: datetime) -> List[NewsItem]:
             if code != 200 or not html_src:
                 continue
             links = _iter_links(html_src, final_url, domain_must="bankofengland.co.uk")
-            # оставляем только материалы 20xx
-            picked = [u for u in links if re.search(r"/20\d{2}\b|-20\d{2}-|\b20\d{2}\b", u)]
+            picked = [u for u in links if "/news/" in u and year_pat.search(u)]
             log.info("news_augment: BOE list %s: anchors=%d kept=%d", url, len(links), len(picked))
             for u in picked:
                 if u in seen:
@@ -295,29 +239,105 @@ def collect_boe(now: datetime) -> List[NewsItem]:
                 title = _slug_to_title(u)
                 imp = "high" if _boe_is_high(u, title) else "medium"
                 items.append(NewsItem(now, "BOE_PR", title, u, "united kingdom", "GBP", "boe", imp))
+    return items
 
+def _parse_rss_datetime(v: str) -> Optional[datetime]:
+    # Пробуем стандартные RSS pubDate форматы
+    try:
+        # Примеры: "Fri, 12 Sep 2025 09:30:00 GMT"
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _collect_boe_rss() -> List[NewsItem]:
+    """
+    Надёжный фолбэк: официальные RSS фиды BoE.
+    Известные коды:
+      N  — News
+      P  — Publications
+      S  — Speeches
+      PR — Prudential Regulation
+      ST — Statistics
+      E  — Events
+    """
+    now = datetime.now(timezone.utc)
+    base = "https://www.bankofengland.co.uk/boeapps/rss/Feeds.aspx?FeedCode="
+    feeds = ["N", "P", "S", "PR", "ST", "E"]
+    out: List[NewsItem] = []
+
+    for code in feeds:
+        url = base + code
+        xml, status, final = fetch_text(url)
+        if status != 200 or not xml:
+            log.info("news_augment: BOE RSS %s: status=%s size=%d", code, status, len(xml or ""))
+            continue
+        # Парсим RSS 2.0 без строгих namespace — через regex + простые теги
+        # Берём title, link, pubDate
+        items = re.findall(
+            r"<item[\s\S]*?<title>([\s\S]*?)</title>[\s\S]*?<link>([\s\S]*?)</link>[\s\S]*?(?:<pubDate>([\s\S]*?)</pubDate>)?",
+            xml, re.I
+        )
+        log.info("news_augment: BOE RSS %s: items=%d", code, len(items))
+        for t, lnk, pd in items:
+            title = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", t)).strip())
+            lnk = html.unescape(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", lnk)).strip())
+            if not lnk.startswith("http"):
+                lnk = _urljoin("https://www.bankofengland.co.uk/", lnk)
+            ts = _parse_rss_datetime((pd or "").strip()) or now
+            imp = "high" if _boe_is_high(lnk, title) else "medium"
+            out.append(NewsItem(ts, "BOE_PR", title or _slug_to_title(lnk), lnk,
+                                "united kingdom", "GBP", "boe", imp))
+    return out
+
+def collect_boe(now: datetime) -> List[NewsItem]:
+    items_html = _collect_boe_html(now)
+    if items_html:
+        log.info("news_augment: BOE HTML collected: %d", len(items_html))
+    else:
+        log.info("news_augment: BOE HTML empty — trying RSS")
+    items_rss = _collect_boe_rss()
+    total = {}
+
+    # дедуп по URL
+    for it in items_html + items_rss:
+        key = it.url.rstrip("/").lower()
+        if key not in total:
+            total[key] = it
+
+    items = list(total.values())
+    # отфильтруем совсем уж нерелевантные к политике/ставке — но оставим всё из /news/
+    def _keep(it: NewsItem) -> bool:
+        u = it.url.lower()
+        t = (it.title or "").lower()
+        if "/news/" in u:
+            return True
+        return any(k in (u + " " + t) for k in [
+            "monetary-policy", "bank-rate", "mpc", "monetary policy", "minutes", "summary"
+        ])
+
+    items = [x for x in items if _keep(x)]
     log.info("news_augment: BOE collected total: %d", len(items))
     return items
 
+# ---- BoJ ----
+
 def collect_boj(now: datetime) -> List[NewsItem]:
-    """
-    Bank of Japan: две витрины — решения/заявления и расписания/мнения/протоколы.
-    """
     items: List[NewsItem] = []
 
-    # Monetary Policy Releases (решения, заявления, списки по годам)
     url1 = "https://www.boj.or.jp/en/mopo/mpmdeci/index.htm"
     html1, code1, u1 = fetch_text(url1)
     if code1 == 200 and html1:
         links1 = _iter_links(html1, u1, domain_must="boj.or.jp")
-        # отфильтруем только /mopo/mpmdeci/…
         links1 = [u for u in links1 if "/mopo/mpmdeci/" in u]
         for u in links1:
             title = _slug_to_title(u)
             imp = "high" if _importance_high(title + " " + u) else "medium"
             items.append(NewsItem(now, "BOJ_PR", title, u, "japan", "JPY", "boj mpm", imp))
 
-    # Schedule/Minutes/Opinions
     url2 = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
     html2, code2, u2 = fetch_text(url2)
     if code2 == 200 and html2:
@@ -328,29 +348,20 @@ def collect_boj(now: datetime) -> List[NewsItem]:
             imp = "high" if _importance_high(title + " " + u) else "medium"
             items.append(NewsItem(now, "BOJ_PR", title, u, "japan", "JPY", "boj mpm", imp))
 
-    # нормализуем/дедупим, оставим только наиболее релевантные (mps/mpm/statement/minutes/opinion/…)
-    def _boost(u: str, t: str) -> bool:
-        return any(k in (u + " " + t).lower() for k in [
-            "mpr_", "state_", "k20", "statement", "minutes", "opinion",
-            "mpr_202", "state_202", "mpmdeci", "mpmsche_minu",
-        ])
-
+    # дедуп + усиление релевантности
     dedup = {}
     for it in items:
         key = it.url.rstrip("/").lower()
-        if key not in dedup and _boost(it.url, it.title):
+        if key not in dedup and any(k in (it.url + " " + it.title).lower() for k in
+                                    ["mpr_", "state_", "statement", "minutes", "opinion", "mpmdeci", "mpmsche_minu"]):
             dedup[key] = it
-
     items = list(dedup.values())
     log.info("news_augment: BoJ collected: %d", len(items))
     return items
 
+# ---- Japan MoF FX ----
+
 def collect_mof_fx(now: datetime) -> List[NewsItem]:
-    """
-    Japan MoF FX — справочная страница с историей интервенций.
-    У MOF часто гуляют пути и падают в 404. Пробуем оба базовых URL.
-    Если доступно — фиксируем ссылку как high.
-    """
     candidates = [
         "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/",
         "https://www.mof.go.jp/policy/international_policy/reference/foreign_exchange_intervention/",
@@ -372,21 +383,15 @@ def append_news_rows(sh, items: List[NewsItem]) -> int:
         return 0
     ws, _ = ensure_worksheet(sh, "NEWS", NEWS_HEADERS)
     existing_hash = _read_existing_hashes(ws, "I")
-    rows = [n.to_row() for n in items if n.key_hash() not in existing_hash]
 
-    # обрезаем по давности, чтобы мусорные старые ссылки не тащить
+    # отсечём по давности (по ts_utc самого айтема — у RSS это pubDate)
     cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_MAX_AGE_DAYS)
-    rows = [r for r in rows if _parse_iso_ts(r[0]) >= cutoff]
+    rows = [n.to_row() for n in items
+            if n.key_hash() not in existing_hash and n.ts_utc >= cutoff]
 
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
     return len(rows)
-
-def _parse_iso_ts(s: str) -> datetime:
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
 
 # ---- Main ----
 
@@ -401,16 +406,15 @@ def collect_once():
 
     now = datetime.now(timezone.utc)
 
-    # Сбор по источникам
     boe = collect_boe(now)
     boj = collect_boj(now)
     mof = collect_mof_fx(now)
 
     all_items = boe + boj + mof
-    log.info("news_augment: augment collected: %d new candidates", len(all_items))
+    log.info("news_augment: news_augment: augment collected: %d new candidates", len(all_items))
 
     added = append_news_rows(sh, all_items)
-    log.info("news_augment: NEWS augment: +%d rows", added)
+    log.info("news_augment: news_augment: NEWS augment: +%d rows", added)
 
 def main():
     if RUN_FOREVER:
@@ -424,6 +428,5 @@ def main():
     else:
         collect_once()
 
-# ---- Utils (if run as script) ----
 if __name__ == "__main__":
     main()
