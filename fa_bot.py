@@ -72,7 +72,7 @@ except Exception:
 
 # -------------------- ЛОГИ --------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL","INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("fund_bot")
@@ -99,6 +99,21 @@ LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-5").strip()
 LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or "30000")
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
+
+# --- Рекомендации по весам (ENV) ---
+RECO_ENABLED            = (os.getenv("RECO_ENABLED","1").lower() in ("1","true","yes","on"))
+RECO_MIN_PERSIST_MIN   = int(os.getenv("RECO_MIN_PERSIST_MIN","120") or "120")  # риск Amber/Red держится не меньше
+RECO_COOLDOWN_MIN      = int(os.getenv("RECO_COOLDOWN_MIN","360") or "360")      # не спамить чаще
+RECO_POLL_MIN          = int(os.getenv("RECO_POLL_MIN","10") or "10")            # как часто проверять
+RECO_MIN_SHIFT_PCT     = float(os.getenv("RECO_MIN_SHIFT_PCT","0.06") or "0.06")# суммарное отклонение весов
+RECO_MULT_GREEN        = float(os.getenv("RECO_MULT_GREEN","1.0") or "1.0")
+RECO_MULT_AMBER        = float(os.getenv("RECO_MULT_AMBER","0.90") or "0.90")
+RECO_MULT_RED          = float(os.getenv("RECO_MULT_RED","0.75") or "0.75")
+RECO_TRACK_WS          = os.getenv("RECO_TRACK_WS","FA_Reco_Track").strip() or "FA_Reco_Track"
+
+# сопоставление актив ↔ пара
+ASSET_BY_PAIR = {"USDJPY":"JPY","AUDUSD":"AUD","EURUSD":"EUR","GBPUSD":"GBP"}
+PAIR_BY_ASSET = {"JPY":"USDJPY","AUD":"AUDUSD","EUR":"EURUSD","GBP":"GBPUSD"}
 
 # --- Названия листов с логами по парам (переопределяются через ENV) ---
 BMR_SHEETS = {
@@ -218,6 +233,27 @@ def append_row(sh, title: str, row: list):
     ws, _ = ensure_worksheet(sh, title)
     ws.append_row(row, value_input_option="RAW")
 
+def _set_bank_target_in_bmr(sh, symbol: str, amount: float):
+    """Обновляет Bank_Target_USDT в листе BMR_DCA_* для пары symbol."""
+    sheet_name = BMR_SHEETS.get(symbol)
+    if not sheet_name:
+        return
+    ws = sh.worksheet(sheet_name)
+    hdr = ws.row_values(1)
+    if "Bank_Target_USDT" not in hdr:
+        return
+    col = hdr.index("Bank_Target_USDT") + 1
+
+    # найдём последнюю реально заполненную строку (минимум 2)
+    vals = ws.get_all_values()
+    last = len(vals)
+    while last > 1 and not any((c or "").strip() for c in vals[last-1]):
+        last -= 1
+    row_ix = max(2, last)  # пишем в последнюю непустую строку
+
+    ws.update_cell(row_ix, col, float(amount))
+
+
 # --- helpers: Google Sheets → FA/NEWS -------------------------------------------------
 def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
@@ -335,6 +371,179 @@ def _h(x) -> str:
 
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
+
+# ---- helpers: рекомендации по весам -----------------------------------------
+def _normalize_int_weights(weight_floats: Dict[str, float], keep_total: int) -> Dict[str, int]:
+    # округляем так, чтобы сумма осталась неизменной
+    floors = {k: int(v) for k, v in weight_floats.items()}
+    diff = keep_total - sum(floors.values())
+    if diff == 0:
+        return floors
+    # распределяем по убыванию дробной части
+    fracs = sorted(((k, weight_floats[k] - floors[k]) for k in floors), key=lambda x: x[1], reverse=True)
+    i = 0
+    step = 1 if diff > 0 else -1
+    diff = abs(diff)
+    while diff > 0 and fracs:
+        k, _ = fracs[i % len(fracs)]
+        floors[k] += step
+        diff -= 1
+        i += 1
+    return floors
+
+def _reco_multipliers_for_pair_risk(risk: str) -> float:
+    r = (risk or "Green").capitalize()
+    return RECO_MULT_RED if r == "Red" else RECO_MULT_AMBER if r == "Amber" else RECO_MULT_GREEN
+
+def compute_recommended_weights(cur: Dict[str,int], fa_sheet: Dict[str,dict]) -> Dict[str,int]:
+    total = max(sum(cur.values()), 1)
+    # применяем множители к весам по активам согласно риску по соответствующим парам
+    floated = {}
+    for asset, w in cur.items():
+        pair = PAIR_BY_ASSET.get(asset)
+        risk = (fa_sheet.get(pair, {}) or {}).get("risk", "Green")
+        m = _reco_multipliers_for_pair_risk(risk)
+        floated[asset] = w * m
+    # нормируем к той же сумме и округляем
+    norm_sum = sum(floated.values()) or 1.0
+    rescaled = {k: (v / norm_sum) * total for k, v in floated.items()}
+    return _normalize_int_weights(rescaled, total)
+
+def _weights_shift_pct(a: Dict[str,int], b: Dict[str,int]) -> float:
+    total = max(sum(a.values()), 1)
+    delta = sum(abs(a.get(k,0) - b.get(k,0)) for k in {"JPY","AUD","EUR","GBP"})
+    return delta / total
+
+def _fmt_age(mins: int) -> str:
+    h, m = divmod(max(0, mins), 60)
+    return f"{h}ч{m:02d}м"
+
+def _load_reco_track(sh):
+    # headers: pair,risk,started_at,last_seen,announced_at
+    headers = ["pair","risk","started_at","last_seen","announced_at"]
+    ws, _ = ensure_worksheet(sh, RECO_TRACK_WS)
+    try:
+        rows = ws.get_all_records()
+    except Exception:
+        rows = []
+    d = {}
+    for r in rows:
+        p = str(r.get("pair","")).upper()
+        if not p: 
+            continue
+        d[p] = {
+            "risk": str(r.get("risk","")).capitalize(),
+            "started_at": str(r.get("started_at","")).strip(),
+            "last_seen": str(r.get("last_seen","")).strip(),
+            "announced_at": str(r.get("announced_at","")).strip(),
+        }
+    # гарантируем заголовки
+    try:
+        ws.update("A1", [headers])
+    except Exception:
+        pass
+    return ws, d
+
+def _save_reco_track(ws, d: Dict[str,dict]):
+    order = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
+    out = []
+    for p in order:
+        row = d.get(p, {})
+        out.append([
+            p,
+            row.get("risk",""),
+            row.get("started_at",""),
+            row.get("last_seen",""),
+            row.get("announced_at",""),
+        ])
+    ws.update("A2", out)
+
+async def _maybe_send_reco_message(app, sh, fa_sheet: Dict[str,dict]):
+    if not RECO_ENABLED or not MASTER_CHAT_ID:
+        return
+    now = datetime.now(timezone.utc)
+    ws, track = _load_reco_track(sh)
+    changed = False
+    # обновляем трекинг
+    for pair in SYMBOLS:
+        risk = (fa_sheet.get(pair, {}) or {}).get("risk","Green").capitalize()
+        t = track.get(pair, {})
+        if risk in ("Amber","Red"):
+            if not t or t.get("risk") != risk or not t.get("started_at"):
+                t = {
+                    "risk": risk,
+                    "started_at": now.isoformat(timespec="seconds")+"Z",
+                    "last_seen":  now.isoformat(timespec="seconds")+"Z",
+                    "announced_at": t.get("announced_at",""),
+                }
+            else:
+                t["risk"] = risk
+                t["last_seen"] = now.isoformat(timespec="seconds")+"Z"
+            track[pair] = t
+            changed = True
+        else:
+            # сбрасываем, когда риск зелёный
+            if pair in track:
+                track[pair] = {"risk":"Green","started_at":"","last_seen":now.isoformat(timespec="seconds")+"Z","announced_at":""}
+                changed = True
+    if changed:
+        _save_reco_track(ws, track)
+
+    # выбираем пары, где риск держится достаточно долго и не было рассылки/кулдаун прошёл
+    reasons = []
+    min_ok = RECO_MIN_PERSIST_MIN
+    cd_min = RECO_COOLDOWN_MIN
+    for pair, row in track.items():
+        if row.get("risk") not in ("Amber","Red") or not row.get("started_at"):
+            continue
+        try:
+            start = datetime.fromisoformat(row["started_at"].replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        age_min = int((now - start).total_seconds() // 60)
+        if age_min < min_ok:
+            continue
+        # кулдаун
+        announced_ok = True
+        if row.get("announced_at"):
+            try:
+                ann = datetime.fromisoformat(row["announced_at"].replace("Z","+00:00")).astimezone(timezone.utc)
+                announced_ok = (now - ann).total_seconds() >= cd_min*60
+            except Exception:
+                announced_ok = True
+        if not announced_ok:
+            continue
+        reasons.append((pair, row.get("risk"), age_min))
+
+    if not reasons:
+        return
+
+    # считаем рекомендацию и проверяем порог отличия
+    cur_w = STATE["weights"].copy()
+    reco_w = compute_recommended_weights(cur_w, fa_sheet)
+    if _weights_shift_pct(cur_w, reco_w) < RECO_MIN_SHIFT_PCT:
+        return
+
+    # собираем текст
+    rr = ", ".join([f"{p} — {r} ({_fmt_age(m)})" for p, r, m in reasons])
+    cmd = f"/setweights jpy={reco_w['JPY']} aud={reco_w['AUD']} eur={reco_w['EUR']} gbp={reco_w['GBP']}"
+    text = (
+        "⚖️ Рекомендация по весам (риск>2ч)\n"
+        f"Текущие: {human_readable_weights(cur_w)}\n"
+        f"Рекомендованные: {human_readable_weights(reco_w)}\n"
+        f"Команда, если согласен: {cmd}\n"
+        f"Основание: {rr}"
+    )
+    try:
+        await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=text)
+        # фиксируем рассылку
+        now_iso = now.isoformat(timespec="seconds")+"Z"
+        for pair, _, _ in reasons:
+            track[pair]["announced_at"] = now_iso
+        _save_reco_track(ws, track)
+    except Exception as e:
+        log.warning("reco notify failed: %s", e)
+
 
 def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, float]:
     s = max(sum(weights.values()), 1)
@@ -483,6 +692,13 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             log.warning("append_row alloc failed: %s", e)
+        
+        # автозапись целевых банков в листы BMR_DCA_*
+        try:
+            for sym, amt in alloc.items():
+                _set_bank_target_in_bmr(sh, sym, amt)
+        except Exception as e:
+            log.warning("auto write BMR failed: %s", e)
 
 # ---------- Вспомогательные для «инвесторского» дайджеста ----------
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
@@ -657,6 +873,8 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for chunk in _split_for_tg_html(msg, 3500):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
+        # после дайджеста — проверить, не пора ли рекомендовать веса
+        await _maybe_send_reco_message(context.application, sh, fa_sheet)
     except Exception as e:
         log.exception("Ошибка сборки дайджеста")
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
@@ -683,12 +901,19 @@ def sheets_diag_text() -> str:
             return f"Sheets: ❌ (open ok, ws error: {e})"
 
 async def _diag_news_line() -> str:
+    # простое чтение NEWS без внешних зависимостей
+    def _read_news_rows_simple(sh) -> list[dict]:
+        try:
+            ws = sh.worksheet("NEWS")
+            return ws.get_all_records()
+        except Exception:
+            return []
     try:
         sh, _ = build_sheets_client(SHEET_ID)
         if not sh:
             return "NEWS: ❌ Sheets недоступен"
-        rows = read_news_rows(sh)
-        return f"NEWS: ✅ {len(rows)} строк в листе NEWS; окно {DIGEST_NEWS_LOOKBACK_MIN} мин."
+        rows = _read_news_rows_simple(sh)
+        return f"NEWS: ✅ {len(rows)} строк в листе NEWS; TTL {NEWS_TTL_MIN} мин."
     except Exception as e:
         return f"NEWS: ❌ ошибка: {e}"
 
@@ -782,6 +1007,8 @@ async def morning_digest_scheduler(app: Application):
                 msg = build_digest_text(sh, fa_sheet_data)
                 for chunk in _split_for_tg_html(msg):
                     await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
+                # и тут тоже: после утреннего дайджеста проверим рекомендацию
+                await _maybe_send_reco_message(app, sh, fa_sheet_data)
             else:
                 await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
         except Exception as e:
@@ -790,9 +1017,25 @@ async def morning_digest_scheduler(app: Application):
             except Exception:
                 pass
 
+async def reco_watch_scheduler(app: Application):
+    # фоновый наблюдатель каждые RECO_POLL_MIN минут
+    if not RECO_ENABLED:
+        return
+    import asyncio as _asyncio
+    while True:
+        try:
+            sh, _ = build_sheets_client(SHEET_ID)
+            if sh:
+                fa = _read_fa_signals_from_sheet(sh)
+                await _maybe_send_reco_message(app, sh, fa)
+        except Exception:
+            log.exception("reco_watch iteration failed")
+        await _asyncio.sleep(max(60, RECO_POLL_MIN*60))
+
 async def _post_init(app: Application):
     await _set_bot_commands(app)
     app.create_task(morning_digest_scheduler(app))
+    app.create_task(reco_watch_scheduler(app))
 
 def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
