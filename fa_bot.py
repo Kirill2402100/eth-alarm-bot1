@@ -21,11 +21,10 @@ from telegram.ext import (
 
 # --- Таймзона ---
 try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-except Exception:  # pragma: no cover
+    from zoneinfo import ZoneInfo
+except Exception:
     ZoneInfo = None
-
-LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else None
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ","Europe/Belgrade")) if ZoneInfo else None
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
 
@@ -294,27 +293,45 @@ def _pick_pair_top_news(sh, pair: str, lookback_hours: int = int(os.getenv("DIGE
         return None
     pref = PAIR_PREF.get(pair, {"sources": set(), "countries": set(), "ccy": set()})
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    # 1) профильные источники
+    # 1) профильные источники (importance=high)
     for r in reversed(rows):
         try:
             ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
         except Exception:
             continue
-        if ts < cutoff: break
-        if str(r.get("importance_guess","")).lower() != "high": continue
+        if ts < cutoff:
+            continue
+        if str(r.get("importance_guess","high")).lower() != "high":
+            continue
         if str(r.get("source","")).strip().upper() in pref["sources"]:
             return {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip(), "url": str(r.get("url","")).strip()}
-    # 2) совпадение стран/валют
+    # 2) совпадение стран/валют (importance=high)
     for r in reversed(rows):
         try:
             ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z","+00:00")).astimezone(timezone.utc)
         except Exception:
             continue
-        if ts < cutoff: break
-        if str(r.get("importance_guess","")).lower() != "high": continue
+        if ts < cutoff:
+            continue
+        if str(r.get("importance_guess","high")).lower() != "high":
+            continue
         ctry = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
         ccy  = str(r.get("ccy","")).strip().upper()
         if (ctry & pref["countries"]) or (ccy and ccy in pref["ccy"]):
+            return {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip(), "url": str(r.get("url","")).strip()}
+    # 3) запасной круг: берём medium, если high не нашлось
+    for r in reversed(rows):
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        if str(r.get("importance_guess","")).lower() != "medium":
+            continue
+        ctry = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
+        ccy  = str(r.get("ccy","")).strip().upper()
+        if (ctry & pref["countries"]) or (ccy and ccy in pref["ccy"]) or (str(r.get("source","")).strip().upper() in pref["sources"]):
             return {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip(), "url": str(r.get("url","")).strip()}
     return None
 
@@ -346,7 +363,6 @@ def _pick_pair_top_calendar(sh, pair: str, horizon_hours: int = 96) -> Optional[
             if (best is None) or (abs((ts - now).total_seconds()) < abs((best["ts"] - now).total_seconds())):
                 best = {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip() or "CAL", "url": str(r.get("url","")).strip()}
     return best
-
 
 # ---------- NEWS (READ FROM SHEET) ----------
 NEWS_WS = os.getenv("NEWS_WS", "NEWS").strip() or "NEWS"
@@ -417,32 +433,6 @@ def _ru_title_hint(title: str) -> str:
     for pat, rep in repl.items():
         t = re.sub(pat, rep, t, flags=re.I)
     return t
-
-def choose_top_news_for_symbol(symbol: str, news_rows: List[dict], now_utc: datetime) -> Optional[dict]:
-    look_from = now_utc - timedelta(minutes=DIGEST_NEWS_LOOKBACK_MIN)
-    countries = set(PAIR_COUNTRIES.get(symbol, []))
-    cand = []
-    for r in news_rows:
-        if r["ts"] < look_from:
-            continue
-        if not (r["countries"] & countries):
-            continue
-        score = 0
-        if r["source"] in DIGEST_NEWS_ALLOWED_SOURCES: score += 2
-        if DIGEST_NEWS_KEYWORDS.search(r["title"] + " " + r["tags"]): score += 3
-        if r["importance"] == "high": score += 1
-        age_min = max(1, int((now_utc - r["ts"]).total_seconds() // 60))
-        score += max(0, 3 - age_min//60)
-        r["_score"] = score
-        cand.append(r)
-    if not cand:
-        return None
-    cand.sort(key=lambda x: (x["_score"], x["ts"]), reverse=True)
-    best = cand[0]
-    best_local = best["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else best["ts"]
-    best["local_time_str"] = best_local.strftime("%H:%M")
-    best["ru_title"] = _ru_title_hint(best["title"])
-    return best
 
 # -------------------- УТИЛИТЫ --------------------
 def _h(x) -> str:
@@ -719,7 +709,7 @@ def render_symbol_block(symbol: str, row: dict, fa_data: dict, sh, top_news: Opt
     lines.append(f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve_on_str}; dca_scale <b>{dca_scale:.2f}</b>.")
     
     if top_news:
-        lines.append(f"•\tТоп-новость: {_to_local_hhmm(top_news['ts'])} — {_h(top_news['title'])} ({_h(top_news['source'])}).")
+        lines.append(f"• Топ-новость: {_to_local_hhmm(top_news['ts'])} — {_h(top_news['title'])} ({_h(top_news['source'])}).")
 
     lines.append(f"•\tЧто это значит для цены: {what_means}")
     lines.append(f"•\tПлан vs факт по банку: {plan_fact}.")
@@ -770,7 +760,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"LLM ошибка: {e}")
         return
 
-    sh, _src = build_sheets_client(SHEET_ID)
+    sh = await get_sheets()
     if not sh:
         await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
         return
