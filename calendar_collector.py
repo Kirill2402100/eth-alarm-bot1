@@ -1,4 +1,25 @@
 # calendar_collector.py — собирает CALENDAR и NEWS в Google Sheets
+# Требуемые ENV:
+#   SHEET_ID                         — id таблицы
+#   GOOGLE_CREDENTIALS_JSON_B64     — service-account JSON в base64 (или GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS)
+#   LOCAL_TZ                         — локальная TZ (по умолчанию Europe/Belgrade)
+#   RUN_FOREVER=1|0                  — крутиться в цикле (по умолчанию 1)
+#   COLLECT_EVERY_MIN                — период цикла (мин), дефолт 20
+#   FREE_LOOKBACK_DAYS               — календарь: сколько дней назад держим события (дефолт 7)
+#   FREE_LOOKAHEAD_DAYS              — календарь: сколько дней вперёд собираем (дефолт 30)
+#   FA_NEWS_SOURCES                  — разрешённые источники новостей (CSV), дефолт: US_FED_PR,ECB_PR,BOE_PR,BOJ_PR,RBA_MR,US_TREASURY,JP_MOF_FX
+#   FA_NEWS_KEYWORDS                 — ключевые слова релевантности (regex, insensitive)
+#   FA_NEWS_RECENT_MIN               — окно «свежих» новостей для FA (мин), дефолт 30
+#   FA_NEWS_MIN_COUNT                — порог «красного» статуса на пару, дефолт 2
+#   FA_NEWS_LOCK_MIN                 — lock-минут при amber/red, дефолт 30
+#   FA_NEWS_TTL_MIN                  — TTL для FA_Signals (мин), дефолт 120
+#   NEWS_MAX_AGE_DAYS                — отсечка древних новостей (дефолт 90)
+#   JINA_PROXY                       — прокси для 403/404 (дефолт https://r.jina.ai/http/)
+#
+# Создаются/обновляются листы:
+#   CALENDAR (utc_iso, local_time, country, currency, title, impact, source, url)
+#   NEWS     (ts_utc, source, title, url, countries, ccy, tags, importance_guess, hash)
+#   FA_Signals (pair, risk, bias, ttl, updated_at, scan_lock_until, reserve_off, dca_scale, reason, risk_pct)
 
 import os, re, json, base64, time, logging
 from dataclasses import dataclass
@@ -29,10 +50,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"), format="%(asctime)s %(l
 log = logging.getLogger("calendar_collector")
 
 SHEET_ID = os.getenv("SHEET_ID","").strip()
-INVESTOR_WS = (os.getenv("INVESTOR_WS","INVESTOR_DIGEST").strip() or "INVESTOR_DIGEST")
 
 CAL_WS_OUT = os.getenv("CAL_WS_OUT","CALENDAR").strip() or "CALENDAR"
-CAL_WS_RAW = os.getenv("CAL_WS_RAW","CALENDAR_RAW").strip() or "CALENDAR_RAW"
+CAL_WS_RAW = os.getenv("CAL_WS_RAW","CALENDAR_RAW").strip() or "CALENDAR_RAW"   # зарезервировано, пока не используем
 
 RUN_FOREVER = (os.getenv("RUN_FOREVER","1").lower() in ("1","true","yes","on"))
 COLLECT_EVERY_MIN = int(os.getenv("COLLECT_EVERY_MIN","20") or "20")
@@ -42,8 +62,19 @@ FREE_LOOKAHEAD_DAYS = int(os.getenv("FREE_LOOKAHEAD_DAYS","30") or "30")
 
 JINA_PROXY = os.getenv("JINA_PROXY","https://r.jina.ai/http/").rstrip("/") + "/"
 
-ALLOWED_SOURCES = {s.strip().upper() for s in os.getenv("FA_NEWS_SOURCES","US_FED_PR,ECB_PR,BOE_PR,BOJ_PR,RBA_MR,US_TREASURY,JP_MOF_FX").split(",") if s.strip()}
-KW_RE = re.compile(os.getenv("FA_NEWS_KEYWORDS","rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|intervention|FX intervention|press conference"), re.I)
+# КЛЮЧЕВЫЕ СЛОВА синхронизированы с fa_bot.py (расширено: policy statement(s), cash rate, fomc/mpc и т.д.)
+KW_RE = re.compile(os.getenv(
+    "FA_NEWS_KEYWORDS",
+    "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
+    "intervention|FX intervention|press conference|policy statement|policy statements|"
+    "rate statement|cash rate|fomc|mpc"
+), re.I)
+
+ALLOWED_SOURCES = {s.strip().upper() for s in os.getenv(
+    "FA_NEWS_SOURCES",
+    "US_FED_PR,ECB_PR,BOE_PR,BOJ_PR,RBA_MR,US_TREASURY,JP_MOF_FX"
+).split(",") if s.strip()}
+
 FA_NEWS_RECENT_MIN = int(os.getenv("FA_NEWS_RECENT_MIN","30"))
 FA_NEWS_MIN_COUNT  = int(os.getenv("FA_NEWS_MIN_COUNT","2"))
 FA_NEWS_LOCK_MIN   = int(os.getenv("FA_NEWS_LOCK_MIN","30"))
@@ -56,9 +87,6 @@ PAIR_COUNTRIES = {
     "EURUSD": {"euro area","united states"},
     "GBPUSD": {"united kingdom","united states"},
 }
-
-# emoji для рисков
-RISK_EMOJI = {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -113,7 +141,6 @@ def _localize(dt: datetime) -> datetime:
     return dt.astimezone(LOCAL_TZ) if LOCAL_TZ else dt
 
 def _norm_iso_key(v: str) -> str:
-    import re
     s = str(v or "").strip()
     s = s.replace(" ", "T").replace("Z", "+00:00")
     s = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', s)
@@ -124,12 +151,12 @@ def _norm_iso_key(v: str) -> str:
         return s
 
 # -------- HTTP --------
-def fetch_text(url: str, timeout=15.0) -> tuple[str,int,str]:
+def fetch_text(url: str, timeout=20.0) -> tuple[str,int,str]:
     try:
         with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent":"Mozilla/5.0 (LPBot/1.0)"}) as cli:
             r = cli.get(url)
             if r.status_code in (403,404):
-                pr = cli.get(JINA_PROXY + url.replace("://", "://"))
+                pr = cli.get(JINA_PROXY + url)
                 return pr.text, pr.status_code, str(pr.url)
             return r.text, r.status_code, str(r.url)
     except Exception as e:
@@ -137,10 +164,9 @@ def fetch_text(url: str, timeout=15.0) -> tuple[str,int,str]:
         return "", 0, url
 
 def _html_to_text(s: str) -> str:
-    """Грубое, но очень устойчивое «выковыривание» текста из HTML."""
+    """Грубое, но устойчивое «выковыривание» текста из HTML."""
     if not s:
         return ""
-    # убираем теги и сжимаем пробелы/переносы
     s = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", s, flags=re.I)
     s = re.sub(r"<[^>]+>", " ", s)
     s = _html.unescape(s)
@@ -165,7 +191,7 @@ class CalEvent:
 CAL_HEADERS  = ["utc_iso","local_time","country","currency","title","impact","source","url"]
 NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
 
-# -------- Calendar parsers (миним.) --------
+# -------- Calendar parsers --------
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
     """
     Страница FOMC часто меняет верстку. Делаем устойчиво:
@@ -174,30 +200,32 @@ def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
     3) берем ПЕРВЫЙ день интервала как ориентир (14:00Z)
     """
     text = _html_to_text(html)
-    # Sep / September и т.п. + день (иногда диапазон) + год
     pat = re.compile(
         r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
         r"Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
         r"(\d{1,2})(?:\s*[–—\-]\s*(\d{1,2}))?,\s*(20\d{2})",
         re.I
     )
-
     out: List[CalEvent] = []
     for m in pat.finditer(text):
-        mon_s, d1_s, d2_s, y_s = m.group(1), m.group(2), m.group(3), m.group(4)
+        mon_s, d1_s, _d2_s, y_s = m.group(1), m.group(2), m.group(3), m.group(4)
         month = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,
                  "sep":9,"oct":10,"nov":11,"dec":12}[mon_s.lower()[:3]]
         day = int(d1_s)
         year = int(y_s)
-        dt = datetime(year, month, day, 14, 0, 0, tzinfo=timezone.utc)
-        out.append(CalEvent(
-            utc=dt, country="united states", currency="USD",
-            title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
-        ))
+        try:
+            dt = datetime(year, month, day, 14, 0, 0, tzinfo=timezone.utc)
+            out.append(CalEvent(
+                utc=dt, country="united states", currency="USD",
+                title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
+            ))
+        except Exception:
+            continue
     # дедуп по дате
     uniq = {}
     for ev in out:
-        uniq[ev.utc.date()] = ev
+        if 2000 <= ev.utc.year <= 2100:
+            uniq[ev.utc.date()] = ev
     return list(uniq.values())
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
@@ -206,7 +234,6 @@ def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
     """
     text = _html_to_text(html)
     out: List[CalEvent] = []
-
     for m in re.finditer(r"(20\d{2})[./-]\s?(\d{1,2})[./-]\s?(\d{1,2})", text):
         try:
             y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -217,8 +244,6 @@ def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
             ))
         except Exception:
             continue
-
-    # дедуп по дате и отсечка странных лет
     uniq = {}
     for ev in out:
         if 2000 <= ev.utc.year <= 2100:
@@ -234,15 +259,20 @@ def collect_calendar() -> List[CalEvent]:
         f = parse_fomc_calendar(txt, f_url)
         log.info("FOMC parsed: %d", len(f))
         events += f
+    else:
+        log.warning("FOMC fetch error: code=%s", code)
 
     url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
-    txt, code, f_url = fetch_text(url_boj)
+    txt, code, b_url = fetch_text(url_boj)
     if code:
-        b = parse_boj_calendar(txt, f_url)
+        b = parse_boj_calendar(txt, b_url)
         log.info("BoJ parsed: %d", len(b))
         events += b
+    else:
+        log.warning("BoJ fetch error: code=%s", code)
 
-    # (ECB/BoE оставляем заглушкой)
+    # (ECB/BoE — оставлены как заглушка. При необходимости добавим отдельные расписания.)
+
     return events
 
 # -------- NEWS scrapers --------
@@ -279,11 +309,12 @@ class NewsItem:
 def collect_news() -> List[NewsItem]:
     """
     Собираем только релевант:
-    - Fed: ссылки вида /newsevents/pressreleases/20xx-press-*.htm и /20xx-press-fomc.htm
+    - Fed: ссылки вида /newsevents/pressreleases/20xx-press-*.htm (оставляем, но дальше отфильтруем по ключевым словам/странам)
     - ECB: press, govcdec, press_conference, monetary policy statements
     - BoE: /news/20xx/*
     - RBA: /media-releases/YYYY/*
     - US Treasury: /news/press-releases/sb\d+
+    - JP MoF FX: страница справки по интервенциям (сигнал высокого приоритета)
     """
     items: List[NewsItem] = []
     now = datetime.now(timezone.utc)
@@ -291,10 +322,12 @@ def collect_news() -> List[NewsItem]:
     # FED
     txt, code, url = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
     if code:
-        for m in re.finditer(r'href="(/newsevents/pressreleases/(?:20\d{2}-press-(?:fomc|monetary)|20\d{2}-press-\w+)\.htm)"[^>]*>(.*?)</a>', txt, re.I):
+        for m in re.finditer(r'href="(/newsevents/pressreleases/(?:20\d{2}-press-(?:fomc|monetary|\w+))\.htm)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://www.federalreserve.gov" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip() or "Fed press release"
             items.append(NewsItem(now, "US_FED_PR", t, u, "united states", "USD", "policy", "high"))
+    else:
+        log.warning("Fed PR fetch error: %s", code)
 
     # US Treasury
     txt, code, url = fetch_text("https://home.treasury.gov/news/press-releases")
@@ -303,6 +336,8 @@ def collect_news() -> List[NewsItem]:
             u = "https://home.treasury.gov" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             items.append(NewsItem(now, "US_TREASURY", t, u, "united states", "USD", "treasury", "medium"))
+    else:
+        log.warning("Treasury fetch error: %s", code)
 
     # ECB (правление/заявления/конфы)
     txt, code, url = fetch_text("https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release")
@@ -312,6 +347,8 @@ def collect_news() -> List[NewsItem]:
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             imp = "high" if KW_RE.search(t) else "medium"
             items.append(NewsItem(now, "ECB_PR", t, u, "euro area", "EUR", "ecb", imp))
+    else:
+        log.warning("ECB fetch error: %s", code)
 
     # BoE
     txt, code, url = fetch_text("https://www.bankofengland.co.uk/news")
@@ -321,6 +358,8 @@ def collect_news() -> List[NewsItem]:
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             imp = "high" if KW_RE.search(t) else "medium"
             items.append(NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", imp))
+    else:
+        log.warning("BoE fetch error: %s", code)
 
     # RBA
     txt, code, url = fetch_text("https://www.rba.gov.au/media-releases/")
@@ -330,13 +369,15 @@ def collect_news() -> List[NewsItem]:
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             imp = "high" if KW_RE.search(t) else "medium"
             items.append(NewsItem(now, "RBA_MR", t, u, "australia", "AUD", "rba", imp))
+    else:
+        log.warning("RBA fetch error: %s", code)
 
     # JP MoF FX (страницу часто меняют; если код !=200 — просто пропускаем)
     txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/")
     if code == 200 and re.search(r"intervention|announcement", txt, re.I):
         items.append(NewsItem(now, "JP_MOF_FX", "FX intervention reference page", url, "japan", "JPY", "mof", "high"))
 
-    # Легкая отсечка древности по названию (если вдруг соберем архив)
+    # Лёгкая отсечка древности по названию (если вдруг соберем архив)
     max_age_days = int(os.getenv("NEWS_MAX_AGE_DAYS", "90") or "90")
     cutoff = now - timedelta(days=max_age_days)
     # пока все ts = now — фильтр на будущее, если появится нормальный парсинг времени
@@ -441,57 +482,6 @@ def write_fa_signals(sh, signals: Dict[str, dict]):
         ])
     ws.update(range_name="A2", values=values)
 
-# ---------- INVESTOR_DIGEST ----------
-def _read_fa_signals_for_digest(sh) -> List[dict]:
-    """Читает лист FA_Signals как список dict'ов; если нет — возвращает пустой список."""
-    try:
-        ws = sh.worksheet("FA_Signals")
-        return ws.get_all_records()
-    except Exception:
-        return []
-
-def _build_investor_digest_text(rows: List[dict]) -> str:
-    """Строит компактную сводку по парам из FA_Signals."""
-    by_pair = {str(r.get("pair","")).upper(): r for r in rows}
-    lines = []
-    for sym in SYMBOLS:
-        r = by_pair.get(sym, {})
-        risk = str(r.get("risk","Green")).capitalize()
-        bias = str(r.get("bias","neutral")).lower()
-        reason = str(r.get("reason","")).strip()
-        dca = r.get("dca_scale", 1.0)
-        # хвост с деталями
-        tail = f" | {risk}/{bias}"
-        if reason:
-            tail += f" | {reason}"
-        try:
-            dca_val = float(dca)
-        except Exception:
-            dca_val = 1.0
-        if abs(dca_val - 1.0) > 1e-9:
-            # печатаем как 0.5 / 0.75 / 1.2 и т.п. без лишних нулей
-            dtxt = f"{dca_val:.3f}".rstrip("0").rstrip(".")
-            tail += f" | dca×{dtxt}"
-        emoji = RISK_EMOJI.get(risk, "🟢")
-        lines.append(f"• {sym}: {emoji}{tail}")
-    return "FA-сводка (aggregated):\n" + "\n".join(lines)
-
-def write_investor_digest(sh):
-    """Пишет одну запись в INVESTOR_DIGEST, если текст изменился со времени прошлой записи."""
-    ws, _ = ensure_worksheet(sh, INVESTOR_WS, ["ts_utc","text"])
-    text = _build_investor_digest_text(_read_fa_signals_for_digest(sh))
-    # проверка на дубликат: сравниваем с последней строкой (B2)
-    try:
-        last = ws.get_values("B2:B2")
-        if last and last[0] and (last[0][0] == text):
-            log.info("INVESTOR_DIGEST: unchanged")
-            return
-    except Exception:
-        pass
-    ts = _to_utc_iso(datetime.now(timezone.utc))
-    ws.insert_row([ts, text], index=2)
-    log.info("INVESTOR_DIGEST: +1 row")
-
 def _read_existing_hashes(ws, hash_col_letter: str) -> set[str]:
     try:
         rng = f"{hash_col_letter}2:{hash_col_letter}10000"
@@ -507,7 +497,9 @@ def _calendar_window_filter(events: Iterable[CalEvent]) -> List[CalEvent]:
     return [e for e in events if d1 <= e.utc <= d2]
 
 def collect_once():
-    log.info("collector… sheet=%s ws=%s tz=%s window=[-%dd,+%dd]", SHEET_ID, CAL_WS_OUT, (LOCAL_TZ.key if LOCAL_TZ else "UTC"), FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS)
+    log.info("collector… sheet=%s ws=%s tz=%s window=[-%dd,+%dd]",
+             SHEET_ID, CAL_WS_OUT, (LOCAL_TZ.key if LOCAL_TZ else "UTC"),
+             FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS)
     sh, _ = build_sheets_client(SHEET_ID)
     if not sh:
         log.error("Sheets not available — exit")
@@ -521,8 +513,12 @@ def collect_once():
     except Exception:
         seen = set()
 
+    all_cal = collect_calendar()
+    in_window = _calendar_window_filter(all_cal)
+    log.info("Calendar parsed total=%d, in_window=%d", len(all_cal), len(in_window))
+
     new_rows = []
-    for ev in _calendar_window_filter(collect_calendar()):
+    for ev in in_window:
         key = (_norm_iso_key(_to_utc_iso(ev.utc)), ev.title.strip())
         if key not in seen:
             new_rows.append(ev.to_row())
@@ -532,7 +528,6 @@ def collect_once():
         ws_cal.append_rows(new_rows, value_input_option="RAW")
     log.info("CALENDAR: +%d rows", len(new_rows))
 
-
     # NEWS
     news = collect_news()
     ws_news, _ = ensure_worksheet(sh, "NEWS", NEWS_HEADERS)
@@ -540,18 +535,13 @@ def collect_once():
     news_rows = [n.to_row() for n in news if n.key_hash() not in existing_hash]
     if news_rows:
         ws_news.append_rows(news_rows, value_input_option="RAW")
-    log.info("NEWS: +%d rows", len(news_rows))
+    log.info("NEWS: +%d rows (dedup from %d)", len(news_rows), len(news))
 
     # FA signals (строго)
     all_news = _read_news_rows(sh)
     fa = compute_fa_from_news(all_news, datetime.now(timezone.utc))
     write_fa_signals(sh, fa)
-    # INVESTOR_DIGEST: агрегированная строка на основе FA_Signals
-    try:
-        write_investor_digest(sh)
-    except Exception as e:
-        log.warning("INVESTOR_DIGEST write failed: %s", e)
-    log.info("cycle done.")
+    log.info("FA_Signals updated.")
 
 def main():
     if not SHEET_ID: raise RuntimeError("SHEET_ID env empty")
