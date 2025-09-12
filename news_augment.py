@@ -147,94 +147,67 @@ def _importance(title: str, url: str) -> str:
     hay = f"{title} {url}"
     return "high" if KW_RE.search(hay) else "medium"
 
-# ====== GBP: Bank of England (improved) ======
-BOE_BASE = "https://www.bankofengland.co.uk"
-BOE_CATEGORIES = ["news", "publications", "speeches", "statistics", "prudential-regulation"]
-BOE_MAX_PAGES = int(os.getenv("BOE_MAX_PAGES", "3") or "3")  # сколько страниц листинга пройти на раздел
+# -------- Bank of England (GBP) --------
+_BOE_SECTIONS = ["news", "publications", "speeches", "statistics", "prudential-regulation"]
 
-def _boe_extract_articles(html: str, cat: str) -> List[tuple[str, str]]:
-    """
-    Достаём статьи из листинга /news/<cat>[?page=N] только с годом в URL: /news/<cat>/20YY/...
-    Возвращаем (url, title).
-    """
-    out: List[tuple[str, str]] = []
+# href в одинарных ИЛИ двойных кавычках + вытаскиваем текст ссылки
+_BOE_ANCHOR_RE = re.compile(
+    r"<a[^>]+href=['\"]((?:https?://www\.bankofengland\.co\.uk)?"
+    r"/news/(?:news|publications|speeches|statistics|prudential-regulation)"
+    r"/20\d{2}/[^'\"\s?#]+)['\"][^>]*>(.*?)</a>",
+    re.I | re.S
+)
 
-    # Вариант 1: <a href="...">Текст</a> — берём текст как title
-    pat1 = re.compile(
-        rf'<a[^>]+href="(?P<u>(?:https?://(?:www\.)?bankofengland\.co\.uk)?/news/{cat}/20\d{{2}}/[^"#?]+)"[^>]*>(?P<t>.*?)</a>',
-        re.I
-    )
-    for m in pat1.finditer(html):
-        u = m.group("u")
-        if not u.startswith("http"):
-            u = BOE_BASE + u
-        t = _clean_html_text(m.group("t")) or u.rsplit("/", 1)[-1].replace("-", " ").title()
-        out.append((u, t))
-
-    # Вариант 2: если в листинге ссылки без видимого текста внутри того же тега
-    # (подпись рендерится соседним элементом), то подхватим просто href и синтезируем title из слага
-    if not out:
-        pat2 = re.compile(
-            rf'href="(?P<u>(?:https?://(?:www\.)?bankofengland\.co\.uk)?/news/{cat}/20\d{{2}}/[^"#?]+)"',
-            re.I
-        )
-        for m in pat2.finditer(html):
-            u = m.group("u")
-            if not u.startswith("http"):
-                u = BOE_BASE + u
-            t = u.rsplit("/", 1)[-1].replace("-", " ").title()
-            out.append((u, t))
-
-    # Страховка от дублей на странице
-    seen = set()
-    uniq = []
-    for u, t in out:
-        if u not in seen:
-            seen.add(u)
-            uniq.append((u, t))
-    return uniq
+def _boe_abs(url_path: str) -> str:
+    if url_path.startswith("http"):
+        return url_path
+    return "https://www.bankofengland.co.uk" + url_path
 
 def collect_boe() -> List[NewsItem]:
-    """
-    Ходим по разделам /news/<category> и пагинации ?page=2..N, собираем статьи за все доступные страницы.
-    Фильтруем любые «категории» без /20YY/ в пути.
-    """
     now = datetime.now(timezone.utc)
-    out: List[NewsItem] = []
-    seen_urls = set()
+    items: List[NewsItem] = []
 
-    # Быстрый шаг: пробуем /news/news (основная лента)
-    first_urls = [f"{BOE_BASE}/news/news"] + [f"{BOE_BASE}/news/{c}" for c in BOE_CATEGORIES if c != "news"]
-    for url0 in first_urls:
-        txt, code, eff = fetch_text(url0)
+    for sec in _BOE_SECTIONS:
+        for page in (1, 2, 3):
+            url = f"https://www.bankofengland.co.uk/news/{sec}" + ("" if page == 1 else f"?page={page}")
+            html, code, _ = fetch_text(url)
+            if not code:
+                continue
+
+            found = 0
+            for m in _BOE_ANCHOR_RE.finditer(html):
+                href, inner = m.group(1), m.group(2)
+                u = _boe_abs(href)
+                # Чистим текст якоря → заголовок
+                title = _html_to_text(inner)
+                # Важность — high, если попадают монетарные ключевые слова
+                imp = "high" if KW_RE.search(title) else "medium"
+                items.append(NewsItem(
+                    ts_utc=now, source="BOE_PR", title=title, url=u,
+                    countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
+                ))
+                found += 1
+            log.info("news_augment: BOE %s p%d: %d", sec, page, found)
+
+    # Доп. страховка: ловим страницы MPS/Minutes напрямую, если попадутся в листингах
+    # (pattern держим отдельно, на случай если будем переиспользовать)
+    _MPS_RE = re.compile(
+        r"href=['\"]((?:https?://www\.bankofengland\.co\.uk)?/monetary-policy-summary-and-minutes/20\d{2}/[^'\"\s?#]+)['\"]",
+        re.I
+    )
+    for sec in _BOE_SECTIONS:
+        url = f"https://www.bankofengland.co.uk/news/{sec}"
+        html, code, _ = fetch_text(url)
         if not code:
             continue
-        arts = []
-        # первая страница без параметров
-        cat = url0.split("/news/")[-1] or "news"
-        cat = cat.strip("/").split("?", 1)[0]
-        arts += _boe_extract_articles(txt, cat)
-        log.info("BOE %s p1: %d", cat, len(arts))
+        for m in _MPS_RE.finditer(html):
+            u = _boe_abs(m.group(1))
+            items.append(NewsItem(
+                ts_utc=now, source="BOE_PR", title="Monetary Policy Summary / Minutes",
+                url=u, countries="united kingdom", ccy="GBP", tags="boe", importance_guess="high"
+            ))
 
-        # пагинация ?page=2..N
-        for p in range(2, BOE_MAX_PAGES + 1):
-            urlp = f"{BOE_BASE}/news/{cat}?page={p}"
-            txtp, codep, _ = fetch_text(urlp)
-            if not codep:
-                continue
-            arts_p = _boe_extract_articles(txtp, cat)
-            log.info("BOE %s p%d: %d", cat, p, len(arts_p))
-            arts += arts_p
-
-        for u, t in arts:
-            if "/20" not in u or u in seen_urls:
-                continue
-            seen_urls.add(u)
-            imp = _importance(t, u)
-            out.append(NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", imp))
-
-    log.info("BOE collected total: %d", len(out))
-    return out
+    return items
     
 # ====== JPY: Bank of Japan + MoF ======
 def collect_boj() -> List[NewsItem]:
