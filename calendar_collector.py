@@ -4,6 +4,7 @@ import os, re, json, base64, time, logging
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Iterable
 from datetime import datetime, timedelta, timezone
+from html import unescape as _html_unescape
 
 try:
     from zoneinfo import ZoneInfo
@@ -106,6 +107,17 @@ def _to_utc_iso(dt: datetime) -> str:
 def _localize(dt: datetime) -> datetime:
     return dt.astimezone(LOCAL_TZ) if LOCAL_TZ else dt
 
+def _norm_iso_key(v: str) -> str:
+    import re
+    s = str(v or "").strip()
+    s = s.replace(" ", "T").replace("Z", "+00:00")
+    s = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', s)
+    try:
+        dt = datetime.fromisoformat(s).astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return s
+
 # -------- HTTP --------
 def fetch_text(url: str, timeout=15.0) -> tuple[str,int,str]:
     try:
@@ -172,67 +184,119 @@ def collect_calendar() -> List[CalEvent]:
 # -------- NEWS scrapers --------
 @dataclass
 class NewsItem:
-    ts_utc: datetime; source: str; title: str; url: str; countries: str; ccy: str; tags: str; importance_guess: str
-    def key_hash(self) -> str: return re.sub(r"\s+"," ", f"{self.source}|{self.title}".strip())[:180]
-    def to_row(self) -> List[str]:
-        return [_to_utc_iso(self.ts_utc), self.source, self.title, self.url, self.countries, self.ccy, self.tags, self.importance_guess, self.key_hash()]
+    ts_utc: datetime
+    source: str
+    title: str
+    url: str
+    countries: str
+    ccy: str
+    tags: str
+    importance_guess: str
 
-def _parse_time_attr(html: str) -> Optional[datetime]:
-    m = re.search(r'<time[^>]+datetime="([^"]+)"', html, re.I)
-    if not m: return None
-    try: return datetime.fromisoformat(m.group(1).replace("Z","+00:00")).astimezone(timezone.utc)
-    except Exception: return None
+    def key_hash(self) -> str:
+        # Дедуп по источнику+URL (а не по title)
+        base = f"{self.source}|{self.url}"
+        return re.sub(r"\s+", " ", base.strip())[:180]
+
+    def to_row(self) -> List[str]:
+        clean_title = _html_unescape(re.sub(r"<[^>]+>", "", self.title)).strip()
+        return [
+            _to_utc_iso(self.ts_utc),
+            self.source,
+            clean_title,
+            self.url,
+            self.countries,
+            self.ccy,
+            self.tags,
+            self.importance_guess,
+            self.key_hash()
+        ]
+
+def _iter_links_with_time(html: str, href_re: str, time_first: bool = True):
+    """
+    Пытается спарсить пары (ts, href, text), где <time datetime="..."> рядом со ссылкой.
+    time_first=True — ищем <time> ... <a href=...>; иначе наоборот.
+    """
+    flags = re.I | re.S
+    if time_first:
+        pat = rf'<time[^>]+datetime="([^"]+)"[^>]*>.*?</time>.*?<a[^>]+href="({href_re})"[^>]*>(.*?)</a>'
+    else:
+        pat = rf'<a[^>]+href="({href_re})"[^>]*>(.*?)</a>.*?<time[^>]+datetime="([^"]+)"[^>]*>.*?</time>'
+    for m in re.finditer(pat, html, flags):
+        dt = _norm_iso_key(m.group(1) if time_first else m.group(3))
+        try:
+            ts = datetime.fromisoformat(dt.replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            ts = datetime.now(timezone.utc)
+        href = m.group(2 if time_first else 1)
+        text = m.group(3 if time_first else 2)
+        yield ts, href, text
 
 def collect_news() -> List[NewsItem]:
     items: List[NewsItem] = []
     now = datetime.now(timezone.utc)
 
-    # FED PR (списки разделов — хватит для сигналов)
-    txt, code, _ = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
+    # --- FED PR: только реальные релизы по монетарной политике/FOMC ---
+    txt, code, url = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
     if code:
-        for m in re.finditer(r'<a[^>]+href="(/newsevents/pressreleases/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-            u = "https://www.federalreserve.gov"+m.group(1)
-            t = re.sub(r"<[^>]+>","",m.group(2)).strip()
-            items.append(NewsItem(now,"US_FED_PR",t,u,"united states","USD","policy","high" if KW_RE.search(t) else "medium"))
+        for ts, href, text in _iter_links_with_time(
+            txt,
+            href_re=r'/newsevents/pressreleases/(?:monetary|fomc)[^"]+?\.htm'
+        ):
+            u = "https://www.federalreserve.gov" + href
+            items.append(NewsItem(ts,"US_FED_PR",text,u,"united states","USD","policy",
+                                  "high" if KW_RE.search(text) else "medium"))
 
-    # US Treasury
-    txt, code, _ = fetch_text("https://home.treasury.gov/news/press-releases")
+    # --- US Treasury: берём только конкретные пресс-релизы (sb####/jl####), без каталогов ---
+    txt, code, url = fetch_text("https://home.treasury.gov/news/press-releases")
     if code:
-        for m in re.finditer(r'<a[^>]+href="(/news/press-releases/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-            u = "https://home.treasury.gov"+m.group(1)
-            t = re.sub(r"<[^>]+>","",m.group(2)).strip()
-            items.append(NewsItem(now,"US_TREASURY",t,u,"united states","USD","treasury","medium"))
+        for ts, href, text in _iter_links_with_time(
+            txt,
+            href_re=r'/news/press-releases/(?:sb|jl)\d+[^"/]*'
+        ):
+            u = "https://home.treasury.gov" + href
+            items.append(NewsItem(ts,"US_TREASURY",text,u,"united states","USD","treasury",
+                                  "high" if KW_RE.search(text) else "medium"))
 
-    # ECB PR
-    txt, code, _ = fetch_text("https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release")
+    # --- ECB PR ---
+    txt, code, url = fetch_text("https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release")
     if code:
-        for m in re.finditer(r'<a[^>]+href="(/press/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-            u = "https://www.ecb.europa.eu"+m.group(1)
-            t = re.sub(r"<[^>]+>","",m.group(2)).strip()
-            items.append(NewsItem(now,"ECB_PR",t,u,"euro area","EUR","ecb","high" if KW_RE.search(t) else "medium"))
+        for ts, href, text in _iter_links_with_time(
+            txt,
+            href_re=r'/press/[^"]+?\.html'
+        ):
+            u = "https://www.ecb.europa.eu" + href
+            items.append(NewsItem(ts,"ECB_PR",text,u,"euro area","EUR","ecb",
+                                  "high" if KW_RE.search(text) else "medium"))
 
-    # BoE
-    txt, code, _ = fetch_text("https://www.bankofengland.co.uk/news")
+    # --- BoE ---
+    txt, code, url = fetch_text("https://www.bankofengland.co.uk/news")
     if code:
-        for m in re.finditer(r'<a[^>]+href="(/news/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-            u = "https://www.bankofengland.co.uk"+m.group(1)
-            t = re.sub(r"<[^>]+>","",m.group(2)).strip()
-            items.append(NewsItem(now,"BOE_PR",t,u,"united kingdom","GBP","boe","high" if KW_RE.search(t) else "medium"))
+        for ts, href, text in _iter_links_with_time(
+            txt,
+            href_re=r'/news/\d{4}/[^"]+'
+        ):
+            u = "https://www.bankofengland.co.uk" + href
+            items.append(NewsItem(ts,"BOE_PR",text,u,"united kingdom","GBP","boe",
+                                  "high" if KW_RE.search(text) else "medium"))
 
-    # RBA
-    txt, code, _ = fetch_text("https://www.rba.gov.au/media-releases/")
+    # --- RBA ---
+    txt, code, url = fetch_text("https://www.rba.gov.au/media-releases/")
     if code:
-        for m in re.finditer(r'<a[^>]+href="(/media-releases/\d{4}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-            u = "https://www.rba.gov.au"+m.group(1)
-            t = re.sub(r"<[^>]+>","",m.group(2)).strip()
-            items.append(NewsItem(now,"RBA_MR",t,u,"australia","AUD","rba","high" if KW_RE.search(t) else "medium"))
+        for ts, href, text in _iter_links_with_time(
+            txt,
+            href_re=r'/media-releases/\d{4}/[^"]+'
+        ):
+            u = "https://www.rba.gov.au" + href
+            items.append(NewsItem(ts,"RBA_MR",text,u,"australia","AUD","rba",
+                                  "high" if KW_RE.search(text) else "medium"))
 
-    # JP MoF FX (флаг)
+    # --- JP MoF FX (флажок страницы) ---
     txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/index.html")
     if code and re.search(r"intervention|announcement", txt, re.I):
         items.append(NewsItem(now,"JP_MOF_FX","FX intervention reference page",url,"japan","JPY","mof","high"))
 
-    log.info("NEWS collected: %d", len(items))
+    log.info("NEWS collected: %d items", len(items))
     return items
 
 # -------- NEWS → FA (строгая агрегация для FA_Signals) --------
@@ -319,21 +383,25 @@ def collect_once():
         return
 
     # CALENDAR
-    cal_events = _calendar_window_filter(collect_calendar())
     ws_cal, _ = ensure_worksheet(sh, CAL_WS_OUT, CAL_HEADERS)
+    # --- CALENDAR: читаем существующие и строим ключи на нормализованном utc_iso ---
     try:
         existing = ws_cal.get_all_records()
-        seen = {(r["utc_iso"], r.get("title","")) for r in existing}
+        seen = {(_norm_iso_key(r.get("utc_iso")), (r.get("title") or "").strip()) for r in existing}
     except Exception:
         seen = set()
+
     new_rows = []
-    for ev in cal_events:
-        key = (_to_utc_iso(ev.utc), ev.title)
+    for ev in _calendar_window_filter(collect_calendar()):
+        key = (_norm_iso_key(_to_utc_iso(ev.utc)), ev.title.strip())
         if key not in seen:
             new_rows.append(ev.to_row())
+            seen.add(key) # prevent duplicates in the same batch
+
     if new_rows:
         ws_cal.append_rows(new_rows, value_input_option="RAW")
     log.info("CALENDAR: +%d rows", len(new_rows))
+
 
     # NEWS
     news = collect_news()
