@@ -148,65 +148,52 @@ def _importance(title: str, url: str) -> str:
     return "high" if KW_RE.search(hay) else "medium"
 
 # -------- Bank of England (GBP) --------
-_BOE_SECTIONS = ["news", "publications", "speeches", "statistics", "prudential-regulation"]
+_BOE_SITEMAPS = [
+    "https://www.bankofengland.co.uk/sitemap.xml",
+    "https://www.bankofengland.co.uk/news/sitemap.xml",
+    "https://www.bankofengland.co.uk/monetary-policy-summary-and-minutes/sitemap.xml",
+]
 
-# href в одинарных ИЛИ двойных кавычках + вытаскиваем текст ссылки
-_BOE_ANCHOR_RE = re.compile(
-    r"<a[^>]+href=['\"]((?:https?://www\.bankofengland\.co\.uk)?"
-    r"/news/(?:news|publications|speeches|statistics|prudential-regulation)"
-    r"/20\d{2}/[^'\"\s?#]+)['\"][^>]*>(.*?)</a>",
-    re.I | re.S
-)
+# всё, что явно про MPC/Bank Rate/MPS — считаем high
+def _boe_is_high(url: str, title: str) -> bool:
+    if "monetary-policy-summary-and-minutes" in url:
+        return True
+    hay = f"{title} {url}".lower()
+    return bool(KW_RE.search(hay))
 
-def _boe_abs(url_path: str) -> str:
-    if url_path.startswith("http"):
-        return url_path
-    return "https://www.bankofengland.co.uk" + url_path
+def _slug_to_title(url: str) -> str:
+    slug = url.rstrip("/").split("/")[-1]
+    t = re.sub(r"[-_]+", " ", slug).strip()
+    # немного гуманизации
+    return t[:1].upper() + t[1:] if t else "BoE item"
 
 def collect_boe() -> List[NewsItem]:
     now = datetime.now(timezone.utc)
     items: List[NewsItem] = []
+    seen: set[str] = set()
 
-    for sec in _BOE_SECTIONS:
-        for page in (1, 2, 3):
-            url = f"https://www.bankofengland.co.uk/news/{sec}" + ("" if page == 1 else f"?page={page}")
-            html, code, _ = fetch_text(url)
-            if not code:
+    for sm in _BOE_SITEMAPS:
+        xml, code, _ = fetch_text(sm)
+        if not code or not xml:
+            continue
+        # простенький XML-парсер по <loc> (без зависимостей)
+        for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, flags=re.I):
+            url = loc.strip()
+            if "bankofengland.co.uk" not in url:
                 continue
-
-            found = 0
-            for m in _BOE_ANCHOR_RE.finditer(html):
-                href, inner = m.group(1), m.group(2)
-                u = _boe_abs(href)
-                # Чистим текст якоря → заголовок
-                title = _html_to_text(inner)
-                # Важность — high, если попадают монетарные ключевые слова
-                imp = "high" if KW_RE.search(title) else "medium"
+            # интересуют новости и MPS-страницы с годом в пути
+            if ("/news/" in url or "/monetary-policy-summary-and-minutes/" in url) and re.search(r"/20\d{2}/", url):
+                if url in seen:
+                    continue
+                seen.add(url)
+                title = _slug_to_title(url)
+                imp = "high" if _boe_is_high(url, title) else "medium"
                 items.append(NewsItem(
-                    ts_utc=now, source="BOE_PR", title=title, url=u,
+                    ts_utc=now, source="BOE_PR", title=title, url=url,
                     countries="united kingdom", ccy="GBP", tags="boe", importance_guess=imp
                 ))
-                found += 1
-            log.info("news_augment: BOE %s p%d: %d", sec, page, found)
 
-    # Доп. страховка: ловим страницы MPS/Minutes напрямую, если попадутся в листингах
-    # (pattern держим отдельно, на случай если будем переиспользовать)
-    _MPS_RE = re.compile(
-        r"href=['\"]((?:https?://www\.bankofengland\.co\.uk)?/monetary-policy-summary-and-minutes/20\d{2}/[^'\"\s?#]+)['\"]",
-        re.I
-    )
-    for sec in _BOE_SECTIONS:
-        url = f"https://www.bankofengland.co.uk/news/{sec}"
-        html, code, _ = fetch_text(url)
-        if not code:
-            continue
-        for m in _MPS_RE.finditer(html):
-            u = _boe_abs(m.group(1))
-            items.append(NewsItem(
-                ts_utc=now, source="BOE_PR", title="Monetary Policy Summary / Minutes",
-                url=u, countries="united kingdom", ccy="GBP", tags="boe", importance_guess="high"
-            ))
-
+    log.info("news_augment: BOE via sitemap collected: %d", len(items))
     return items
     
 # ====== JPY: Bank of Japan + MoF ======
