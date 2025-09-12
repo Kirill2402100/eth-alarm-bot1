@@ -7,7 +7,7 @@ import logging
 import re
 from html import escape as _html_escape
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional, List, Iterable
+from typing import Dict, Tuple, Optional, List
 
 import asyncio
 
@@ -53,9 +53,9 @@ except Exception:
     service_account = None
     _GSHEETS_AVAILABLE = False
 
-# --- HTTP для календаря ---
+# --- HTTP (резерв, если понадобится) ---
 try:
-    import requests
+    import requests  # noqa
     _REQUESTS_AVAILABLE = True
 except Exception:
     requests = None
@@ -119,10 +119,10 @@ PAIR_COUNTRIES = {
     "GBPUSD": {"united kingdom", "united states"},
 }
 
-# та же логика ключевых слов/источников, что в calendar_collector.py
+# Ключевые слова/источники, синхронизированы с calendar_collector.py
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
-    # добавили: fomc/mpc, policy statement(s), rate statement, cash rate
+    # + расширения: fomc/mpc, policy statement(s), rate statement, cash rate
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
     "intervention|FX intervention|press conference|policy statement|policy statements|"
     "rate statement|cash rate|fomc|mpc"
@@ -222,11 +222,11 @@ def append_row(sh, title: str, row: list):
 def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
-def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
+def _top_news_for_pair(sh, pair: str, now_utc: Optional[datetime] = None) -> str:
     """
     Возвращает строку вида 'HH:MM — Title (SRC)' для КОНКРЕТНОЙ пары.
     1) Ищем свежую high-новость из NEWS за TTL (по странам пары).
-    2) Если нет — ближайшее событие из CALENDAR (по странам пары).
+    2) Если нет — ближайшее событие из CALENDAR (по странам пары) или крайнее прошедшее.
     """
     now_utc = now_utc or datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(minutes=NEWS_TTL_MIN)
@@ -251,21 +251,25 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
         title = str(r.get("title", "")).strip()
         tags  = str(r.get("tags", "")).strip()
         kw_ok = bool(KW_RE.search(f"{title} {tags}"))
-        # Разрешаем «якорные» источники ЦБ даже без ключевых слов
-        if not kw_ok and src in {"US_FED_PR","ECB_PR","BOE_PR","RBA_MR","BOJ_PR"}:
+        # Разрешаем «якорные» источники ЦБ даже без ключевых слов (иногда заголовки без явных ключей)
+        if not kw_ok and src in {"US_FED_PR", "ECB_PR", "BOE_PR", "RBA_MR", "BOJ_PR"}:
             kw_ok = True
         if not kw_ok:
             continue
-        row_cty = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
+        row_cty = {x.strip().lower() for x in str(r.get("countries", "")).split(",") if x.strip()}
         if not (row_cty & countries):
-            continue
+            # Для долларовых пар разрешаем чисто американские новости (Fed/Treasury и т.п.)
+            if "USD" in pair and "united states" in row_cty:
+                pass
+            else:
+                continue
         if (best is None) or (ts > best["ts"]):
             best = {"ts": ts, "title": title, "src": src}
     if best:
         lt = best["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else best["ts"]
         return f"{lt:%H:%M} — {best['title']} ({best['src']})"
 
-    # 2) CALENDAR (fallback: ближайшее важное)
+    # 2) CALENDAR (fallback: ближайшее ВПЕРЕДИ; если нет — последнее ПРОШЕДШЕЕ)
     try:
         events = sh.worksheet(CAL_WS_OUT).get_all_records()
     except Exception:
@@ -277,15 +281,14 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
             dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z", "+00:00")).astimezone(timezone.utc)
         except Exception:
             continue
+        if str(e.get("country", "")).strip().lower() not in countries:
+            continue
         if dt <= now_utc:
-            # запомним самое близкое ПРОШЕДШЕЕ событие (как крайний фолбэк)
-            if last_past is None or dt > last_past["ts"]:
-                last_past = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
-            continue
-        if str(e.get("country","")).strip().lower() not in countries:
-            continue
-        if (soon is None) or (dt < soon["ts"]):
-            soon = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
+            if (last_past is None) or (dt > last_past["ts"]):
+                last_past = {"ts": dt, "title": str(e.get("title", "")).strip(), "src": str(e.get("source", "")).strip() or "cal"}
+        else:
+            if (soon is None) or (dt < soon["ts"]):
+                soon = {"ts": dt, "title": str(e.get("title", "")).strip(), "src": str(e.get("source", "")).strip() or "cal"}
     if soon:
         lt = soon["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else soon["ts"]
         return f"{lt:%Y-%m-%d %H:%M} — {soon['title']} ({soon['src']})"
@@ -294,6 +297,7 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
         return f"{lt:%H:%M} — {last_past['title']} ({last_past['src']})"
     return ""
 
+# -------------------- Чтение FA_Signals --------------------
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
     """
     Лист FA_Signals: pair,risk,bias,ttl,updated_at,scan_lock_until,reserve_off,dca_scale,reason,risk_pct
@@ -317,8 +321,7 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
         except Exception:
             upd_ts = None
         if ttl and upd_ts and now > upd_ts + timedelta(minutes=ttl):
-            # протухло — игнорируем
-            continue
+            continue  # протухло
         out[pair] = {
             "risk":        (str(r.get("risk", "Green")).capitalize()),
             "bias":        (str(r.get("bias", "neutral")).lower()),
@@ -345,154 +348,6 @@ def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, f
         "GBPUSD": round(total * weights.get("GBP", 0) / s, 2),
     }
 
-def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
-    now = now or datetime.now(timezone.utc)
-    sec = int((dt_to - now).total_seconds())
-    sign = "через" if sec >= 0 else "назад"
-    sec = abs(sec)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    if h and m:
-        return f"{h} ч {m:02d} мин {sign}"
-    if h:
-        return f"{h} ч {sign}"
-    return f"{m} мин {sign}"
-
-def assert_master_chat(update: Update) -> bool:
-    if MASTER_CHAT_ID and update.effective_chat:
-        return update.effective_chat.id == MASTER_CHAT_ID
-    return True
-
-def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
-    parts, cur = [], []
-    cur_len = 0
-    for para in msg.split("\n\n"):
-        block = (para + "\n\n")
-        if cur_len + len(block) > limit and cur:
-            parts.append("".join(cur).rstrip())
-            cur, cur_len = [], 0
-        cur.append(block)
-        cur_len += len(block)
-    if cur:
-        parts.append("".join(cur).rstrip())
-    return parts
-
-# -------------------- КОМАНДЫ --------------------
-HELP_TEXT = (
-    "Что я умею\n"
-    "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
-    "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
-    "/weights — показать целевые веса.\n"
-    "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
-    "/digest — утренний дайджест (человеческий язык + события + новости).\n"
-    "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
-    "/init_sheet — создать/проверить лист в Google Sheets.\n"
-    "/sheet_test — записать тестовую строку в лист.\n"
-    "/diag — диагностика LLM / Sheets / NEWS.\n"
-)
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help",
-        parse_mode=ParseMode.HTML,
-    )
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
-
-async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not assert_master_chat(update):
-        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
-        return
-    try:
-        parts = update.message.text.strip().split()
-        if len(parts) < 2:
-            raise ValueError
-        total = float(parts[1])
-    except Exception:
-        await update.message.reply_text("Пример: /settotal 2800")
-        return
-
-    STATE["total"] = total
-    await update.message.reply_text(f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
-
-async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not assert_master_chat(update):
-        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
-        return
-
-    text = update.message.text[len("/setweights"):].strip().lower()
-    new_w = STATE["weights"].copy()
-    try:
-        for token in text.split():
-            if "=" not in token:
-                continue
-            k, v = token.split("=", 1)
-            k = k.strip().upper()
-            v = int(v.strip())
-            if k in ("JPY", "AUD", "EUR", "GBP"):
-                new_w[k] = v
-    except Exception:
-        await update.message.reply_text("Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
-        return
-
-    STATE["weights"] = new_w
-    await update.message.reply_text(
-        f"Целевые веса обновлены: {human_readable_weights(new_w)}"
-    )
-
-async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Целевые веса: {human_readable_weights(STATE['weights'])}")
-
-async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = float(STATE["total"])
-    if total <= 0:
-        await update.message.reply_text("Сначала задайте общий банк: /settotal 2800")
-        return
-
-    w = STATE["weights"]
-    alloc = split_total_by_weights(total, w)
-
-    lines = [
-        f"Целевые веса: {human_readable_weights(w)}",
-        "",
-        "Распределение:",
-    ]
-    for sym in SYMBOLS:
-        lines.append(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}")
-    msg = "\n".join(lines)
-    await update.message.reply_text(msg)
-
-    sh, _src = build_sheets_client(SHEET_ID)
-    if sh:
-        try:
-            append_row(
-                sh,
-                SHEET_WS,
-                [
-                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                    str(update.effective_chat.id),
-                    "alloc",
-                    f"{total:.2f}",
-                    json.dumps(w, ensure_ascii=False),
-                    json.dumps(alloc, ensure_ascii=False),
-                ],
-            )
-        except Exception as e:
-            log.warning("append_row alloc failed: %s", e)
-
-# ---------- Вспомогательные для «инвесторского» дайджеста ----------
-_RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-_RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
-
-def header_ru(dt) -> str:
-    wd = _RU_WD[dt.weekday()]
-    mm = _RU_MM[dt.month - 1]
-    return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
-
 def _to_float(x, default: Optional[float] = 0.0) -> Optional[float]:
     try:
         return float(str(x).strip().replace(",", "."))
@@ -501,11 +356,13 @@ def _to_float(x, default: Optional[float] = 0.0) -> Optional[float]:
 
 def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return None
+    if not sheet_name:
+        return None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows: return None
+        if not rows:
+            return None
         for r in reversed(rows):
             if any(r.get(f) not in (None, "", 0, "0", "0.0") for f in needed_fields):
                 return r
@@ -515,11 +372,13 @@ def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_
 
 def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return None, None
+    if not sheet_name:
+        return None, None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows: return None, None
+        if not rows:
+            return None, None
         tgt = fac = None
         for r in reversed(rows):
             if tgt is None and r.get("Bank_Target_USDT") not in (None, "", 0, "0", "0.0"):
@@ -533,11 +392,40 @@ def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[
         return None, None
 
 def price_fmt(symbol: str, value: Optional[float]) -> str:
-    if value is None: return "—"
+    if value is None:
+        return "—"
     return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
 
-def _symbol_hints(symbol: str) -> tuple[str,str]:
-    # (что это значит для цены, простыми словами)
+_RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+_RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
+
+def header_ru(dt) -> str:
+    wd = _RU_WD[dt.weekday()]
+    mm = _RU_MM[dt.month - 1]
+    return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
+
+def _pair_to_title(symbol: str) -> str:
+    return f"<b>{symbol[:3]}/{symbol[3:]}</b>"
+
+def _plan_vs_fact_line(sh, symbol: str) -> str:
+    target, fact = latest_bank_target_fact(sh, symbol)
+    if target is None and fact is None:
+        return "план —; факт —."
+    tt = target if target is not None else 0.0
+    ff = fact if fact is not None else 0.0
+    if tt <= 0:
+        return f"план {tt:g} / факт {ff:g} — —."
+    delta = 0 if tt == 0 else (ff - tt) / tt
+    ap = abs(delta)
+    if ap <= 0.02:
+        mark = "✅ в норме."
+    elif ap <= 0.05:
+        mark = f"⚠️ {'ниже' if delta < 0 else 'выше'} плана ({delta:+.0%})."
+    else:
+        mark = f"🚧 {'ниже' if delta < 0 else 'выше'} плана ({delta:+.0%})."
+    return f"план {tt:g} / факт {ff:g} — {mark}"
+
+def _symbol_hints(symbol: str) -> tuple[str, str]:
     if symbol == "USDJPY":
         return (
             "до решения ФРС сильного тренда не ждём. Резкие слова ФРС — укрепляют доллар (часто рост USD/JPY); мягкие — ослабляют доллар (падение USD/JPY).",
@@ -559,33 +447,15 @@ def _symbol_hints(symbol: str) -> tuple[str,str]:
         "больше тревоги по инфляции — фунт сильнее; меньше — слабее."
     )
 
-def _pair_to_title(symbol: str) -> str:
-    return f"<b>{symbol[:3]}/{symbol[3:]}</b>"
-
-def _plan_vs_fact_line(sh, symbol: str) -> str:
-    target, fact = latest_bank_target_fact(sh, symbol)
-    if target is None and fact is None:
-        return "план —; факт —."
-    tt = target if target is not None else 0.0
-    ff = fact if fact is not None else 0.0
-    if tt <= 0:
-        return f"план {tt:g} / факт {ff:g} — —."
-    delta = 0 if tt == 0 else (ff - tt) / tt
-    ap = abs(delta)
-    if ap <= 0.02: mark = "✅ в норме."
-    elif ap <= 0.05: mark = f"⚠️ {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
-    else: mark = f"🚧 {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
-    return f"план {tt:g} / факт {ff:g} — {mark}"
-
 def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     risk = fa_data.get("risk", "Green")
     bias = fa_data.get("bias", "neutral")
     dca_scale = float(fa_data.get("dca_scale", 1.0))
     reserve_on_str = "OFF" if fa_data.get("reserve_off") else "ON"
     icon = _fa_icon(risk)
-    
+
     title = f"{_pair_to_title(pair)} — {icon} фон {risk.lower()}, bias: {bias.upper()}"
-    
+
     side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
     avg = price_fmt(pair, _to_float(row.get("Avg_Price"), None))
     nxt = price_fmt(pair, _to_float(row.get("Next_DCA_Price"), None))
@@ -593,7 +463,7 @@ def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     plan_fact = _plan_vs_fact_line(sh, pair)
 
     lines = [title]
-    lines.append(f"•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='short' and pair=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}")
+    lines.append("•\tСводка рынка: движения ровные, резких скачков не ждём до США.")
     lines.append(f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.")
     lines.append(f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve_on_str}; dca_scale <b>{dca_scale:.2f}</b>.")
 
@@ -607,18 +477,16 @@ def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
 
     return "\n".join(lines)
 
-
 # ---------- Digest helpers (сборка полного текста) ----------
 def build_digest_text(sh, fa_sheet_data: dict) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
-    
+
     parts: List[str] = [header]
-    
+
     for i, sym in enumerate(SYMBOLS):
         row = get_last_nonempty_row(sh, sym) or {}
         fa_data = fa_sheet_data.get(sym, {})
-        
         block = render_morning_pair_block(sh, sym, row, fa_data)
         parts.append(block)
         if i < len(SYMBOLS) - 1:
@@ -626,7 +494,6 @@ def build_digest_text(sh, fa_sheet_data: dict) -> str:
 
     parts.append("Главная мысль дня: до ФРС — аккуратно; после пресс-конференции вернёмся к обычному режиму, если не будет сюрпризов.")
     return "\n".join(parts)
-
 
 # -------------------- /digest --------------------
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -654,13 +521,12 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         fa_sheet = _read_fa_signals_from_sheet(sh)
         msg = build_digest_text(sh, fa_sheet)
-        
+
         for chunk in _split_for_tg_html(msg, 3500):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("Ошибка сборки дайджеста")
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
-
 
 # -------------------- Диагностика --------------------
 def sheets_diag_text() -> str:
@@ -687,8 +553,11 @@ async def _diag_news_line() -> str:
         sh, _ = build_sheets_client(SHEET_ID)
         if not sh:
             return "NEWS: ❌ Sheets недоступен"
-        rows = read_news_rows(sh)
-        return f"NEWS: ✅ {len(rows)} строк в листе NEWS; окно {DIGEST_NEWS_LOOKBACK_MIN} мин."
+        try:
+            rows = sh.worksheet("NEWS").get_all_records()
+        except Exception:
+            rows = []
+        return f"NEWS: ✅ {len(rows)} строк в листе NEWS; TTL {NEWS_TTL_MIN} мин.; источники: {', '.join(sorted(ALLOWED_SOURCES))}"
     except Exception as e:
         return f"NEWS: ❌ ошибка: {e}"
 
@@ -740,7 +609,21 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
-# -------------------- СТАРТ --------------------
+# -------------------- Планировщик утренника --------------------
+def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
+    parts, cur = [], []
+    cur_len = 0
+    for para in msg.split("\n\n"):
+        block = (para + "\n\n")
+        if cur_len + len(block) > limit and cur:
+            parts.append("".join(cur).rstrip())
+            cur, cur_len = [], 0
+        cur.append(block)
+        cur_len += len(block)
+    if cur:
+        parts.append("".join(cur).rstrip())
+    return parts
+
 async def _set_bot_commands(app: Application):
     cmds = [
         BotCommand("start", "Запуск бота"),
@@ -794,10 +677,13 @@ async def _post_init(app: Application):
     await _set_bot_commands(app)
     app.create_task(morning_digest_scheduler(app))
 
+# -------------------- СТАРТ --------------------
 def build_application() -> Application:
-    if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
     builder = Application.builder().token(BOT_TOKEN)
-    if _RATE_LIMITER_AVAILABLE: builder = builder.rate_limiter(AIORateLimiter())
+    if _RATE_LIMITER_AVAILABLE:
+        builder = builder.rate_limiter(AIORateLimiter())
     builder = builder.post_init(_post_init)
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
