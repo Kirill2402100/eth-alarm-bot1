@@ -225,6 +225,74 @@ def append_row(sh, title: str, row: list):
     ws, _ = ensure_worksheet(sh, title)
     ws.append_row(row, value_input_option="RAW")
 
+# --- helpers: Google Sheets → FA/NEWS -------------------------------------------------
+def _fa_icon(risk: str) -> str:
+    return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
+
+def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
+    """
+    Лист FA_Signals: pair,risk,bias,ttl,updated_at,scan_lock_until,reserve_off,dca_scale,reason,risk_pct
+    Возвращает только НЕ протухшие по TTL записи.
+    """
+    try:
+        ws = sh.worksheet("FA_Signals")
+        rows = ws.get_all_records()
+    except Exception:
+        return {}
+    now = datetime.now(timezone.utc)
+    out: Dict[str, dict] = {}
+    for r in rows:
+        pair = str(r.get("pair", "")).upper()
+        if not pair:
+            continue
+        ttl = int(r.get("ttl") or 0)
+        upd_raw = str(r.get("updated_at", "")).strip()
+        try:
+            upd_ts = datetime.fromisoformat(upd_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            upd_ts = None
+        if ttl and upd_ts and now > upd_ts + timedelta(minutes=ttl):
+            # протухло — игнорируем
+            continue
+        out[pair] = {
+            "risk":        (str(r.get("risk", "Green")).capitalize()),
+            "bias":        (str(r.get("bias", "neutral")).lower()),
+            "dca_scale":   float(r.get("dca_scale") or 1.0),
+            "reserve_off": bool(int(r.get("reserve_off") or 0)),
+            "reason":      str(r.get("reason", "base")),
+            "updated_at":  upd_raw,
+        }
+    return out
+
+def _pick_top_news(sh, lookback_hours: int = int(os.getenv("DIGEST_NEWS_LOOKBACK_H", "48"))) -> Optional[dict]:
+    """Берём самую свежую importance=high из NEWS за lookback_hours."""
+    try:
+        ws = sh.worksheet("NEWS")
+        rows = ws.get_all_records()
+    except Exception:
+        rows = []
+    if not rows:
+        return None
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=lookback_hours)
+    for r in reversed(rows):
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if ts < cutoff:
+            break
+        if str(r.get("importance_guess", "")).lower() != "high":
+            continue
+        return {
+            "ts": ts,
+            "title": str(r.get("title", "")).strip(),
+            "source": str(r.get("source", "")).strip(),
+            "url": str(r.get("url", "")).strip(),
+        }
+    return None
+
+
 # ---------- NEWS (READ FROM SHEET) ----------
 NEWS_WS = os.getenv("NEWS_WS", "NEWS").strip() or "NEWS"
 DIGEST_NEWS_LOOKBACK_MIN = int(os.getenv("DIGEST_NEWS_LOOKBACK_MIN", "720") or "720")
@@ -476,46 +544,6 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning("append_row alloc failed: %s", e)
 
-# ── Чтение статусов FA из листа FA_Signals ────────────────────────────────────
-def _gs_open() -> Optional[gspread.Spreadsheet]:
-    """Лёгкая авторизация в Google Sheets через JSON в ENV (GOOGLE_CREDENTIALS / SHEET_ID)."""
-    try:
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        sheet_key  = os.environ.get("SHEET_ID")
-        if not (creds_json and sheet_key):
-            return None
-        gc = gspread.service_account_from_dict(json.loads(creds_json))
-        return gc.open_by_key(sheet_key)
-    except Exception:
-        log.exception("GSheets auth/open failed")
-        return None
-
-def read_fa_map() -> dict:
-    """
-    Возвращает { 'USDJPY': {'risk':'Green','bias':'neutral', ...}, ... }
-    При ошибке — пустой dict (утренник просто не покажет бейджи).
-    """
-    try:
-        sh = _gs_open()
-        if not sh:
-            return {}
-        ws = sh.worksheet("FA_Signals")
-        rows = ws.get_all_records()
-        out = {}
-        for r in rows:
-            sym = str(r.get("pair","")).upper()
-            if not sym:
-                continue
-            out[sym] = {
-                "risk": (str(r.get("risk","Green")).capitalize()),
-                "bias": (str(r.get("bias","neutral")).lower()),
-            }
-        return out
-    except Exception:
-        log.exception("read_fa_map failed")
-        return {}
-
-
 # ---------- Вспомогательные для «инвесторского» дайджеста ----------
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
@@ -702,20 +730,6 @@ def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = N
     return out
 
 # ---- Форматирование блока по согласованному шаблону ----
-def _risk_label(fa_level: str) -> str:
-    L = (fa_level or "").upper()
-    if L.startswith("RED") or "HIGH" in L:
-        return "🔴 высокий риск"
-    if L.startswith("YEL") or "AMBER" in L or "CAUTION" in L:
-        return "⚠️ умеренный риск"
-    return "✅ спокойно"
-
-def _fa_level(row: dict) -> str:
-    v = (row.get("FA_Risk") or row.get("fa_risk") or "").strip().lower()
-    if v.startswith("red"): return "RED"
-    if v.startswith("yellow") or v.startswith("amber"): return "AMBER"
-    return "GREEN"
-
 def _fa_bias(row: dict) -> str:
     b = (row.get("FA_Bias") or row.get("fa_bias") or "").strip().lower()
     if b.startswith("long"): return "LONG"
@@ -777,22 +791,20 @@ def _no_quiet_until(pack: dict) -> str:
     start = (n["utc"] - timedelta(minutes=QUIET_BEFORE_MIN)).astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]
     return f"тихого окна нет до {start:%H:%M}."
 
-def render_symbol_block(symbol: str, row: dict, pack: dict, best_news: Optional[dict], sh, badge_text: str) -> str:
-    title = _pair_to_title(symbol)
-    bias  = _fa_bias(row)
+def render_symbol_block(symbol: str, row: dict, pack: dict, fa_data: dict, sh) -> str:
+    risk = fa_data.get("risk", "Green")
+    bias = fa_data.get("bias", "neutral")
+    dca_scale = float(fa_data.get("dca_scale", 1.0))
+    reserve_on_str = "OFF" if fa_data.get("reserve_off") else "ON"
+    icon = _fa_icon(risk)
+    
+    title = f"{_pair_to_title(symbol)} — {icon} фон {risk.lower()}, bias: {bias.upper()}"
+    
     side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
     avg = price_fmt(symbol, _to_float(row.get("Avg_Price"), None))
     nxt = price_fmt(symbol, _to_float(row.get("Next_DCA_Price"), None))
     what_means, simple_words = _symbol_hints(symbol)
-
-    speed = "сниженная" if "осторожно" in badge_text or "стоп" in badge_text else "обычная"
-    quiet_sentence = _no_quiet_until(pack)
     plan_fact = _plan_vs_fact_line(sh, symbol)
-
-    # Новости
-    news_line = ""
-    if best_news:
-        news_line = f"\n\t•\tТоп-новость: {best_news['local_time_str']} — {_h(best_news['ru_title'])}."
 
     # Ближайшее время/тихое окно
     tail_time = ""
@@ -804,67 +816,58 @@ def render_symbol_block(symbol: str, row: dict, pack: dict, best_news: Optional[
             tail_time = f"\n\t•\tБлижайшее важное время: {nn:%H:%M} — {_h(pack['nearest_next']['title'])}."
 
     return (
-f"""{title} — {badge_text}
-\t•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='SHORT' and symbol=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}
+f"""{title}
+\t•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='short' and symbol=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}
 \t•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.
-\t•\tЧто делаем: скорость докупок — {speed}; {quiet_sentence}
+\t•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve_on_str}; dca_scale <b>{dca_scale:.2f}</b>.
 \t•\tЧто это значит для цены: {what_means}
-\t•\tПлан vs факт по банку: {plan_fact}.{news_line}
+\t•\tПлан vs факт по банку: {plan_fact}.
 Простыми словами: {simple_words}{tail_time}"""
     )
 
+
 # ---------- Digest helpers (сборка полного текста) ----------
-def build_digest_text(sh) -> str:
+def build_digest_text(sh, fa_sheet_data: dict, top_news_item: Optional[dict]) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
     cal = build_calendar_for_symbols(SYMBOLS)
-    news_rows = read_news_rows(sh)
     
-    fa = read_fa_map()
-    def badge(sym: str) -> str:
-        risk = (fa.get(sym, {}) or {}).get("risk", "Green")
-        return FA_BADGE.get(risk, FA_BADGE["Green"])
-
     parts: List[str] = [header]
 
+    if top_news_item:
+        parts.append(f"🗞️ Топ-новость: <b>{_h(top_news_item['title'])}</b> ({_h(top_news_item['source'])})")
+    
     for i, sym in enumerate(SYMBOLS):
         row = get_last_nonempty_row(sh, sym) or {}
-        best_news = choose_top_news_for_symbol(sym, news_rows, now_utc)
-        sym_badge = badge(sym)
-        block = render_symbol_block(sym, row, cal.get(sym, {}), best_news, sh, sym_badge)
+        fa_data = fa_sheet_data.get(sym, {})
+        block = render_symbol_block(sym, row, cal.get(sym, {}), fa_data, sh)
         parts.append(block)
         if i < len(SYMBOLS) - 1:
             parts.append("⸻")
 
-    # Итоговый календарь «на сегодня»
-    today_list = []
-    for sym in SYMBOLS:
-        pack = cal.get(sym, {})
-        evs = pack.get("events") or []
-        for ev in evs:
-            tloc = ev["local"] if LOCAL_TZ else ev["utc"]
-            today_list.append((tloc, f"{_pair_to_title(sym)}: {_h(ev['country'])}: {_h(ev['title'])}", sym))
-
-    if not today_list:
+    # Итоговый календарь «на сегодня», если не было топ-новости
+    if not top_news_item:
+        today_list = []
         for sym in SYMBOLS:
             n = cal.get(sym, {}).get("nearest_next")
             if n:
                 tloc = n["local"] if LOCAL_TZ else n["utc"]
                 today_list.append((tloc, f"{_pair_to_title(sym)}: {_h(n['country'])}: {_h(n['title'])}", sym))
 
-    today_list.sort(key=lambda x: x[0])
-    if today_list:
-        parts.append("Календарь «на сегодня»:")
-        seen = set()
-        for tloc, label, _ in today_list:
-            key = (tloc.strftime("%H:%M"), label)
-            if key in seen: 
-                continue
-            seen.add(key)
-            parts.append(f"\t•\t{tloc:%H:%M} — {label}")
+        today_list.sort(key=lambda x: x[0])
+        if today_list:
+            parts.append("Календарь «на сегодня»:")
+            seen = set()
+            for tloc, label, _ in today_list:
+                key = (tloc.strftime("%H:%M"), label)
+                if key in seen: 
+                    continue
+                seen.add(key)
+                parts.append(f"\t•\t{tloc:%H:%M} — {label}")
 
     parts.append("Главная мысль дня: до ФРС — аккуратно; после пресс-конференции вернёмся к обычному режиму, если не будет сюрпризов.")
     return "\n".join(parts)
+
 
 # -------------------- /digest --------------------
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -890,11 +893,16 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        msg = build_digest_text(sh)
+        fa_sheet = _read_fa_signals_from_sheet(sh)
+        top_news = _pick_top_news(sh)
+        msg = build_digest_text(sh, fa_sheet, top_news)
+        
         for chunk in _split_for_tg_html(msg, 3500):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
     except Exception as e:
+        log.exception("Ошибка сборки дайджеста")
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
+
 
 # -------------------- Диагностика --------------------
 def sheets_diag_text() -> str:
@@ -1012,7 +1020,9 @@ async def morning_digest_scheduler(app: Application):
         try:
             sh, _ = build_sheets_client(SHEET_ID)
             if sh:
-                msg = build_digest_text(sh)
+                fa_sheet_data = _read_fa_signals_from_sheet(sh)
+                top_news = _pick_top_news(sh)
+                msg = build_digest_text(sh, fa_sheet_data, top_news)
                 for chunk in _split_for_tg_html(msg):
                     await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
             else:
