@@ -132,7 +132,6 @@ def load_google_service_info() -> Tuple[Optional[dict], str]:
             return info, "env:GOOGLE_CREDENTIALS_JSON_B64"
         except Exception as e:
             return None, f"b64 present but decode/json error: {e}"
-
     for name in ("GOOGLE_CREDENTIALS_JSON", "GOOGLE_CREDENTIALS"):
         raw = _env(name)
         if raw:
@@ -141,7 +140,6 @@ def load_google_service_info() -> Tuple[Optional[dict], str]:
                 return info, f"env:{name}"
             except Exception as e:
                 return None, f"{name} present but invalid JSON: {e}"
-
     return None, "not-found"
 
 def build_sheets_client(sheet_id: str):
@@ -149,7 +147,6 @@ def build_sheets_client(sheet_id: str):
         return None, "gsheets libs not installed"
     if not sheet_id:
         return None, "sheet_id empty"
-
     info, src = load_google_service_info()
     if not info:
         return None, src
@@ -214,7 +211,7 @@ def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
         parts.append("".join(cur).rstrip())
     return parts
 
-# ===== Данные для дайджеста (BMR, FA, NEWS/CALENDAR) ==========================
+# ===== Данные для дайджеста ====================================================
 
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
@@ -296,16 +293,10 @@ def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
 def _top_news_for_pair(sh, pair: str, now_utc: Optional[datetime] = None) -> str:
-    """
-    Возвращает строку вида 'HH:MM — Title (SRC)' для пары:
-    1) свежая high-новость из NEWS за TTL (по странам пары);
-    2) иначе — ближайшее событие из CALENDAR (по странам пары).
-    """
     now_utc = now_utc or datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(minutes=NEWS_TTL_MIN)
     countries = PAIR_COUNTRIES.get(pair, set())
 
-    # NEWS
     try:
         rows = sh.worksheet("NEWS").get_all_records()
     except Exception:
@@ -337,7 +328,6 @@ def _top_news_for_pair(sh, pair: str, now_utc: Optional[datetime] = None) -> str
         lt = best["ts"].astimezone(LOCAL_TZ)
         return f"{lt:%H:%M} — {best['title']} ({best['src']})"
 
-    # CALENDAR (fallback)
     try:
         events = sh.worksheet(CAL_WS_OUT).get_all_records()
     except Exception:
@@ -424,7 +414,6 @@ def build_digest_text(sh, fa_sheet_data: dict) -> str:
     return "\n".join(parts)
 
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
-    """Лист FA_Signals: pair,risk,bias,ttl,updated_at,scan_lock_until,reserve_off,dca_scale,reason,risk_pct"""
     try:
         ws = sh.worksheet("FA_Signals")
         rows = ws.get_all_records()
@@ -457,7 +446,6 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
 # ===== Автозапись целевого банка в BMR_DCA_* ==================================
 
 def _set_bank_target_in_bmr(sh, symbol: str, amount: float):
-    """Обновляет Bank_Target_USDT в листе BMR_DCA_* для пары symbol (в последней непустой строке)."""
     sheet_name = BMR_SHEETS.get(symbol)
     if not sheet_name:
         return
@@ -471,12 +459,11 @@ def _set_bank_target_in_bmr(sh, symbol: str, amount: float):
         return
     col_ix = header.index("Bank_Target_USDT") + 1
 
-    # найдём последнюю реально заполненную строку
     vals = ws.get_all_values()
     last = len(vals)
     while last > 1 and not any((c or "").strip() for c in vals[last - 1]):
         last -= 1
-    row_ix = max(2, last)  # пишем в последнюю непустую строку
+    row_ix = max(2, last)
     try:
         ws.update_cell(row_ix, col_ix, float(amount))
     except Exception as e:
@@ -574,7 +561,6 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sh, _src = build_sheets_client(SHEET_ID)
     if sh:
-        # лог в FUND_BOT
         try:
             append_row(
                 sh,
@@ -625,70 +611,31 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Ошибка сборки дайджеста")
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
 
-# Диагностика / сервисные
+# ===== Планировщик утреннего дайджеста =======================================
 
-def sheets_diag_text() -> str:
-    sid_state = "set" if SHEET_ID else "empty"
-    if not _GSHEETS_AVAILABLE:
-        return f"Sheets: ❌ (libs not installed, SID={sid_state})"
-    sh, src = build_sheets_client(SHEET_ID)
-    if sh is None:
-        return f"Sheets: ❌ (SID={sid_state}, source={src})"
-    try:
-        ws, created = ensure_worksheet(sh, SHEET_WS, SHEET_HEADERS)
-        mark = "created" if created else "exists"
-        return f"Sheets: ✅ ok (ws={ws.title}:{mark})"
-    except Exception as e:
-        return f"Sheets: ❌ (open ok, ws error: {e})"
-
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        ok = await llm_ping()
-        llm_line = "LLM: ✅ ok" if ok else "LLM: ❌ no key"
-    except Exception:
-        llm_line = "LLM: ❌ error"
-    sheets_line = sheets_diag_text()
-    await update.message.reply_text(f"{llm_line}\n{sheets_line}")
-
-async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not SHEET_ID:
-        await update.message.reply_text("SHEET_ID не задан.")
-        return
-    sh, src = build_sheets_client(SHEET_ID)
-    if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
-        return
-    try:
-        ws, created = ensure_worksheet(sh, SHEET_WS, SHEET_HEADERS)
-        await update.message.reply_text(
-            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
-
-async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sh, src = build_sheets_client(SHEET_ID)
-    if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
-        return
-    try:
-        append_row(
-            sh,
-            SHEET_WS,
-            [
-                datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                str(update.effective_chat.id),
-                "test",
-                f"{STATE['total']:.2f}",
-                json.dumps(STATE['weights'], ensure_ascii=False),
-                "manual /sheet_test",
-            ],
-        )
-        await update.message.reply_text("Sheets: ✅ записано (test row).")
-    except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
-
-# ===== Планировщик утреннего дайджеста (JobQueue) =============================
+async def morning_digest_scheduler(app: Application):
+    # Фолбэк-планировщик на случай отсутствия JobQueue
+    import asyncio
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        target = datetime.combine(now.date(), dtime(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ))
+        if now >= target:
+            target += timedelta(days=1)
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+        try:
+            sh, _ = build_sheets_client(SHEET_ID)
+            if sh:
+                fa_sheet_data = _read_fa_signals_from_sheet(sh)
+                msg = build_digest_text(sh, fa_sheet_data)
+                for chunk in _split_for_tg_html(msg):
+                    await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
+            else:
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
+        except Exception as e:
+            try:
+                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+            except Exception:
+                pass
 
 async def morning_digest_job(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -726,12 +673,21 @@ async def _post_init(app: Application):
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
 
-    # Планировщик ежедневного дайджеста
-    app.job_queue.run_daily(
-        morning_digest_job,
-        time=dtime(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ),
-        name="morning_digest",
-    )
+    # Попытка использовать JobQueue; если его нет — фолбэк на create_task
+    jq = getattr(app, "job_queue", None)
+    try:
+        if jq is not None:
+            jq.run_daily(
+                morning_digest_job,
+                time=dtime(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ),
+                name="morning_digest",
+            )
+        else:
+            log.warning("JobQueue is None — using fallback scheduler task")
+            app.create_task(morning_digest_scheduler(app))
+    except Exception as e:
+        log.warning("Scheduling digest failed (%s). Fallback to background task.", e)
+        app.create_task(morning_digest_scheduler(app))
 
 # ===== Старт приложения ========================================================
 
@@ -756,8 +712,7 @@ def build_application() -> Application:
 def main():
     log.info("Fund bot is running…")
     app = build_application()
-    # run_polling по умолчанию ставит delete_webhook=True и запускает JobQueue
-    app.run_polling(close_loop=False)
+    app.run_polling()  # безопасный запуск
 
 if __name__ == "__main__":
     main()
