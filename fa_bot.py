@@ -7,7 +7,7 @@ import logging
 import re
 from html import escape as _html_escape
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Iterable
 
 import asyncio
 
@@ -207,6 +207,10 @@ def build_sheets_client(sheet_id: str):
     except Exception as e:
         return None, f"auth/open error: {e}"
 
+async def get_sheets():
+    sh, _ = build_sheets_client(SHEET_ID)
+    return sh
+
 # ---------- Sheets helpers ----------
 SHEET_HEADERS = ["ts", "chat_id", "action", "total", "weights_json", "note"]
 
@@ -228,6 +232,21 @@ def append_row(sh, title: str, row: list):
 # --- helpers: Google Sheets → FA/NEWS -------------------------------------------------
 def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
+
+def _to_local_hhmm(ts_utc: datetime) -> str:
+    try:
+        dt = ts_utc.astimezone(LOCAL_TZ) if LOCAL_TZ else ts_utc
+        return dt.strftime("%H:%M")
+    except Exception:
+        return "—"
+
+# какие источники/страны считаем профильными для каждой пары
+PAIR_PREF = {
+    "USDJPY": {"sources": {"US_FED_PR","JP_MOF_FX"}, "countries": {"united states","japan"}, "ccy": {"USD","JPY"}},
+    "AUDUSD": {"sources": {"RBA_MR","US_FED_PR"},       "countries": {"australia","united states"}, "ccy": {"AUD","USD"}},
+    "EURUSD": {"sources": {"ECB_PR","US_FED_PR"},       "countries": {"euro area","united states"}, "ccy": {"EUR","USD"}},
+    "GBPUSD": {"sources": {"BOE_PR","US_FED_PR"},       "countries": {"united kingdom","united states"}, "ccy": {"GBP","USD"}},
+}
 
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
     """
@@ -264,8 +283,8 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
         }
     return out
 
-def _pick_top_news(sh, lookback_hours: int = int(os.getenv("DIGEST_NEWS_LOOKBACK_H", "48"))) -> Optional[dict]:
-    """Берём самую свежую importance=high из NEWS за lookback_hours."""
+def _pick_pair_top_news(sh, pair: str, lookback_hours: int = int(os.getenv("DIGEST_NEWS_LOOKBACK_H","48"))) -> Optional[dict]:
+    """Самая свежая importance=high из NEWS для конкретной пары за окно."""
     try:
         ws = sh.worksheet("NEWS")
         rows = ws.get_all_records()
@@ -273,24 +292,60 @@ def _pick_top_news(sh, lookback_hours: int = int(os.getenv("DIGEST_NEWS_LOOKBACK
         rows = []
     if not rows:
         return None
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=lookback_hours)
+    pref = PAIR_PREF.get(pair, {"sources": set(), "countries": set(), "ccy": set()})
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    # 1) профильные источники
     for r in reversed(rows):
         try:
             ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
         except Exception:
             continue
-        if ts < cutoff:
-            break
-        if str(r.get("importance_guess", "")).lower() != "high":
+        if ts < cutoff: break
+        if str(r.get("importance_guess","")).lower() != "high": continue
+        if str(r.get("source","")).strip().upper() in pref["sources"]:
+            return {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip(), "url": str(r.get("url","")).strip()}
+    # 2) совпадение стран/валют
+    for r in reversed(rows):
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
             continue
-        return {
-            "ts": ts,
-            "title": str(r.get("title", "")).strip(),
-            "source": str(r.get("source", "")).strip(),
-            "url": str(r.get("url", "")).strip(),
-        }
+        if ts < cutoff: break
+        if str(r.get("importance_guess","")).lower() != "high": continue
+        ctry = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
+        ccy  = str(r.get("ccy","")).strip().upper()
+        if (ctry & pref["countries"]) or (ccy and ccy in pref["ccy"]):
+            return {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip(), "url": str(r.get("url","")).strip()}
     return None
+
+def _pick_pair_top_calendar(sh, pair: str, horizon_hours: int = 96) -> Optional[dict]:
+    """Фолбэк: ближайшее high-impact событие по странам/валютам пары из CALENDAR (+/- horizon_hours)."""
+    try:
+        ws = sh.worksheet("CALENDAR")
+        rows = ws.get_all_records()
+    except Exception:
+        rows = []
+    if not rows:
+        return None
+    pref = PAIR_PREF.get(pair, {"countries": set(), "ccy": set()})
+    now = datetime.now(timezone.utc)
+    best = None
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(str(r.get("utc_iso")).replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if abs((ts - now).total_seconds()) > horizon_hours*3600: 
+            continue
+        if str(r.get("impact","")).lower() != "high":
+            continue
+        ctry = str(r.get("country","")).strip().lower()
+        ccy  = str(r.get("currency","")).strip().upper()
+        if (ctry and ctry in pref["countries"]) or (ccy and ccy in pref["ccy"]):
+            # выбираем ближайшее по модулю времени
+            if (best is None) or (abs((ts - now).total_seconds()) < abs((best["ts"] - now).total_seconds())):
+                best = {"ts": ts, "title": str(r.get("title","")).strip(), "source": str(r.get("source","")).strip() or "CAL", "url": str(r.get("url","")).strip()}
+    return best
 
 
 # ---------- NEWS (READ FROM SHEET) ----------
@@ -602,140 +657,6 @@ def importance_is_high(val) -> bool:
     s = str(val).strip().lower()
     return "high" in s or s == "3"
 
-# ---- Календарь (FF / лист CALENDAR как fallback) ----
-def fetch_calendar_events_ff_all() -> List[dict]:
-    if not _REQUESTS_AVAILABLE:
-        return _FF_CACHE["data"]
-    import time
-    now = int(time.time())
-
-    if _FF_NEG["until"] and now < _FF_NEG["until"]:
-        return _FF_CACHE["data"]
-
-    if _FF_CACHE["data"] and (now - _FF_CACHE["at"] < CAL_TTL_SEC):
-        return _FF_CACHE["data"]
-
-    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "fund-bot/1.0"})
-        if r.status_code == 429:
-            _FF_NEG["until"] = now + 120
-            log.warning("calendar fetch (FF) 429: backoff 120s")
-            return _FF_CACHE["data"]
-        r.raise_for_status()
-
-        raw = r.json()
-        data = []
-        for it in raw or []:
-            ts = it.get("timestamp")
-            if not ts: continue
-            dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            country_raw = (it.get("country") or "").strip()
-            country = FF_CODE2NAME.get(country_raw.lower(), country_raw)
-            data.append({
-                "utc": dt_utc,
-                "country": country,
-                "title": it.get("title") or it.get("event") or "Event",
-                "importance": it.get("impact") or "",
-            })
-        _FF_CACHE["data"] = data
-        _FF_CACHE["at"] = now
-        _FF_NEG["until"] = 0
-        return data
-    except Exception as e:
-        log.warning("calendar fetch (FF) failed: %s", e)
-        return _FF_CACHE["data"] or []
-
-def read_calendar_rows_sheet(sh) -> List[dict]:
-    try:
-        ws = sh.worksheet(CAL_WS)
-        rows = ws.get_all_records()
-    except Exception:
-        return []
-    out = []
-    for r in rows:
-        utc = _norm_iso_to_utc_dt(r.get("utc_iso"))
-        if not utc:
-            continue
-        out.append({
-            "utc": utc,
-            "country": str(r.get("country","")).strip().lower(),
-            "title":   str(r.get("title","")).strip(),
-            "importance": str(r.get("impact","")).strip(),
-        })
-    return out
-
-def build_calendar_for_symbols(symbols: List[str], window_min: Optional[int] = None) -> Dict[str, dict]:
-    now = datetime.now(timezone.utc)
-    w = window_min if window_min is not None else CAL_WINDOW_MIN
-    d1 = now - timedelta(minutes=w)
-    d2 = now + timedelta(minutes=w)
-
-    if LOCAL_TZ:
-        now_loc = now.astimezone(LOCAL_TZ)
-        day_start_loc = now_loc.replace(hour=0, minute=0, second=0, microsecond=0)
-        d1_ext = day_start_loc - timedelta(days=1)
-        d2_ext = day_start_loc + timedelta(days=2)
-        d1_ext, d2_ext = d1_ext.astimezone(timezone.utc), d2_ext.astimezone(timezone.utc)
-    else:
-        d1_ext, d2_ext = now - timedelta(hours=36), now + timedelta(hours=36)
-
-    all_raw_events = fetch_calendar_events_ff_all() if CAL_PROVIDER in ('ff', 'auto') else None
-    if (all_raw_events is not None) and not all_raw_events:
-        sh, _ = build_sheets_client(SHEET_ID)
-        if sh:
-            all_raw_events = read_calendar_rows_sheet(sh)
-
-    out: Dict[str, dict] = {}
-    for sym in symbols:
-        countries = PAIR_COUNTRIES.get(sym, [])
-        if all_raw_events is not None:
-            want = {c.lower() for c in countries}
-            sym_raw_all = [ev for ev in all_raw_events if ev["country"].lower() in want]
-        else:
-            sym_raw_all = []
-
-        around = [
-            {**ev, "local": ev["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["utc"]}
-            for ev in sym_raw_all
-            if importance_is_high(ev.get("importance")) and d1 <= ev["utc"] <= d2
-        ]
-        around.sort(key=lambda x: x["utc"])
-
-        nearest_prev = nearest_next = None
-        high_events = [ev for ev in sym_raw_all if importance_is_high(ev.get("importance"))]
-        past = [ev for ev in high_events if ev["utc"] < now]
-        futr = [ev for ev in high_events if ev["utc"] >= now]
-        if past:
-            p = max(past, key=lambda e: e["utc"])
-            nearest_prev = {**p, "local": p["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else p["utc"]}
-        if futr:
-            n = min(futr, key=lambda e: e["utc"])
-            nearest_next = {**n, "local": n["utc"].astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]}
-
-        quiet_now = False
-        if nearest_next:
-            start_q = nearest_next["utc"] - timedelta(minutes=QUIET_BEFORE_MIN)
-            end_q = nearest_next["utc"] + timedelta(minutes=QUIET_AFTER_MIN)
-            quiet_now = start_q <= now <= end_q
-
-        out[sym] = {
-            "events": around,
-            "nearest_prev": nearest_prev,
-            "nearest_next": nearest_next,
-            "quiet_now": quiet_now,
-            "quiet_from_to": (QUIET_BEFORE_MIN, QUIET_AFTER_MIN) if nearest_next else (0, 0),
-        }
-
-    return out
-
-# ---- Форматирование блока по согласованному шаблону ----
-def _fa_bias(row: dict) -> str:
-    b = (row.get("FA_Bias") or row.get("fa_bias") or "").strip().lower()
-    if b.startswith("long"): return "LONG"
-    if b.startswith("short"): return "SHORT"
-    return "BOTH"
-
 def _symbol_hints(symbol: str) -> tuple[str,str]:
     # (что это значит для цены, простыми словами)
     if symbol == "USDJPY":
@@ -777,21 +698,7 @@ def _plan_vs_fact_line(sh, symbol: str) -> str:
     else: mark = f"🚧 {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
     return f"план {tt:g} / факт {ff:g} — {mark}"
 
-def _quiet_line(pack: dict) -> str:
-    n = pack.get("nearest_next")
-    if not n:
-        return "тихого окна нет."
-    start = (n["utc"] - timedelta(minutes=QUIET_BEFORE_MIN)).astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]
-    end   = (n["utc"] + timedelta(minutes=QUIET_AFTER_MIN)).astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]
-    return f"Тихое окно: {start:%H:%M}–{end:%H:%M}"
-
-def _no_quiet_until(pack: dict) -> str:
-    n = pack.get("nearest_next")
-    if not n: return "тихого окна нет."
-    start = (n["utc"] - timedelta(minutes=QUIET_BEFORE_MIN)).astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]
-    return f"тихого окна нет до {start:%H:%M}."
-
-def render_symbol_block(symbol: str, row: dict, pack: dict, fa_data: dict, sh) -> str:
+def render_symbol_block(symbol: str, row: dict, fa_data: dict, sh, top_news: Optional[dict]) -> str:
     risk = fa_data.get("risk", "Green")
     bias = fa_data.get("bias", "neutral")
     dca_scale = float(fa_data.get("dca_scale", 1.0))
@@ -806,64 +713,40 @@ def render_symbol_block(symbol: str, row: dict, pack: dict, fa_data: dict, sh) -
     what_means, simple_words = _symbol_hints(symbol)
     plan_fact = _plan_vs_fact_line(sh, symbol)
 
-    # Ближайшее время/тихое окно
-    tail_time = ""
-    if pack.get("nearest_next"):
-        if pack.get("events"):
-            tail_time = f"\n\t•\t{_quiet_line(pack)}"
-        else:
-            nn = pack["nearest_next"]["local"] if LOCAL_TZ else pack["nearest_next"]["utc"]
-            tail_time = f"\n\t•\tБлижайшее важное время: {nn:%H:%M} — {_h(pack['nearest_next']['title'])}."
+    lines = [title]
+    lines.append(f"•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='short' and symbol=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}")
+    lines.append(f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.")
+    lines.append(f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve_on_str}; dca_scale <b>{dca_scale:.2f}</b>.")
+    
+    if top_news:
+        lines.append(f"•\tТоп-новость: {_to_local_hhmm(top_news['ts'])} — {_h(top_news['title'])} ({_h(top_news['source'])}).")
 
-    return (
-f"""{title}
-\t•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='short' and symbol=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}
-\t•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.
-\t•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve_on_str}; dca_scale <b>{dca_scale:.2f}</b>.
-\t•\tЧто это значит для цены: {what_means}
-\t•\tПлан vs факт по банку: {plan_fact}.
-Простыми словами: {simple_words}{tail_time}"""
-    )
+    lines.append(f"•\tЧто это значит для цены: {what_means}")
+    lines.append(f"•\tПлан vs факт по банку: {plan_fact}.")
+    lines.append(f"Простыми словами: {simple_words}")
+
+    return "\n".join(lines)
 
 
 # ---------- Digest helpers (сборка полного текста) ----------
-def build_digest_text(sh, fa_sheet_data: dict, top_news_item: Optional[dict]) -> str:
+def build_digest_text(sh, fa_sheet_data: dict) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
-    cal = build_calendar_for_symbols(SYMBOLS)
     
     parts: List[str] = [header]
-
-    if top_news_item:
-        parts.append(f"🗞️ Топ-новость: <b>{_h(top_news_item['title'])}</b> ({_h(top_news_item['source'])})")
     
     for i, sym in enumerate(SYMBOLS):
         row = get_last_nonempty_row(sh, sym) or {}
         fa_data = fa_sheet_data.get(sym, {})
-        block = render_symbol_block(sym, row, cal.get(sym, {}), fa_data, sh)
+        
+        top_news = _pick_pair_top_news(sh, sym)
+        if not top_news:
+            top_news = _pick_pair_top_calendar(sh, sym)
+
+        block = render_symbol_block(sym, row, fa_data, sh, top_news)
         parts.append(block)
         if i < len(SYMBOLS) - 1:
             parts.append("⸻")
-
-    # Итоговый календарь «на сегодня», если не было топ-новости
-    if not top_news_item:
-        today_list = []
-        for sym in SYMBOLS:
-            n = cal.get(sym, {}).get("nearest_next")
-            if n:
-                tloc = n["local"] if LOCAL_TZ else n["utc"]
-                today_list.append((tloc, f"{_pair_to_title(sym)}: {_h(n['country'])}: {_h(n['title'])}", sym))
-
-        today_list.sort(key=lambda x: x[0])
-        if today_list:
-            parts.append("Календарь «на сегодня»:")
-            seen = set()
-            for tloc, label, _ in today_list:
-                key = (tloc.strftime("%H:%M"), label)
-                if key in seen: 
-                    continue
-                seen.add(key)
-                parts.append(f"\t•\t{tloc:%H:%M} — {label}")
 
     parts.append("Главная мысль дня: до ФРС — аккуратно; после пресс-конференции вернёмся к обычному режиму, если не будет сюрпризов.")
     return "\n".join(parts)
@@ -894,8 +777,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         fa_sheet = _read_fa_signals_from_sheet(sh)
-        top_news = _pick_top_news(sh)
-        msg = build_digest_text(sh, fa_sheet, top_news)
+        msg = build_digest_text(sh, fa_sheet)
         
         for chunk in _split_for_tg_html(msg, 3500):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
@@ -1021,8 +903,7 @@ async def morning_digest_scheduler(app: Application):
             sh, _ = build_sheets_client(SHEET_ID)
             if sh:
                 fa_sheet_data = _read_fa_signals_from_sheet(sh)
-                top_news = _pick_top_news(sh)
-                msg = build_digest_text(sh, fa_sheet_data, top_news)
+                msg = build_digest_text(sh, fa_sheet_data)
                 for chunk in _split_for_tg_html(msg):
                     await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
             else:
