@@ -1,129 +1,107 @@
-# news_augment.py — докидывает недостающие источники в лист NEWS
-# GBP: Bank of England /news (фикс 302→404)
-# JPY: Bank of Japan (mpm decisions / minutes / statements)
-# JP MoF FX: страница про интервенции (en/jp) — если доступна
-#
-# ENV (минимум):
-#   SHEET_ID
-#   GOOGLE_CREDENTIALS_JSON_B64  (или GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS)
-#   RUN_FOREVER=1                (по умолчанию крутится циклом)
-#   AUGMENT_EVERY_MIN=30         (как часто пробегать)
-#   FA_NEWS_KEYWORDS             (регексп слов для high-важности; есть дефолт)
-#   JINA_PROXY=https://r.jina.ai/http/  (фолбэк на 403/404)
-#   LOCAL_TZ (опционально, не используется тут)
-
-import os, re, time, json, base64, logging
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Set
-from datetime import datetime, timezone
+# news_augment.py — дополняет лист NEWS локальными источниками (GBP/JPY), без изменений основного кода
+import os, re, json, base64, time, logging, html as _html
+from typing import Optional, List, Tuple
+from datetime import datetime, timezone, timedelta
+from html import unescape as _html_unescape
 
 import httpx
 
-# ----- Logging
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-log = logging.getLogger("news_augment")
+# ====== ENV / CONFIG ======
+SHEET_ID = os.getenv("SHEET_ID","").strip()
+RUN_FOREVER = (os.getenv("NEWS_AUGMENT_RUN_FOREVER","1").lower() in ("1","true","yes","on"))
+EVERY_MIN = int(os.getenv("NEWS_AUGMENT_EVERY_MIN","30") or "30")
+LOG_LEVEL = os.getenv("LOG_LEVEL","INFO").upper()
+JINA_PROXY = os.getenv("JINA_PROXY","https://r.jina.ai/http/").rstrip("/") + "/"
 
-# ----- ENV
-SHEET_ID = (os.getenv("SHEET_ID", "") or "").strip()
-RUN_FOREVER = os.getenv("RUN_FOREVER", "1").lower() in ("1", "true", "yes", "on")
-AUGMENT_EVERY_MIN = int(os.getenv("AUGMENT_EVERY_MIN", "30") or "30")
-JINA_PROXY = os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/"
+# Совместимость с calendar_collector: тот же заголовок для NEWS
+NEWS_HEADERS = ["ts_utc","source","title","url","countries","ccy","tags","importance_guess","hash"]
 
+# Ключевые слова «высокой важности» — совпадают с calendar_collector
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
-    # покрывает MPC/BoE, решения, заявления, пресс-конфы, интервенции
-    r"(bank rate|monetary policy|mpc|policy decision|rate decision|policy statement|"
-    r"press conference|statement|minutes|fx intervention|intervention|unscheduled|emergency)"
+    "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
+    "intervention|FX intervention|press conference|policy statement|policy statements|"
+    "rate statement|cash rate|fomc|mpc"
 ), re.I)
 
-NEWS_HEADERS = ["ts_utc", "source", "title", "url", "countries", "ccy", "tags", "importance_guess", "hash"]
+# ====== Logging ======
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("news_augment")
 
-# ----- Google Sheets
+# ====== Google Sheets ======
 try:
     import gspread
     from google.oauth2 import service_account
-    _GSHEETS_AVAILABLE = True
+    _GSHEETS = True
 except Exception:
     gspread = None
     service_account = None
-    _GSHEETS_AVAILABLE = False
+    _GSHEETS = False
 
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-def _decode_b64_json(s: str) -> dict | None:
+def _decode_b64_to_json(s: str) -> Optional[dict]:
     s = (s or "").strip()
-    if not s:
-        return None
+    if not s: return None
     s += "=" * ((4 - len(s) % 4) % 4)
     try:
-        return json.loads(base64.b64decode(s).decode("utf-8", "strict"))
+        return json.loads(base64.b64decode(s).decode("utf-8","strict"))
     except Exception:
         return None
 
-
-def _load_sa_info() -> dict | None:
-    info = _decode_b64_json(os.getenv("GOOGLE_CREDENTIALS_JSON_B64", ""))
-    if info:
-        return info
-    for k in ("GOOGLE_CREDENTIALS_JSON", "GOOGLE_CREDENTIALS"):
-        raw = (os.getenv(k, "") or "").strip()
+def _load_service_info() -> Optional[dict]:
+    info = _decode_b64_to_json(os.getenv("GOOGLE_CREDENTIALS_JSON_B64",""))
+    if info: return info
+    for k in ("GOOGLE_CREDENTIALS_JSON","GOOGLE_CREDENTIALS"):
+        raw = os.getenv(k,"").strip()
         if raw:
-            try:
-                return json.loads(raw)
-            except Exception:
-                pass
+            try: return json.loads(raw)
+            except Exception: pass
     return None
 
-
-def build_sheets_client(sheet_id: str):
-    if not _GSHEETS_AVAILABLE:
+def open_sheet(sheet_id: str):
+    if not _GSHEETS:
         return None, "gsheets libs not installed"
     if not sheet_id:
-        return None, "SHEET_ID env empty"
-    info = _load_sa_info()
+        return None, "SHEET_ID empty"
+    info = _load_service_info()
     if not info:
         return None, "no service account json"
     try:
-        creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
         gc = gspread.authorize(creds)
-        return gc.open_by_key(sheet_id), "ok"
+        sh = gc.open_by_key(sheet_id)
+        return sh, "ok"
     except Exception as e:
         return None, f"auth/open error: {e}"
 
-
-def ensure_worksheet(sh, title: str, headers: List[str]):
+def ensure_news_ws(sh):
     for ws in sh.worksheets():
-        if ws.title == title:
+        if ws.title == "NEWS":
             try:
-                cur = ws.get_values("A1:Z1") or [[]]
-                if not cur or cur[0] != headers:
-                    ws.update(range_name="A1", values=[headers])
+                cur = ws.get_values("A1:I1") or [[]]
+                if not cur or cur[0] != NEWS_HEADERS:
+                    ws.update(range_name="A1", values=[NEWS_HEADERS])
             except Exception:
                 pass
-            return ws, False
-    ws = sh.add_worksheet(title=title, rows=300, cols=max(10, len(headers)))
-    ws.update(range_name="A1", values=[headers])
-    return ws, True
+            return ws
+    ws = sh.add_worksheet(title="NEWS", rows=1000, cols=9)
+    ws.update(range_name="A1", values=[NEWS_HEADERS])
+    return ws
 
-
-def _existing_hashes(ws, col_letter: str = "I") -> Set[str]:
+def _read_existing_hashes(ws) -> set:
     try:
-        rng = f"{col_letter}2:{col_letter}10000"
-        col = ws.get_values(rng)
+        col = ws.get_values("I2:I10000")
         return {r[0] for r in col if r and r[0]}
     except Exception:
         return set()
 
-
-# ----- HTTP helpers
-def fetch_text(url: str, timeout=15.0) -> Tuple[str, int, str]:
-    """GET с fallback через Jina proxy на 403/404."""
+# ====== HTTP helpers ======
+def fetch_text(url: str, timeout=15.0) -> Tuple[str,int,str]:
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (LPBot/news-augment)"}) as cli:
+        with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent":"Mozilla/5.0 (LPBot/1.0)"}) as cli:
             r = cli.get(url)
-            if r.status_code in (403, 404):
+            if r.status_code in (403,404):
                 pr = cli.get(JINA_PROXY + url)
                 return pr.text, pr.status_code, str(pr.url)
             return r.text, r.status_code, str(r.url)
@@ -131,152 +109,160 @@ def fetch_text(url: str, timeout=15.0) -> Tuple[str, int, str]:
         log.warning("fetch failed %s: %s", url, e)
         return "", 0, url
 
+def _clean_html_text(s: str) -> str:
+    if not s: return ""
+    s = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = _html.unescape(s)
+    return re.sub(r"\s+"," ", s).strip()
 
-def _strip_html(s: str) -> str:
-    return re.sub(r"<[^>]+>", " ", s or "").strip()
-
-
-@dataclass
+# ====== News row model ======
 class NewsItem:
-    ts_utc: datetime
-    source: str
-    title: str
-    url: str
-    countries: str
-    ccy: str
-    tags: str
-    importance_guess: str
+    __slots__ = ("ts_utc","source","title","url","countries","ccy","tags","importance")
+    def __init__(self, ts_utc: datetime, source: str, title: str, url: str, countries: str, ccy: str, tags: str, importance: str):
+        self.ts_utc = ts_utc
+        self.source = source
+        self.title = title
+        self.url = url
+        self.countries = countries
+        self.ccy = ccy
+        self.tags = tags
+        self.importance = importance
 
-    def row(self) -> List[str]:
-        clean_title = re.sub(r"\s+", " ", _strip_html(self.title)).strip()
-        h = re.sub(r"\s+", " ", f"{self.source}|{self.url}".strip())[:180]
+    def key_hash(self) -> str:
+        return f"{self.source}|{self.url}"[:180]
+
+    def to_row(self) -> List[str]:
+        clean_title = _html_unescape(re.sub(r"<[^>]+>", "", self.title)).strip() or self.title.strip()
         return [
-            self.ts_utc.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            self.ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             self.source,
             clean_title,
             self.url,
             self.countries,
             self.ccy,
             self.tags,
-            self.importance_guess,
-            h,
+            self.importance,
+            self.key_hash(),
         ]
 
+def _importance(title: str, url: str) -> str:
+    hay = f"{title} {url}"
+    return "high" if KW_RE.search(hay) else "medium"
 
-# ----- Scrapers (добавляем недостающее)
-def scrape_boe(now: datetime) -> List[NewsItem]:
-    """Bank of England: общая лента /news; high если триггерится по ключевым словам."""
-    items: List[NewsItem] = []
-    txt, code, _ = fetch_text("https://www.bankofengland.co.uk/news")
-    if not code:
-        return items
-    for m in re.finditer(r'href="(/news/20\d{2}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-        u = "https://www.bankofengland.co.uk" + m.group(1)
-        t = _strip_html(m.group(2))
-        imp = "high" if KW_RE.search(t) else "medium"
-        items.append(NewsItem(now, "BOE_PR", t or "BoE News", u, "united kingdom", "GBP", "boe", imp))
-    return items
+# ====== Parsers we ДОБАВЛЯЕМ (GBP, JPY) ======
 
+def collect_boe() -> List[NewsItem]:
+    """Bank of England — GBP/UK. Собираем с /news (абсолютные и относительные ссылки)."""
+    base = "https://www.bankofengland.co.uk"
+    txt, code, _ = fetch_text(base + "/news")
+    out: List[NewsItem] = []
+    if code:
+        now = datetime.now(timezone.utc)
+        # 1) Абсолютные и относительные ссылки вида /news/20xx/...
+        for m in re.finditer(r'href="(?:(https?://www\.bankofengland\.co\.uk)?(/news/20\d{2}/[^"#?]+))"[^>]*>(.*?)</a>', txt, re.I):
+            abs_host, rel, label = m.group(1) or "", m.group(2), (m.group(3) or "").strip()
+            url = (abs_host or base) + rel
+            title = _clean_html_text(label) or rel.rsplit("/",1)[-1].replace("-", " ").title()
+            imp = _importance(title, url)
+            out.append(NewsItem(now, "BOE_PR", title, url, "united kingdom", "GBP", "boe", imp))
 
-def scrape_boj(now: datetime) -> List[NewsItem]:
-    """Bank of Japan: набор страниц с решениями/минутами/заявлениями."""
-    items: List[NewsItem] = []
-    pages = [
-        "https://www.boj.or.jp/en/mopo/mpmdeci/index.htm",                  # Monetary Policy Releases
-        "https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2025/index.htm",        # All decisions (by year)
-        "https://www.boj.or.jp/en/mopo/mpmdeci/state_2025/index.htm",      # Statements on Monetary Policy
-        "https://www.boj.or.jp/en/mopo/mpmdeci/minu_2025/index.htm",       # Minutes
-        "https://www.boj.or.jp/en/mopo/mpmdeci/opinion_2025/index.htm",    # Summary of Opinions
-        "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm",            # Meetings & minutes hub
-    ]
-    seen_urls: Set[str] = set()
-    for url in pages:
+        # 2) На некоторых страницах внутри карточки ссылка лежит в data-attribute:
+        for m in re.finditer(r'data-gtm-(?:link|cta)="[^"]*"\s+href="(?:(https?://www\.bankofengland\.co\.uk)?(/news/20\d{2}/[^"#?]+))"', txt, re.I):
+            abs_host, rel = m.group(1) or "", m.group(2)
+            url = (abs_host or base) + rel
+            title = url.rsplit("/",1)[-1].replace("-", " ").title()
+            imp = _importance(title, url)
+            out.append(NewsItem(now, "BOE_PR", title, url, "united kingdom", "GBP", "boe", imp))
+    log.info("BOE collected: %d", len(out))
+    return out
+
+def collect_boj() -> List[NewsItem]:
+    """Bank of Japan — JPY/JP. Берём два «якоря» раздела."""
+    out: List[NewsItem] = []
+    now = datetime.now(timezone.utc)
+
+    def _grab(url: str, tag: str):
         txt, code, _ = fetch_text(url)
-        if not code:
-            continue
-        for m in re.finditer(r'href="(/en/mopo/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
-            href = m.group(1)
-            # ограничим на осмысленные разделы
-            if not re.search(r"(mpmdeci|mpmsche_minu)", href, re.I):
-                continue
-            u = "https://www.boj.or.jp" + href
-            if u in seen_urls:
-                continue
-            seen_urls.add(u)
-            t = _strip_html(m.group(2)) or "BoJ monetary policy"
-            imp = "high" if KW_RE.search(t + " monetary policy mpm decision statement minutes") else "medium"
-            items.append(NewsItem(now, "BOJ_PR", t, u, "japan", "JPY", "boj mpm", imp))
-    return items
+        if not code: return
+        # ссылки на решения/заявления/списки по годам, pdf и htm
+        for m in re.finditer(r'href="(?:(https?://www\.boj\.or\.jp)?(/en/mopo/(?:mpmdeci|mpmsche_minu)/[^"]+\.(?:htm|pdf)))"', txt, re.I):
+            host, rel = m.group(1) or "https://www.boj.or.jp", m.group(2)
+            u = host + rel
+            t = rel.rsplit("/",1)[-1]
+            title = _clean_html_text(t.replace("_"," ").replace("-", " ").split(".")[0]).title()
+            out.append(NewsItem(now, "BOJ_PR", title or "BoJ document", u, "japan", "JPY", "boj mpm", "high"))
 
+        # и директории/«by year»
+        for m in re.finditer(r'href="(?:(https?://www\.boj\.or\.jp)?(/en/mopo/(?:mpmdeci|mpmsche_minu)/[^"]+/))"', txt, re.I):
+            host, rel = m.group(1) or "https://www.boj.or.jp", m.group(2)
+            u = host + rel
+            seg = rel.strip("/").rsplit("/",1)[-1]
+            title = _clean_html_text(seg.replace("_"," ").replace("-", " ")).title()
+            out.append(NewsItem(now, "BOJ_PR", title or "BoJ page", u, "japan", "JPY", "boj mpm", "high"))
 
-def scrape_mof_fx(now: datetime) -> List[NewsItem]:
-    """JP MoF FX page — если открывается и содержит keywords «intervention/announcement», добавляем одну ссылку."""
-    items: List[NewsItem] = []
-    candidates = [
+    _grab("https://www.boj.or.jp/en/mopo/mpmdeci/index.htm", "mpmdeci")
+    _grab("https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm", "mpmsche_minu")
+
+    log.info("BoJ collected: %d", len(out))
+    return out
+
+def collect_jp_mof_fx() -> List[NewsItem]:
+    """MoF FX interventions — если страница доступна (часто 404)."""
+    urls = [
         "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/",
         "https://www.mof.go.jp/policy/international_policy/reference/foreign_exchange_intervention/",
     ]
-    for url in candidates:
-        txt, code, real = fetch_text(url)
-        if code == 200 and re.search(r"(intervention|announcement)", txt, re.I):
-            items.append(NewsItem(now, "JP_MOF_FX", "FX intervention reference page", real, "japan", "JPY", "mof", "high"))
-            break
-    return items
-
-
-def collect_candidates() -> List[NewsItem]:
     now = datetime.now(timezone.utc)
-    all_items: List[NewsItem] = []
-    all_items += scrape_boe(now)
-    all_items += scrape_boj(now)
-    all_items += scrape_mof_fx(now)
-    return all_items
+    out: List[NewsItem] = []
+    for u in urls:
+        txt, code, eff = fetch_text(u)
+        if code == 200 and re.search(r"intervention|announcement", txt, re.I):
+            out.append(NewsItem(now, "JP_MOF_FX", "FX intervention reference page", eff, "japan", "JPY", "mof", "high"))
+            break
+    log.info("JP MoF FX collected: %d", len(out))
+    return out
 
-
-# ----- Writer
-def write_to_news(sh, items: List[NewsItem]) -> int:
-    ws, _ = ensure_worksheet(sh, "NEWS", NEWS_HEADERS)
-    existing = _existing_hashes(ws, "I")
-    rows = []
-    added = 0
-    for it in items:
-        h = re.sub(r"\s+", " ", f"{it.source}|{it.url}".strip())[:180]
-        if h in existing:
-            continue
-        rows.append(it.row())
-        existing.add(h)
-        added += 1
+# ====== Write to NEWS ======
+def append_news_rows(sh, items: List[NewsItem]) -> int:
+    if not items: return 0
+    ws = ensure_news_ws(sh)
+    existing = _read_existing_hashes(ws)
+    rows = [n.to_row() for n in items if n.key_hash() not in existing]
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
-    return added
+    log.info("NEWS augment: +%d rows", len(rows))
+    return len(rows)
 
-
-# ----- Main loop
+# ====== Main cycle ======
 def run_once():
     if not SHEET_ID:
         raise RuntimeError("SHEET_ID env empty")
-    sh, why = build_sheets_client(SHEET_ID)
+    sh, status = open_sheet(SHEET_ID)
     if not sh:
-        raise RuntimeError(why)
+        raise RuntimeError(f"Sheets not ready: {status}")
 
-    items = collect_candidates()
+    items: List[NewsItem] = []
+    items += collect_boe()      # GBP
+    items += collect_boj()      # JPY
+    items += collect_jp_mof_fx()# JPY (при доступности)
+
     log.info("augment collected: %d new candidates", len(items))
-    added = write_to_news(sh, items)
-    log.info("NEWS augment: +%d rows", added)
-
+    append_news_rows(sh, items)
 
 def main():
+    if not SHEET_ID:
+        raise RuntimeError("SHEET_ID env empty")
     if RUN_FOREVER:
-        interval = max(1, AUGMENT_EVERY_MIN) * 60
+        interval = max(1, EVERY_MIN) * 60
         while True:
             try:
                 run_once()
             except Exception:
-                log.exception("news_augment: augment iteration failed")
+                log.exception("news_augment iteration failed")
             time.sleep(interval)
     else:
         run_once()
-
 
 if __name__ == "__main__":
     main()
