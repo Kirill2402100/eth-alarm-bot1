@@ -29,6 +29,13 @@ LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else N
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
 
+# --- FA badges (трёхстатусная шкала) ---
+FA_BADGE = {
+    "Green": "✅ спокойно",
+    "Amber": "🟡 осторожно",
+    "Red":   "🛑 стоп докупок",
+}
+
 # --- Лимитер Telegram (может быть не установлен) ---
 try:
     from telegram.ext import AIORateLimiter
@@ -235,13 +242,11 @@ DIGEST_NEWS_KEYWORDS = re.compile(
     re.I
 )
 
-# --- ВСТАВИТЬ РЯДОМ С ДРУГИМИ УТИЛИТАМИ ДАТЫ ---
 def _norm_iso_to_utc_dt(s: str):
     import re
     s = str(s or "").strip()
     if not s:
         return None
-    # нормализация форматов: "YYYY-MM-DD HH:MM:SS+0000" → "YYYY-MM-DDTHH:MM:SS+00:00"
     s = s.replace(" ", "T").replace("Z", "+00:00")
     s = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', s)
     try:
@@ -249,7 +254,6 @@ def _norm_iso_to_utc_dt(s: str):
     except Exception:
         return None
 
-# --- ЗАМЕНИ read_news_rows целиком ---
 def read_news_rows(sh) -> List[dict]:
     try:
         ws = sh.worksheet(NEWS_WS)
@@ -472,6 +476,46 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning("append_row alloc failed: %s", e)
 
+# ── Чтение статусов FA из листа FA_Signals ────────────────────────────────────
+def _gs_open() -> Optional[gspread.Spreadsheet]:
+    """Лёгкая авторизация в Google Sheets через JSON в ENV (GOOGLE_CREDENTIALS / SHEET_ID)."""
+    try:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        sheet_key  = os.environ.get("SHEET_ID")
+        if not (creds_json and sheet_key):
+            return None
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        return gc.open_by_key(sheet_key)
+    except Exception:
+        log.exception("GSheets auth/open failed")
+        return None
+
+def read_fa_map() -> dict:
+    """
+    Возвращает { 'USDJPY': {'risk':'Green','bias':'neutral', ...}, ... }
+    При ошибке — пустой dict (утренник просто не покажет бейджи).
+    """
+    try:
+        sh = _gs_open()
+        if not sh:
+            return {}
+        ws = sh.worksheet("FA_Signals")
+        rows = ws.get_all_records()
+        out = {}
+        for r in rows:
+            sym = str(r.get("pair","")).upper()
+            if not sym:
+                continue
+            out[sym] = {
+                "risk": (str(r.get("risk","Green")).capitalize()),
+                "bias": (str(r.get("bias","neutral")).lower()),
+            }
+        return out
+    except Exception:
+        log.exception("read_fa_map failed")
+        return {}
+
+
 # ---------- Вспомогательные для «инвесторского» дайджеста ----------
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
@@ -574,7 +618,6 @@ def fetch_calendar_events_ff_all() -> List[dict]:
         log.warning("calendar fetch (FF) failed: %s", e)
         return _FF_CACHE["data"] or []
 
-# --- ЗАМЕНИ read_calendar_rows_sheet целиком ---
 def read_calendar_rows_sheet(sh) -> List[dict]:
     try:
         ws = sh.worksheet(CAL_WS)
@@ -703,7 +746,7 @@ def _symbol_hints(symbol: str) -> tuple[str,str]:
     )
 
 def _pair_to_title(symbol: str) -> str:
-    return f"{symbol[:3]}/{symbol[3:]}"
+    return f"<b>{symbol[:3]}/{symbol[3:]}</b>"
 
 def _plan_vs_fact_line(sh, symbol: str) -> str:
     target, fact = latest_bank_target_fact(sh, symbol)
@@ -734,17 +777,15 @@ def _no_quiet_until(pack: dict) -> str:
     start = (n["utc"] - timedelta(minutes=QUIET_BEFORE_MIN)).astimezone(LOCAL_TZ) if LOCAL_TZ else n["utc"]
     return f"тихого окна нет до {start:%H:%M}."
 
-def render_symbol_block(symbol: str, row: dict, pack: dict, best_news: Optional[dict], sh) -> str:
+def render_symbol_block(symbol: str, row: dict, pack: dict, best_news: Optional[dict], sh, badge_text: str) -> str:
     title = _pair_to_title(symbol)
-    level = _risk_label(_fa_level(row))
     bias  = _fa_bias(row)
     side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
     avg = price_fmt(symbol, _to_float(row.get("Avg_Price"), None))
     nxt = price_fmt(symbol, _to_float(row.get("Next_DCA_Price"), None))
     what_means, simple_words = _symbol_hints(symbol)
 
-    # «скорость докупок»
-    speed = "сниженная" if "умеренный" in level or "высокий" in level else "обычная"
+    speed = "сниженная" if "осторожно" in badge_text or "стоп" in badge_text else "обычная"
     quiet_sentence = _no_quiet_until(pack)
     plan_fact = _plan_vs_fact_line(sh, symbol)
 
@@ -763,7 +804,7 @@ def render_symbol_block(symbol: str, row: dict, pack: dict, best_news: Optional[
             tail_time = f"\n\t•\tБлижайшее важное время: {nn:%H:%M} — {_h(pack['nearest_next']['title'])}."
 
     return (
-f"""{title} — {level}
+f"""{title} — {badge_text}
 \t•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='SHORT' and symbol=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}
 \t•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.
 \t•\tЧто делаем: скорость докупок — {speed}; {quiet_sentence}
@@ -778,19 +819,24 @@ def build_digest_text(sh) -> str:
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
     cal = build_calendar_for_symbols(SYMBOLS)
     news_rows = read_news_rows(sh)
+    
+    fa = read_fa_map()
+    def badge(sym: str) -> str:
+        risk = (fa.get(sym, {}) or {}).get("risk", "Green")
+        return FA_BADGE.get(risk, FA_BADGE["Green"])
 
     parts: List[str] = [header]
 
     for i, sym in enumerate(SYMBOLS):
         row = get_last_nonempty_row(sh, sym) or {}
         best_news = choose_top_news_for_symbol(sym, news_rows, now_utc)
-        block = render_symbol_block(sym, row, cal.get(sym, {}), best_news, sh)
+        sym_badge = badge(sym)
+        block = render_symbol_block(sym, row, cal.get(sym, {}), best_news, sh, sym_badge)
         parts.append(block)
         if i < len(SYMBOLS) - 1:
             parts.append("⸻")
 
     # Итоговый календарь «на сегодня»
-    # Собираем все High события ближайшего дня (локального)
     today_list = []
     for sym in SYMBOLS:
         pack = cal.get(sym, {})
@@ -799,7 +845,6 @@ def build_digest_text(sh) -> str:
             tloc = ev["local"] if LOCAL_TZ else ev["utc"]
             today_list.append((tloc, f"{_pair_to_title(sym)}: {_h(ev['country'])}: {_h(ev['title'])}", sym))
 
-    # если окон нет — покажем ближайшее важное время
     if not today_list:
         for sym in SYMBOLS:
             n = cal.get(sym, {}).get("nearest_next")
