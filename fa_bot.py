@@ -14,6 +14,8 @@ import asyncio
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError, RetryAfter
 
 # --- Таймзона ---
 try:
@@ -311,6 +313,22 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
 def _h(x) -> str:
     return _html_escape(str(x), quote=True)
 
+async def safe_send_message(bot, chat_id: int, **kwargs):
+    """Sends a message with retry logic for network errors."""
+    delay = 1.0
+    for attempt in range(5):
+        try:
+            return await bot.send_message(chat_id=chat_id, **kwargs)
+        except RetryAfter as e:
+            log.warning("send_message: hit rate limit, sleeping for %s seconds", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+        except (TimedOut, NetworkError) as e:
+            log.warning("send_message: network error '%s', attempt %d/5, sleeping for %.1f s", e, attempt + 1, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+    log.error("send_message: gave up after 5 retries (chat_id=%s)", chat_id)
+
+
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
 
@@ -370,20 +388,18 @@ HELP_TEXT = (
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help",
-        parse_mode=ParseMode.HTML,
-    )
+    msg = f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help"
+    await safe_send_message(context.bot, update.effective_chat.id, text=msg, parse_mode=ParseMode.HTML)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await safe_send_message(context.bot, update.effective_chat.id, text=HELP_TEXT)
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
+    await safe_send_message(context.bot, update.effective_chat.id, text="pong")
 
 async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not assert_master_chat(update):
-        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Эта команда доступна только в мастер-чате.")
         return
     try:
         parts = update.message.text.strip().split()
@@ -391,15 +407,15 @@ async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
         total = float(parts[1])
     except Exception:
-        await update.message.reply_text("Пример: /settotal 2800")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Пример: /settotal 2800")
         return
 
     STATE["total"] = total
-    await update.message.reply_text(f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
+    await safe_send_message(context.bot, update.effective_chat.id, text=f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
 
 async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not assert_master_chat(update):
-        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Эта команда доступна только в мастер-чате.")
         return
 
     text = update.message.text[len("/setweights"):].strip().lower()
@@ -414,21 +430,23 @@ async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if k in ("JPY", "AUD", "EUR", "GBP"):
                 new_w[k] = v
     except Exception:
-        await update.message.reply_text("Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
         return
 
     STATE["weights"] = new_w
-    await update.message.reply_text(
-        f"Целевые веса обновлены: {human_readable_weights(new_w)}"
+    await safe_send_message(
+        context.bot,
+        update.effective_chat.id,
+        text=f"Целевые веса обновлены: {human_readable_weights(new_w)}"
     )
 
 async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Целевые веса: {human_readable_weights(STATE['weights'])}")
+    await safe_send_message(context.bot, update.effective_chat.id, text=f"Целевые веса: {human_readable_weights(STATE['weights'])}")
 
 async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = float(STATE["total"])
     if total <= 0:
-        await update.message.reply_text("Сначала задайте общий банк: /settotal 2800")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Сначала задайте общий банк: /settotal 2800")
         return
 
     w = STATE["weights"]
@@ -442,7 +460,7 @@ async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for sym in SYMBOLS:
         lines.append(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}")
     msg = "\n".join(lines)
-    await update.message.reply_text(msg)
+    await safe_send_message(context.bot, update.effective_chat.id, text=msg)
 
     sh, _src = build_sheets_client(SHEET_ID)
     if sh:
@@ -622,24 +640,24 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model=LLM_MINI,
                 token_budget=LLM_TOKEN_BUDGET_PER_DAY,
             )
-            await update.message.reply_text(txt)
+            await safe_send_message(context.bot, update.effective_chat.id, text=txt)
         except Exception as e:
-            await update.message.reply_text(f"LLM ошибка: {e}")
+            await safe_send_message(context.bot, update.effective_chat.id, text=f"LLM ошибка: {e}")
         return
 
     sh = await get_sheets()
     if not sh:
-        await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Sheets недоступен: не могу собрать инвесторский дайджест.")
         return
 
     try:
         fa_sheet = _read_fa_signals_from_sheet(sh)
         msg = build_digest_text(sh, fa_sheet)
         for chunk in _split_for_tg_html(msg, 3500):
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
+            await safe_send_message(context.bot, update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.exception("Ошибка сборки дайджеста")
-        await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
+        await safe_send_message(context.bot, update.effective_chat.id, text=f"Ошибка сборки дайджеста: {e}")
 
 # -------------------- Диагностика --------------------
 def sheets_diag_text() -> str:
@@ -682,28 +700,30 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         llm_line = "LLM: ❌ error"
     sheets_line = sheets_diag_text()
     news_line = await _diag_news_line()
-    await update.message.reply_text(f"{llm_line}\n{sheets_line}\n{news_line}")
+    await safe_send_message(context.bot, update.effective_chat.id, text=f"{llm_line}\n{sheets_line}\n{news_line}")
 
 async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not SHEET_ID:
-        await update.message.reply_text("SHEET_ID не задан.")
+        await safe_send_message(context.bot, update.effective_chat.id, text="SHEET_ID не задан.")
         return
     sh, src = build_sheets_client(SHEET_ID)
     if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
+        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ {src}")
         return
     try:
         ws, created = ensure_worksheet(sh, SHEET_WS)
-        await update.message.reply_text(
-            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
+        await safe_send_message(
+            context.bot,
+            update.effective_chat.id,
+            text=f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
         )
     except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
+        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ ошибка создания листа: {e}")
 
 async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sh, src = build_sheets_client(SHEET_ID)
     if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
+        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ {src}")
         return
     try:
         append_row(
@@ -718,9 +738,9 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "manual /sheet_test",
             ],
         )
-        await update.message.reply_text("Sheets: ✅ записано (test row).")
+        await safe_send_message(context.bot, update.effective_chat.id, text="Sheets: ✅ записано (test row).")
     except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
+        await safe_send_message(context.bot, update.effective_chat.id, text=f"Sheets: ❌ ошибка записи: {e}")
 
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
@@ -762,12 +782,12 @@ async def morning_digest_scheduler(app: Application):
                 fa_sheet_data = _read_fa_signals_from_sheet(sh)
                 msg = build_digest_text(sh, fa_sheet_data)
                 for chunk in _split_for_tg_html(msg):
-                    await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
+                    await safe_send_message(app.bot, MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
             else:
-                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
+                await safe_send_message(app.bot, MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
         except Exception as e:
             try:
-                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+                await safe_send_message(app.bot, MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
             except Exception:
                 pass
 
@@ -777,7 +797,18 @@ async def _post_init(app: Application):
 
 def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
-    builder = Application.builder().token(BOT_TOKEN)
+    
+    # Custom HTTPX request object with longer timeouts
+    req = HTTPXRequest(
+        connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "10")),
+        read_timeout=float(os.getenv("TG_READ_TIMEOUT", "45")),
+        write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "30")),
+        pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
+        connection_pool_size=int(os.getenv("TG_POOL_SIZE", "8")),
+    )
+
+    builder = Application.builder().token(BOT_TOKEN).request(req)
+    
     if _RATE_LIMITER_AVAILABLE:
         builder = builder.rate_limiter(AIORateLimiter())
     builder = builder.post_init(_post_init)
@@ -798,7 +829,11 @@ def build_application() -> Application:
 def main():
     log.info("Fund bot is running…")
     app = build_application()
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True,
+        poll_interval=float(os.getenv("TG_POLL_INTERVAL", "2")),
+        timeout=int(os.getenv("TG_LONGPOLL_TIMEOUT", "30")),
+    )
 
 if __name__ == "__main__":
     main()
