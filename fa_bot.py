@@ -5,6 +5,7 @@ import json
 import base64
 import logging
 import re
+import time  # для backoff в main()
 from html import escape as _html_escape
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple, Optional, List
@@ -796,22 +797,25 @@ async def _post_init(app: Application):
     app.create_task(morning_digest_scheduler(app))
 
 def build_application() -> Application:
-    if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
-    
-    # Custom HTTPX request object with longer timeouts
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+
     req = HTTPXRequest(
-        connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "10")),
-        read_timeout=float(os.getenv("TG_READ_TIMEOUT", "45")),
-        write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "30")),
+        connect_timeout=float(os.getenv("TG_CONNECT_TIMEOUT", "20")),  # было 10 → 20
+        read_timeout=float(os.getenv("TG_READ_TIMEOUT", "60")),
+        write_timeout=float(os.getenv("TG_WRITE_TIMEOUT", "60")),
         pool_timeout=float(os.getenv("TG_POOL_TIMEOUT", "10")),
-        connection_pool_size=int(os.getenv("TG_POOL_SIZE", "8")),
+        connection_pool_size=int(os.getenv("TG_POOL_SIZE", "16")),
+        retries=int(os.getenv("TG_HTTP_RETRIES", "3")),  # ключевое: ретраи на коннекте
+        http_version="1.1",  # иногда HTTP/2 handshakes ведут себя хуже в PaaS
+        trust_env=True,      # если Railway задаёт прокси/сетевые переменные — использовать
     )
 
     builder = Application.builder().token(BOT_TOKEN).request(req)
-    
     if _RATE_LIMITER_AVAILABLE:
         builder = builder.rate_limiter(AIORateLimiter())
     builder = builder.post_init(_post_init)
+
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -828,12 +832,20 @@ def build_application() -> Application:
 
 def main():
     log.info("Fund bot is running…")
-    app = build_application()
-    app.run_polling(
-        drop_pending_updates=True,
-        poll_interval=float(os.getenv("TG_POLL_INTERVAL", "2")),
-        timeout=int(os.getenv("TG_LONGPOLL_TIMEOUT", "30")),
-    )
+    backoff = 5
+    while True:
+        try:
+            app = build_application()
+            app.run_polling(
+                drop_pending_updates=True,
+                poll_interval=float(os.getenv("TG_POLL_INTERVAL", "2")),
+                timeout=int(os.getenv("TG_LONGPOLL_TIMEOUT", "30")),  # getUpdates timeout
+            )
+            backoff = 5  # если отработал штатно — сброс бэкоффа
+        except Exception as e:
+            log.exception("Polling crashed on startup: %s. Retry in %ss", e, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 if __name__ == "__main__":
     main()
