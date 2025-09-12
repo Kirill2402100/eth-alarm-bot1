@@ -122,7 +122,10 @@ PAIR_COUNTRIES = {
 # та же логика ключевых слов/источников, что в calendar_collector.py
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
-    "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|intervention|FX intervention|press conference"
+    # добавили: fomc/mpc, policy statement(s), rate statement, cash rate
+    "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
+    "intervention|FX intervention|press conference|policy statement|policy statements|"
+    "rate statement|cash rate|fomc|mpc"
 ), re.I)
 ALLOWED_SOURCES = {
     s.strip().upper()
@@ -247,7 +250,11 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
             continue
         title = str(r.get("title", "")).strip()
         tags  = str(r.get("tags", "")).strip()
-        if not KW_RE.search(f"{title} {tags}"):
+        kw_ok = bool(KW_RE.search(f"{title} {tags}"))
+        # Разрешаем «якорные» источники ЦБ даже без ключевых слов
+        if not kw_ok and src in {"US_FED_PR","ECB_PR","BOE_PR","RBA_MR","BOJ_PR"}:
+            kw_ok = True
+        if not kw_ok:
             continue
         row_cty = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
         if not (row_cty & countries):
@@ -264,12 +271,16 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
     except Exception:
         events = []
     soon = None
+    last_past = None
     for e in events:
         try:
             dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z", "+00:00")).astimezone(timezone.utc)
         except Exception:
             continue
         if dt <= now_utc:
+            # запомним самое близкое ПРОШЕДШЕЕ событие (как крайний фолбэк)
+            if last_past is None or dt > last_past["ts"]:
+                last_past = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
             continue
         if str(e.get("country","")).strip().lower() not in countries:
             continue
@@ -278,6 +289,9 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
     if soon:
         lt = soon["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else soon["ts"]
         return f"{lt:%Y-%m-%d %H:%M} — {soon['title']} ({soon['src']})"
+    if last_past:
+        lt = last_past["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else last_past["ts"]
+        return f"{lt:%H:%M} — {last_past['title']} ({last_past['src']})"
     return ""
 
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
