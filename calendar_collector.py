@@ -2,7 +2,7 @@
 import os, re, json, base64, time, logging, html as _html
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Iterable
-from datetime import datetime, timedelta, timezone, time as _time
+from datetime import datetime, timedelta, timezone, time as _time, date
 from html import unescape as _html_unescape
 
 # ---- TZ ----
@@ -323,77 +323,63 @@ def _selftest_scan_dates():
 
 # --- FOMC helpers ---
 def _slice_year_block_for_fomc(html: str) -> str:
-    t = _html_to_text(html)
-    y = _guess_context_year(t)
+    t = _html_to_text(html); y = _guess_context_year(t)
     m = re.search(rf"\b{y}\b", t)
     if not m: return t
     start = max(0, m.start() - 120)
-    nxt = re.search(r"\b20\d{2}\b", t[m.end():])
+    nxt = re.search(r"(?i)\b20\d{2}\b.{0,40}(calendar|meeting\s+dates)", t[m.end():])
     end = (m.end() + nxt.start()) if nxt else len(t)
     return t[start:end]
 
-def _scan_range_ends_simple(text: str) -> set[tuple[int,int,int]]:
-    """
-    Достаём ВТОРЫЕ дни диапазонов вида:
-      - Sep 16–17, 2025
-      - 16–17 Sep 2025
-      - Sep 16–17       (год = контекстный)
-      - 16–17 Sep       (год = контекстный)
-    Игнорируем «minutes / press conference / transcript».
-    """
-    t = text or ""
-    ctx_year = _guess_context_year(t)
-    cur_year = datetime.now(timezone.utc).year
-
-    MON = (r"Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
-           r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
-           r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?")
-
-    pats = [
-        re.compile(rf"\b(?P<mon>{MON})\s+(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\s*,\s*(?P<y>20\d{{2}})\b", re.I),
-        re.compile(rf"\b(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\s+(?P<mon>{MON})\s*,?\s*(?P<y>20\d{{2}})\b", re.I),
-        re.compile(rf"\b(?P<mon>{MON})\s+(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\b", re.I),
-        re.compile(rf"\b(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\s+(?P<mon>{MON})\b", re.I),
-    ]
-
-    def mon2num_safe(s: str) -> Optional[int]:
-        if not s: return None
-        key = s.lower().replace(".", "")[:3]
-        return _MONTH.get(key)
-
-    def good_context(lo: int, hi: int) -> bool:
-        seg = t[max(0, lo-80): hi+80].lower()
-        if any(b in seg for b in ("minutes", "press conference", "transcript")):
-            return False
-        return ("meeting" in seg) or ("fomc" in seg)
-
-    ends: set[tuple[int,int,int]] = set()
-
-    for pat in pats:
-        for m in pat.finditer(t):
-            if not good_context(m.start(), m.end()):
-                continue
-            gd = m.groupdict()
-            mon = gd.get("mon"); d1 = int(gd["d1"]); d2 = int(gd["d2"])
-            if d2 < d1:
-                d1, d2 = d2, d1
-            y = int(gd.get("y") or ctx_year)
-            mo = mon2num_safe(mon)
-            if not mo:
-                continue
-            if not ((cur_year - 1) <= y <= (cur_year + 1)):
-                continue
-            try:
-                datetime(y, mo, d2)
-            except ValueError:
-                continue
-            ends.add((y, mo, d2))
-
+def _fomc_meeting_range_ends(html: str) -> set[tuple[int, int, int]]:
+    t = _html_to_text(html); ctx_year = _guess_context_year(t); cur_year = datetime.now(timezone.utc).year
+    MON = (r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
+           r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)")
+    def mon2num(s: str) -> int: return _MONTH[s.lower().replace('.', '')[:3]]
+    ends: set[tuple[int, int, int]] = set()
+    pA = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s*,\s*(20\d{{2}})\b", re.I)
+    pB = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I)
+    pC = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I)
+    pD = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I)
+    def _close_has_meeting(mobj: re.Match) -> bool:
+        seg = t[max(0, mobj.start()-120): mobj.end()+120].lower()
+        if "meeting" not in seg: return False
+        if not ("fomc" in seg or "federal open market committee" in seg): return False
+        bad = ("minutes", "transcript", "press conference")
+        return not any(b in seg for b in bad)
+    for m in pA.finditer(t):
+        if not _close_has_meeting(m): continue
+        mo = mon2num(m.group(1)); d2 = int(m.group(3)); y = int(m.group(4)); ends.add((y, mo, d2))
+    for m in pB.finditer(t):
+        if not _close_has_meeting(m): continue
+        d2 = int(m.group(2)); mo = mon2num(m.group(3)); y = int(m.group(4)); ends.add((y, mo, d2))
+    for m in pC.finditer(t):
+        if not _close_has_meeting(m): continue
+        mo = mon2num(m.group(1)); d2 = int(m.group(3)); ends.add((ctx_year, mo, d2))
+    for m in pD.finditer(t):
+        if not _close_has_meeting(m): continue
+        d2 = int(m.group(2)); mo = mon2num(m.group(3)); ends.add((ctx_year, mo, d2))
+    ends = {(y, mo, d) for (y, mo, d) in ends
+            if (cur_year - 1) <= y <= (cur_year + 1) and datetime(y, mo, d, tzinfo=timezone.utc).weekday() < 5}
     return ends
 
 def _fomc_anchor_utc(y: int, mo: int, d: int) -> str:
     """14:00 ET => 18:00Z (март–окт) или 19:00Z (нояб–фев). Эвристика по месяцам."""
     return "18:00" if 3 <= mo <= 10 else "19:00"
+
+def _keep_last_per_cluster(triples: Iterable[tuple[int,int,int]]) -> set[tuple[int,int,int]]:
+    """Сжимает подряд идущие даты (расстояние ≤1 день) до последнего дня каждого кластера."""
+    ds = sorted({date(y, m, d) for (y, m, d) in triples})
+    keep: set[tuple[int,int,int]] = set()
+    i = 0
+    while i < len(ds):
+        j = i
+        while j + 1 < len(ds) and (ds[j+1] - ds[j]).days <= 1:
+            j += 1
+        last = ds[j]
+        keep.add((last.year, last.month, last.day))
+        i = j + 1
+    return keep
 
 # ---- Calendar parsers ----
 def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
@@ -439,25 +425,17 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
     block = _slice_year_block_for_fomc(html)
-    t_block = _html_to_text(block)
-    t_full  = _html_to_text(html)
-    try:
-        range_ends = _scan_range_ends_simple(t_block)
-    except Exception as e:
-        log.warning("FOMC simple scan failed: %s", e)
-        range_ends = set()
+    range_ends = _fomc_meeting_range_ends(block)
     if not range_ends:
-        range_ends = _scan_range_ends_simple(t_full)
+        log.debug("FOMC: fallback to full-page scan")
+        range_ends = _fomc_meeting_range_ends(_html_to_text(html))
+    range_ends = _keep_last_per_cluster(range_ends)
     out: List[CalEvent] = []
     for (y, mo, d) in sorted(range_ends):
-        try:
-            dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", _fomc_anchor_utc(y, mo, d))
-            out.append(CalEvent(
-                utc=dt, country="united states", currency="USD",
-                title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
-            ))
-        except Exception:
-            continue
+        dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", _fomc_anchor_utc(y, mo, d))
+        out.append(CalEvent(utc=dt, country="united states", currency="USD",
+                              title="FOMC Meeting / Rate Decision", impact="high",
+                              source="FOMC", url=url))
     return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
