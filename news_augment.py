@@ -74,6 +74,7 @@ def _canon_url(u: str) -> str:
         return u
 
 def _hash(source: str, url: str) -> str:
+    # url уже должен быть канонизирован, но для надежности вызываем еще раз
     return f"{source}|{_canon_url(url)}"
 
 @dataclass
@@ -174,6 +175,12 @@ def _is_noise_anchor(link: str, text: str) -> bool:
     return (not t) or t.startswith("skip to main")
 
 
+def _host_matches(host: str, must: str) -> bool:
+    host = (host or "").lower()
+    must = (must or "").lower()
+    return host == must or host.endswith("." + must)
+
+
 def _iter_links(html_src: str, base_url: str, domain_must: Optional[str] = None) -> Iterator[Tuple[str, str]]:
     """
     Итератор (url, text). Если задан domain_must, пропускаем чужие домены.
@@ -195,7 +202,7 @@ def _iter_links(html_src: str, base_url: str, domain_must: Optional[str] = None)
                 netloc = urllib.parse.urlparse(url).netloc
             except Exception:
                 continue
-            if domain_must not in netloc:
+            if not _host_matches(netloc, domain_must):
                 continue
         text = _strip_tags(a_inner)
         if _is_noise_anchor(url, text):  # <— фильтр мусора
@@ -209,16 +216,17 @@ def _now_utc() -> datetime:
 
 def _mk_item(source: str, title: str, url: str, countries: str, ccy: str,
              tags: str, importance: str) -> NewsItem:
+    cu = _canon_url(url)  # <— канон в сам объект
     return NewsItem(
         ts_utc=_now_utc(),
         source=source,
         title=title,
-        url=url,
+        url=cu,
         countries=countries,
         ccy=ccy,
         tags=tags,
         importance_guess=importance,
-        hash=_hash(source, url),
+        hash=_hash(source, cu),
     )
 
 
@@ -258,7 +266,7 @@ def collect_us_treasury() -> List[NewsItem]:
         m = re.search(r"/news/press-releases/s[bp](\d+)", u)
         return int(m.group(1)) if m else -1
 
-    kept = sorted({u for u, _ in kept}, key=_score, reverse=True)[:40]
+    kept = sorted({_canon_url(u) for u, _ in kept}, key=_score, reverse=True)[:40]
     for u in kept:
         # вытащим заголовок с самой страницы
         page, c2, f2 = fetch_text(u)
@@ -420,6 +428,7 @@ def collect_boe() -> List[NewsItem]:
 # --- Reserve Bank of Australia (расширенный матч + фолбэк) ---
 
 RBA_BASE = "https://www.rba.gov.au"
+RBA_YEAR_OK_RE = re.compile(r"/20(24|25)\b")
 RBA_SEARCH_QUERIES = [
     "Monetary Policy Decision",
     "Cash rate decision",
@@ -473,6 +482,8 @@ def collect_rba() -> List[NewsItem]:
 
         kept = 0
         for link_url, text in _iter_links(html_src, final_url, domain_must="rba.gov.au"):
+            if not RBA_YEAR_OK_RE.search(link_url):
+                continue
             imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
@@ -490,6 +501,8 @@ def collect_rba() -> List[NewsItem]:
             continue
         kept = 0
         for link_url, text in _iter_links(html_src, RBA_BASE, domain_must="rba.gov.au"):
+            if not RBA_YEAR_OK_RE.search(link_url):
+                continue
             imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
