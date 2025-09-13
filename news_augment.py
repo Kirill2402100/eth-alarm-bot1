@@ -58,8 +58,24 @@ BOE_KEEP_KEYWORDS = [
 BOE_KEEP_RE = re.compile("|".join(BOE_KEEP_KEYWORDS), re.I)
 
 # -----------------------------------------------------------------------------
-# Модель данных
+# Модель данных и утилиты нормализации
 # -----------------------------------------------------------------------------
+
+def _canon_url(u: str) -> str:
+    try:
+        u, _frag = urllib.parse.urldefrag(u)  # убираем #...
+        p = urllib.parse.urlsplit(u)
+        netloc = p.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = re.sub(r"/+$", "", p.path) or "/"
+        return urllib.parse.urlunsplit((p.scheme.lower(), netloc, path, p.query, ""))
+    except Exception:
+        return u
+
+def _hash(source: str, url: str) -> str:
+    return f"{source}|{_canon_url(url)}"
+
 @dataclass
 class NewsItem:
     ts_utc: datetime
@@ -87,10 +103,6 @@ class NewsItem:
             esc(self.importance_guess),
             esc(self.hash),
         ])
-
-
-def _hash(source: str, url: str) -> str:
-    return f"{source}|{url}"
 
 
 # -----------------------------------------------------------------------------
@@ -157,6 +169,11 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _is_noise_anchor(link: str, text: str) -> bool:
+    t = (text or "").strip().lower()
+    return (not t) or t.startswith("skip to main")
+
+
 def _iter_links(html_src: str, base_url: str, domain_must: Optional[str] = None) -> Iterator[Tuple[str, str]]:
     """
     Итератор (url, text). Если задан domain_must, пропускаем чужие домены.
@@ -172,6 +189,7 @@ def _iter_links(html_src: str, base_url: str, domain_must: Optional[str] = None)
         if not href:
             continue
         url = _abs_url(join_base, href)
+        url = _canon_url(url)  # <— канон
         if domain_must:
             try:
                 netloc = urllib.parse.urlparse(url).netloc
@@ -180,6 +198,8 @@ def _iter_links(html_src: str, base_url: str, domain_must: Optional[str] = None)
             if domain_must not in netloc:
                 continue
         text = _strip_tags(a_inner)
+        if _is_noise_anchor(url, text):  # <— фильтр мусора
+            continue
         yield (url, text)
 
 
@@ -453,8 +473,6 @@ def collect_rba() -> List[NewsItem]:
 
         kept = 0
         for link_url, text in _iter_links(html_src, final_url, domain_must="rba.gov.au"):
-            if not text.strip() or "#" in link_url or text.strip().lower().startswith("skip to main"):
-                continue
             imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
@@ -472,8 +490,6 @@ def collect_rba() -> List[NewsItem]:
             continue
         kept = 0
         for link_url, text in _iter_links(html_src, RBA_BASE, domain_must="rba.gov.au"):
-            if not text.strip() or "#" in link_url or text.strip().lower().startswith("skip to main"):
-                continue
             imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
