@@ -323,65 +323,50 @@ def _selftest_scan_dates():
 
 # --- FOMC helpers ---
 def _slice_year_block_for_fomc(html: str) -> str:
-    """
-    Берём кусок страницы вокруг заголовка с годом (напр. '2025 FOMC meeting calendar'
-    или 'Meeting dates 2025'), чтобы не ловить посторонние даты.
-    """
+    """Take a slice of the page around the year title to avoid catching extraneous dates."""
     t = _html_to_text(html)
     y = _guess_context_year(t)
-    pat = re.compile(rf"(?i)(fomc.*?\b{y}\b.*?(calendar|meeting\s+dates)|"
-                     rf"(meeting\s+dates).*?\b{y}\b)")
-    m = pat.search(t)
-    if not m:
-        return html
-    start = m.start()
-    nxt = re.search(r"(?i)\b20\d{2}\b.*?(calendar|meeting\s+dates)", t[start+1:])
-    end = (start + 1 + nxt.start()) if nxt else len(t)
+    m = re.search(rf"\b{y}\b", t)
+    if not m: return t
+    start = max(0, m.start() - 120)
+    nxt = re.search(r"\b20\d{2}\b", t[m.end():])
+    end = (m.end() + nxt.start()) if nxt else len(t)
     return t[start:end]
 
-def _fomc_meeting_range_ends(html: str) -> set[tuple[int, int, int]]:
-    """
-    Ищем ТОЛЬКО диапазоны дат со словом 'meeting' поблизости.
-    Возвращаем ВТОРЫЕ дни диапазона (конец).
-    Поддерживаем варианты с/без года.
-    """
-    t = html
+def _scan_range_ends_simple(text: str) -> set[tuple[int, int, int]]:
+    """Scan for date ranges and return the end dates, with simple filtering."""
+    t = _html_to_text(text)
     ctx_year = _guess_context_year(t)
     cur_year = datetime.now(timezone.utc).year
     MON = (r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
            r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
            r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)")
-    def mon2num(s: str) -> int:
-        return _MONTH[s.lower().replace(".", "")[:3]]
+    def mon2num(s: str) -> int: return _MONTH[s.lower().replace(".", "")[:3]]
     ends: set[tuple[int, int, int]] = set()
-    pA = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s*,\s*(20\d{{2}})\b", re.I)
-    pB = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I)
-    pC = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I)
-    pD = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I)
-    def _close_has_meeting(mobj: re.Match) -> bool:
-        seg = _html_to_text(t[max(0, mobj.start()-120): mobj.end()+120]).lower()
-        if "meeting" not in seg:
-            return False
-        if not ("fomc" in seg or "federal open market committee" in seg):
-            return False
-        bad = ("minutes", "transcript", "press conference")
-        return not any(b in seg for b in bad)
-    for m in pA.finditer(t):
-        if not _close_has_meeting(m): continue
-        mo = mon2num(m.group(1)); d2 = int(m.group(3)); y = int(m.group(4))
-        ends.add((y, mo, d2))
-    for m in pB.finditer(t):
-        if not _close_has_meeting(m): continue
-        d2 = int(m.group(2)); mo = mon2num(m.group(3)); y = int(m.group(4))
-        ends.add((y, mo, d2))
-    for m in pC.finditer(t):
-        if not _close_has_meeting(m): continue
-        mo = mon2num(m.group(1)); d2 = int(m.group(2))
-        ends.add((ctx_year, mo, d2))
-    for m in pD.finditer(t):
-        if not _close_has_meeting(m): continue
-        d2 = int(m.group(2)); mo = mon2num(m.group(3))
-        ends.add((ctx_year, mo, d2))
+    patterns = [
+        re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s*,\s*(20\d{{2}})\b", re.I),
+        re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I),
+        re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I),
+        re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I),
+    ]
+    for p in patterns:
+        for m in p.finditer(t):
+            seg = t[max(0, m.start() - 80): m.end() + 80].lower()
+            bad = ("minutes", "transcript", "press conference")
+            if any(b in seg for b in bad):
+                continue
+            groups = m.groups()
+            y, mo, d2 = None, None, None
+            if len(groups) == 4: # Month d1-d2, YYYY
+                mo = mon2num(groups[0]); d2 = int(groups[2]); y = int(groups[3])
+            elif len(groups) == 4 and groups[0].isdigit(): # d1-d2 Month YYYY
+                d2 = int(groups[1]); mo = mon2num(groups[2]); y = int(groups[3])
+            elif len(groups) == 3: # Month d1-d2
+                mo = mon2num(groups[0]); d2 = int(groups[2]); y = ctx_year
+            elif len(groups) == 3 and groups[0].isdigit(): # d1-d2 Month
+                d2 = int(groups[1]); mo = mon2num(groups[2]); y = ctx_year
+            if all((y, mo, d2)):
+                ends.add((y, mo, d2))
     ends = {
         (y, mo, d) for (y, mo, d) in ends
         if (cur_year - 1) <= y <= (cur_year + 1)
@@ -437,10 +422,10 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
     block = _slice_year_block_for_fomc(html)
-    range_ends = _fomc_meeting_range_ends(block)
+    range_ends = _scan_range_ends_simple(block)
     if not range_ends:
-        log.debug("FOMC: fallback to full-page scan")
-        range_ends = _fomc_meeting_range_ends(html)
+        log.debug("FOMC: simple scan on slice failed, fallback to full page scan")
+        range_ends = _scan_range_ends_simple(_html_to_text(html))
     out: List[CalEvent] = []
     for (y, mo, d) in sorted(range_ends):
         try:
@@ -492,7 +477,7 @@ def collect_calendar() -> List[CalEvent]:
     txt, code, f_url = fetch_text(url_fomc)
     if code == 200 and txt:
         f = parse_fomc_calendar(txt, f_url)
-        if f: log.info("FOMC parsed: %d from %s", len(f), f_url)
+        log.info("FOMC parsed: %d from %s", len(f), f_url)
         events.extend(f)
 
     url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
