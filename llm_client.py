@@ -1,28 +1,15 @@
 # llm_client.py
 # -*- coding: utf-8 -*-
-"""
-Надёжная обёртка под gpt-5 для фонд-бота.
-
-Особенности:
-- По умолчанию все модели = 'gpt-5', но ENV LLM_MAJOR/LLM_MINI/LLM_NANO поддержаны.
-- 1-й путь: Responses API (input=messages, max_output_tokens).
-- Если пустой ответ/ошибка — повтор и фоллбэк в Chat Completions
-  (messages[], max_completion_tokens).
-- На полном провале возвращается пустая строка: верхний слой решает, что показывать.
-"""
-
 import os
 import asyncio
 import logging
 from typing import Dict, List, Optional
-
 from openai import OpenAI
 
 LOG = logging.getLogger("llm_client")
 if os.getenv("DEBUG_LLM"):
     logging.basicConfig(level=logging.DEBUG)
 
-# ===== Модели =====
 LLM_MAJOR: str = os.getenv("LLM_MAJOR", "gpt-5")
 LLM_MINI:  str = os.getenv("LLM_MINI",  LLM_MAJOR)
 LLM_NANO:  str = os.getenv("LLM_NANO",  LLM_MAJOR)
@@ -41,16 +28,12 @@ def _client_singleton() -> OpenAI:
     return _client
 
 
-# ---------- утилиты извлечения текста ----------
-
 def _extract_responses_text(resp) -> str:
     if not resp:
         return ""
     txt = getattr(resp, "output_text", None)
     if txt:
         return str(txt).strip()
-
-    # Подстрахуемся: распарсим output/content
     out = getattr(resp, "output", None)
     parts: List[str] = []
     if isinstance(out, list):
@@ -73,19 +56,16 @@ def _extract_chat_text(resp) -> str:
 
 
 def _create_responses(client: OpenAI, **kwargs):
-    """Вызов Responses API с авто-удалением temperature, если не поддерживается."""
     try:
         return client.responses.create(**kwargs)
     except Exception as e:
+        # если модель не поддерживает temperature — убираем и повторяем
         msg = str(e).lower()
-        # Некоторые развёртывания ругаются на temperature
         if "temperature" in msg and "not supported" in msg:
             kwargs.pop("temperature", None)
             return client.responses.create(**kwargs)
         raise
 
-
-# ---------- единый синхронный рендер ----------
 
 def _respond_sync(
     model: str,
@@ -96,26 +76,24 @@ def _respond_sync(
 ) -> str:
     client = _client_singleton()
 
-    # --- 1) Responses API (попытка 1) ---
+    # 1) Responses API — попытка №1
     try:
         r1 = _create_responses(
             client,
             model=model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
+            input=[{"role": "system", "content": system},
+                   {"role": "user",   "content": user}],
             max_output_tokens=max_output_tokens,
             **({"temperature": temperature} if temperature is not None else {}),
         )
         text = _extract_responses_text(r1)
         if text:
             return text
-        LOG.warning("Responses #1: пустой текст, повторяем (строковый input)…")
+        LOG.warning("Responses #1: пустой текст, повторим строковым input…")
     except Exception as e:
         LOG.warning("Responses #1: ошибка: %s", e)
 
-    # --- 1b) Responses API (попытка 2 с конкатенацией) ---
+    # 1b) Responses API — попытка №2 (склеенный input)
     try:
         stitched = f"[system]\n{system}\n\n[user]\n{user}"
         r2 = _create_responses(
@@ -128,28 +106,36 @@ def _respond_sync(
         text = _extract_responses_text(r2)
         if text:
             return text
-        LOG.warning("Responses #2: снова пусто, падаем в Chat Completions…")
+        LOG.warning("Responses #2: снова пусто — падаем в Chat Completions…")
     except Exception as e:
         LOG.warning("Responses #2: ошибка: %s — падаем в Chat Completions…", e)
 
-    # --- 2) Chat Completions фоллбэк (новые параметры!) ---
+    # 2) Chat Completions — ВАЖНО: без кастомной temperature
     try:
-        cc = client.chat.completions.create(
+        kwargs = dict(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            temperature=(temperature if temperature is not None else 0.0),
-            # у gpt-5: max_completion_tokens вместо max_tokens
+            messages=[{"role": "system", "content": system},
+                      {"role": "user",   "content": user}],
             max_completion_tokens=max_output_tokens,
+            # temperature по умолчанию (1). Не передаём параметр вовсе.
         )
+        cc = client.chat.completions.create(**kwargs)
         return _extract_chat_text(cc)
     except Exception as e:
-        LOG.error(
-            "Chat Completions упал: %s", e
-        )
-        return ""  # верхний уровень сам решит, что показать
+        msg = str(e).lower()
+        LOG.error("Chat Completions упал: %s", e)
+        # крайняя попытка: вообще минимум параметров
+        try:
+            cc2 = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user",   "content": user}],
+                max_completion_tokens=max_output_tokens,
+            )
+            return _extract_chat_text(cc2)
+        except Exception as e2:
+            LOG.error("Chat Completions (повтор) тоже упал: %s", e2)
+            return ""
 
 
 async def _respond_async(
@@ -164,7 +150,7 @@ async def _respond_async(
     )
 
 
-# ---------- публичные функции, совместимые с fa_bot.py ----------
+# -------- Публичные функции (совместимы с fa_bot.py) --------
 
 def quick_classify(labeling_prompt: str) -> str:
     system = "Ты коротко и точно классифицируешь вход. Отвечай одной строкой."
@@ -223,16 +209,15 @@ def deep_analysis(question: str, context: str = "") -> str:
 
 
 async def llm_ping() -> bool:
-    """Пингуем хотя бы одну из настроенных моделей."""
+    """Smoke-test: хотя бы одна модель отвечает."""
     if not os.environ.get("OPENAI_API_KEY"):
         return False
-
     client = _client_singleton()
     models_to_try = [LLM_MINI, LLM_MAJOR, LLM_NANO]
 
     async def _try(mdl: str) -> bool:
+        # Responses ping
         try:
-            # Responses ping
             await asyncio.to_thread(
                 _create_responses, client,
                 model=mdl, input="ping", max_output_tokens=8
@@ -240,15 +225,14 @@ async def llm_ping() -> bool:
             return True
         except Exception:
             pass
+        # Chat ping (без temperature!)
         try:
-            # Chat ping (важно: max_completion_tokens)
             await asyncio.to_thread(
                 client.chat.completions.create,
                 model=mdl,
                 messages=[{"role": "system", "content": "Проверка связи. Ответь одной буквой."},
                           {"role": "user", "content": "ping"}],
                 max_completion_tokens=8,
-                temperature=0.0,
             )
             return True
         except Exception:
@@ -265,13 +249,11 @@ async def generate_digest(
     model: Optional[str] = None,
     token_budget: int = 30000,
 ) -> str:
-    """Короткий «трейдерский» дайджест: одна строка на каждую пару (RU)."""
     mdl = (model or LLM_MINI).strip()
     max_out = max(200, min(500, (token_budget // 50) if token_budget else 400))
     pretty = {"USDJPY": "USD/JPY", "AUDUSD": "AUD/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
     ordered = [s for s in (symbols or []) if isinstance(s, str)] or ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
     want_lines = "\n".join(f"{pretty.get(s, s[:3]+'/'+s[3:])} — <заметка>" for s in ordered)
-
     system = (
         "Ты опытный валютный аналитик. Сделай короткий дайджест на русском, "
         "по одной строке на каждую пару. Пиши по делу: драйверы, риски, режим. Без воды."
@@ -296,14 +278,9 @@ async def generate_digest(
                 by_symbol[s] = line
                 break
     for s in ordered:
-        if by_symbol[s]:
-            lines.append(by_symbol[s])
-        else:
-            lines.append(f"{pretty.get(s, s[:3]+'/'+s[3:])} — фон спокойный; обычный режим")
+        lines.append(by_symbol[s] or f"{pretty.get(s, s[:3]+'/'+s[3:])} — фон спокойный; обычный режим")
     return "\n".join(lines)
 
-
-# ----------- краткий объяснитель «событие → пара» -----------
 
 async def explain_pair_event(
     pair: str,
@@ -312,9 +289,6 @@ async def explain_pair_event(
     lang: str = "ru",
     model: Optional[str] = None,
 ) -> str:
-    """
-    1–2 фразы без эмодзи/цен/вероятностей о влиянии события на FX-пару.
-    """
     mdl = (model or LLM_MINI).strip()
     pair = (pair or "").upper().strip()
     origin = (origin or "").lower().strip()
@@ -350,10 +324,8 @@ async def explain_pair_event(
 
     text = " ".join((text or "").split())
     if not text:
-        return (
-            "Жёстче ожиданий усиливает валюту источника и сдвигает пару в соответствующем направлении; "
-            "мягче ожиданий — наоборот."
-        )
+        return ("Жёстче ожиданий усиливает валюту источника и сдвигает пару в соответствующем направлении; "
+                "мягче ожиданий — наоборот.")
     if len(text) > 400:
         text = text[:400].rsplit(". ", 1)[0] + "."
     return text
