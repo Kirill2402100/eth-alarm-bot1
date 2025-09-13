@@ -11,6 +11,7 @@ import html
 import time
 import httpx
 import logging
+import hashlib
 import urllib.parse
 from itertools import islice
 from dataclasses import dataclass
@@ -46,7 +47,6 @@ BOE_KEEP_KEYWORDS = [
     r"\bbank\s+rate\b", r"\bmonetary\s+policy\s+committee\b",
 ]
 BOE_KEEP_RE = re.compile("|".join(BOE_KEEP_KEYWORDS), re.I)
-# Путь для вывода TSV, если запускать как скрипт
 DEFAULT_TSV_PATH = os.getenv("NEWS_TSV_PATH", "./news_augment_output.tsv")
 HDR = "ts_utc\tsource\ttitle\turl\tcountries\tccy\ttags\timportance_guess\thash\n"
 
@@ -67,7 +67,7 @@ def _canon_url(u: str) -> str:
         return u
 
 def _hash(source: str, url: str) -> str:
-    return f"{source}|{url}" # url уже должен быть каноническим
+    return f"{source}|{url}"
 
 @dataclass
 class NewsItem:
@@ -89,6 +89,12 @@ class NewsItem:
             ts_str, esc(self.source), esc(self.title), esc(self.url), esc(self.countries),
             esc(self.ccy), esc(self.tags), esc(self.importance_guess), esc(self.hash),
         ])
+
+def clean_title(t: str) -> str:
+    """Очищает заголовок от известных артефактов."""
+    if " | " in t:
+        t = t.split(" | ", 1)[0]
+    return t.replace("&nbsp;", " ").strip()
 
 # ... (Остальные хелперы: fetch_text, _abs_url, _unwrap_mirror_base, и т.д. остаются без изменений)
 def fetch_text(url: str, *, max_bytes: int = MAX_BODIES) -> Tuple[Optional[str], int, str]:
@@ -161,28 +167,15 @@ def _mk_item(source: str, title: str, url: str, countries: str, ccy: str,
              tags: str, importance: str) -> NewsItem:
     cu = _canon_url(url)
     return NewsItem(
-        ts_utc=_now_utc(), source=source, title=title, url=cu,
+        ts_utc=_now_utc(), source=source, title=clean_title(title), url=cu,
         countries=countries, ccy=ccy, tags=tags,
         importance_guess=importance, hash=_hash(source, cu),
     )
 
 # -----------------------------------------------------------------------------
-# Collectors (остаются без изменений, т.к. улучшения централизованы)
+# Collectors
 # -----------------------------------------------------------------------------
-def collect_fed_fomc() -> List[NewsItem]:
-    # ... код ...
-    years = ["2025", "2024", "2023", "2022", "2021", "2020"]
-    base = "https://www.federalreserve.gov/newsevents/pressreleases/"
-    items: List[NewsItem] = []
-    for y in years:
-        url = f"{base}{y}-press-fomc.htm"
-        _, code, final = fetch_text(url)
-        if code == 200:
-            items.append(_mk_item("US_FED_PR", f"{y} FOMC", final, "united states", "USD", "policy", "high"))
-    return items
-
 def collect_us_treasury() -> List[NewsItem]:
-    # ... код ...
     url = "https://home.treasury.gov/news/press-releases"
     html_src, code, final = fetch_text(url)
     items: List[NewsItem] = []
@@ -207,8 +200,17 @@ def collect_us_treasury() -> List[NewsItem]:
                 if m: ttl = _strip_tags(m.group(1))
         items.append(_mk_item("US_TREASURY", ttl or "Treasury press release", f2, "united states", "USD", "treasury", "medium"))
     return items
-
-# ... Аналогично для collect_ecb, collect_boj, collect_boe ...
+# ... Остальные сборщики (collect_fed_fomc, ecb, boj, boe, rba, mof) без изменений ...
+def collect_fed_fomc() -> List[NewsItem]:
+    years = ["2025", "2024", "2023", "2022", "2021", "2020"]
+    base = "https://www.federalreserve.gov/newsevents/pressreleases/"
+    items: List[NewsItem] = []
+    for y in years:
+        url = f"{base}{y}-press-fomc.htm"
+        _, code, final = fetch_text(url)
+        if code == 200:
+            items.append(_mk_item("US_FED_PR", f"{y} FOMC", final, "united states", "USD", "policy", "high"))
+    return items
 def collect_ecb() -> List[NewsItem]:
     pages = [("Press releases", "https://www.ecb.europa.eu/press/pr/html/index.en.html"), ("Governing Council decisions", "https://www.ecb.europa.eu/press/govcdec/html/index.en.html"), ("Monetary policy decisions", "https://www.ecb.europa.eu/press/govcdec/mopo/html/index.en.html"), ("Other decisions", "https://www.ecb.europa.eu/press/govcdec/otherdec/html/index.en.html"), ("Monetary policy press conference", "https://www.ecb.europa.eu/press/press_conference/html/index.en.html"), ("Monetary policy statements", "https://www.ecb.europa.eu/press/press_conference/monetary-policy-statement/html/index.en.html"), ("Monetary policy statements at a glance", "https://www.ecb.europa.eu/press/press_conference/visual-mps/html/index.en.html")]
     items: List[NewsItem] = []
@@ -218,7 +220,6 @@ def collect_ecb() -> List[NewsItem]:
             imp = "high" if "monetary-policy" in final or "mopo" in final or "press_conference" in final else "medium"
             items.append(_mk_item("ECB_PR", title, final, "euro area", "EUR", "ecb", imp))
     return items
-
 def collect_boj() -> List[NewsItem]:
     roots = [("Monetary Policy Meetings", "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm", "high"), ("Summary of Opinions", "https://www.boj.or.jp/en/mopo/mpmsche_minu/opinion_2025/index.htm", "high"), ("Minutes", "https://www.boj.or.jp/en/mopo/mpmsche_minu/minu_2025/index.htm", "high"), ("Others", "https://www.boj.or.jp/en/mopo/mpmsche_minu/m_ref/index.htm", "high"), ("Monetary Policy Releases", "https://www.boj.or.jp/en/mopo/mpmdeci/index.htm", "high"), ("All Decisions (by year)", "https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2025/index.htm", "high"), ("Statements on Monetary Policy", "https://www.boj.or.jp/en/mopo/mpmdeci/state_2025/index.htm", "high"), ("Other Statements", "https://www.boj.or.jp/en/mopo/mpmdeci/other/index.htm", "high"), ("Introduction or Modification of Schemes of Operations", "https://www.boj.or.jp/en/mopo/mpmdeci/ope_col_2025/index.htm", "high"), ("Transparency of Monetary Policy", "https://www.boj.or.jp/en/mopo/mpmdeci/transparency/index.htm", "high"), ("List by Year", "https://www.boj.or.jp/en/mopo/mpmdeci/mpr_all/index.htm", "high"), ("List by Year", "https://www.boj.or.jp/en/mopo/mpmdeci/state_all/index.htm", "high"), ("Summary of Opinions at the Monetary Policy Meetings List by Year", "https://www.boj.or.jp/en/mopo/mpmsche_minu/opinion_all/index.htm", "high"), ("Minutes of the Monetary Policy Meetings List by Year", "https://www.boj.or.jp/en/mopo/mpmsche_minu/minu_all/index.htm", "high"), ("Past Monetary Policy Meetings", "https://www.boj.or.jp/en/mopo/mpmsche_minu/past.htm", "high")]
     items: List[NewsItem] = []
@@ -240,7 +241,6 @@ def collect_boj() -> List[NewsItem]:
                 if added >= 40: break
     LOG.info("news_augment: BoJ collected: %d", len(items))
     return items
-
 def _boe_list_pages() -> List[str]:
     base = "https://www.bankofengland.co.uk/news"
     cats = ["news", "publications", "speeches", "statistics", "prudential-regulation", "upcoming"]
@@ -274,7 +274,6 @@ def collect_boe() -> List[NewsItem]:
         LOG.info(f"news_augment: BOE site search '{q}': links={len(anchors)} kept={len(kept)}")
         for link, text in kept[:50]: items.append(_mk_item("BOE_PR", text or "BoE item", link, "united kingdom", "GBP", "boe", "medium"))
     return items
-
 RBA_BASE = "https://www.rba.gov.au"
 RBA_YEAR_OK_RE = re.compile(r"/20(24|25)\b")
 RBA_SEARCH_QUERIES = ["Monetary Policy Decision", "Cash rate decision", "Statement on Monetary Policy", "Minutes of the Monetary Policy Meeting", "RBA Board minutes", "SOMP"]
@@ -316,9 +315,7 @@ def collect_rba() -> List[NewsItem]:
         for url in hubs: items.append(_mk_item("RBA_PR", "RBA hub", url, "australia", "AUD", "rba hub", "medium"))
         LOG.info(f"news_augment: RBA fallback hubs added: {len(hubs)}")
     return items
-
 def collect_mof_fx(now: datetime) -> List[NewsItem]:
-    # ... код ...
     items: List[NewsItem] = []
     bases = ["https://www.mof.go.jp/en/policy/international_policy/reference/foreign-exchange-intervention/", "https://www.mof.go.jp/en/policy/international_policy/reference/foreign_exchange_intervention/", "https://www.mof.go.jp/english/policy/international_policy/reference/foreign-exchange-intervention/", "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/", "https://www.mof.go.jp/policy/international_policy/reference/foreign-exchange-intervention/", "https://www.mof.go.jp/policy/international_policy/reference/foreign_exchange_intervention/"]
     candidates: List[str] = []
@@ -368,7 +365,7 @@ def merge_dedup(*groups: Iterable[NewsItem]) -> List[NewsItem]:
 # -----------------------------------------------------------------------------
 
 def _post_sanity(items: List[NewsItem]):
-    """Проверяет инварианты перед записью, чтобы предотвратить запись 'грязных' данных."""
+    """Проверяет инварианты перед записью."""
     assert all("://www." not in it.url for it in items if any(h in it.url for h in (
         "federalreserve.gov", "bankofengland.co.uk", "boj.or.jp", "ecb.europa.eu"
     ))), "www.* в url после канонизации"
@@ -376,26 +373,30 @@ def _post_sanity(items: List[NewsItem]):
     assert all("#" not in it.url for it in items), "anchor в url"
     LOG.info("Post-sanity checks passed for %d items", len(items))
 
-def write_and_verify(out_path: str, items: List[NewsItem]):
-    """Записывает TSV и сразу же верифицирует запись для диагностики."""
-    # Убедимся, что директория существует
+def _sha256(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+def atomic_write_tsv(items: list[NewsItem], out_path: str):
+    """Выполняет атомарную запись в TSV и выводит метаданные для верификации."""
+    tmp_path = out_path + f".tmp.{os.getpid()}"
     if os.path.dirname(out_path):
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    # Запись
+    
     sorted_items = sorted(items, key=lambda x: x.ts_utc, reverse=True)
-    with open(out_path, "w", encoding="utf-8") as w:
+    with open(tmp_path, "w", encoding="utf-8") as w:
         w.write(HDR)
         for it in sorted_items:
             w.write(it.to_tsv_row() + "\n")
-
-    size = os.path.getsize(out_path)
-    LOG.info("[export] Wrote %d rows, %d bytes -> %s", len(items), size, os.path.abspath(out_path))
-
-    # Контрольное чтение того же файла
-    with open(out_path, "r", encoding="utf-8") as r:
-        head = "".join(islice(r, 8))
-    LOG.info("[export] TSV head:\n---\n%s---", head.strip())
+    
+    os.replace(tmp_path, out_path)
+    
+    st = os.stat(out_path)
+    LOG.info(f"[export] Wrote -> {os.path.abspath(out_path)} size={st.st_size} mtime={int(st.st_mtime)} inode={st.st_ino}")
+    LOG.info(f"[export] sha256={_sha256(out_path)}")
 
 def run_augment() -> List[NewsItem]:
     LOG.info("Starting Container")
@@ -413,11 +414,11 @@ def run_augment() -> List[NewsItem]:
     ust = collect_us_treasury(); LOG.info("US Treasury collected: %d", len(ust))
 
     all_items = merge_dedup(fed, ecb, boj, boe, rba, mof, ust)
-    _post_sanity(all_items) # Проверка перед возвратом/записью
+    _post_sanity(all_items)
     LOG.info("NEWS augment: +%d rows", len(all_items))
     LOG.info("Took %.2fs", time.time() - t0)
     return all_items
 
 if __name__ == "__main__":
     collected_items = run_augment()
-    write_and_verify(DEFAULT_TSV_PATH, collected_items)
+    atomic_write_tsv(collected_items, DEFAULT_TSV_PATH)
