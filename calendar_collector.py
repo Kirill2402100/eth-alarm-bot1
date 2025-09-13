@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("calendar_collector")
 
-# ---- ENV ----
+# ---- ENV & Constants ----
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 
 CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
@@ -44,7 +44,6 @@ COLLECT_EVERY_MIN = int(os.getenv("COLLECT_EVERY_MIN", "20") or "20")
 FREE_LOOKBACK_DAYS  = int(os.getenv("FREE_LOOKBACK_DAYS", "7") or "7")
 FREE_LOOKAHEAD_DAYS = int(os.getenv("FREE_LOOKAHEAD_DAYS", "30") or "30")
 
-# Jina proxy на случай 403/404
 JINA_PROXY = os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/"
 
 ALLOWED_SOURCES = {
@@ -53,7 +52,6 @@ ALLOWED_SOURCES = {
     if s.strip()
 }
 
-# расширенные ключевые слова — ловим policy statement/statement, FOMC/MPC и т.п.
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
@@ -76,6 +74,19 @@ PAIR_COUNTRIES = {
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 FA_BADGE = {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}
+
+ECB_CAL_URLS = [
+    "https://www.ecb.europa.eu/press/calendars/govc/html/index.en.html",
+    "https://www.ecb.europa.eu/press/calendar/html/index.en.html",
+]
+BOE_CAL_URLS = [
+    "https://www.bankofengland.co.uk/monetary-policy",
+    "https://www.bankofengland.co.uk/monetary-policy/the-mpc-and-its-decisions",
+]
+RBA_CAL_URLS = [
+    "https://www.rba.gov.au/monetary-policy/rba-board.html",
+    "https://www.rba.gov.au/media-releases/2025/mr-25-02.html",
+]
 
 # ---- Helpers: creds ----
 def _decode_b64_to_json(s: str) -> Optional[dict]:
@@ -153,11 +164,12 @@ def _norm_iso_key(v: str) -> str:
 def fetch_text(url: str, timeout=15.0) -> tuple[str, int, str]:
     """GET с fallback через Jina proxy на 403/404."""
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (LPBot/1.0)"}) as cli:
+        with httpx.Client(follow_redirects=True, timeout=timeout,
+                          headers={"User-Agent": "Mozilla/5.0 (LPBot/1.0)"}) as cli:
             r = cli.get(url)
             if r.status_code in (403, 404):
                 pr = cli.get(JINA_PROXY + url)
-                return pr.text, pr.status_code, str(pr.url)
+                return pr.text or "", (200 if pr.text else pr.status_code), url
             return r.text, r.status_code, str(r.url)
     except Exception as e:
         log.warning("fetch failed %s: %s", url, e)
@@ -199,74 +211,216 @@ class CalEvent:
 CAL_HEADERS  = ["utc_iso", "local_time", "country", "currency", "title", "impact", "source", "url"]
 NEWS_HEADERS = ["ts_utc", "source", "title", "url", "countries", "ccy", "tags", "importance_guess", "hash"]
 
-# ---- Calendar parsers ----
-def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
-    text = _html_to_text(html)
-    pat = re.compile(
-        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
-        r"Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
-        r"(\d{1,2})(?:\s*[–—\-]\s*(\d{1,2}))?,\s*(20\d{2})",
-        re.I
-    )
-    out: List[CalEvent] = []
-    for m in pat.finditer(text):
-        mon_s, d1_s, _d2_s, y_s = m.group(1), m.group(2), m.group(3), m.group(4)
-        month = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,
-                 "sep":9,"oct":10,"nov":11,"dec":12}[mon_s.lower()[:3]]
-        day   = int(d1_s)
-        year  = int(y_s)
-        # ставим 14:00 UTC как «якорь» для дневного события
-        dt = datetime(year, month, day, 14, 0, 0, tzinfo=timezone.utc)
-        out.append(CalEvent(
-            utc=dt, country="united states", currency="USD",
-            title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
-        ))
-    # дедуп по дате
+# ---- Universal Calendar Parsing Helpers ----
+def _has_policy_context(html_text: str, patterns: List[str]) -> bool:
+    """Проверяет наличие ключевых слов в очищенном тексте страницы."""
+    t = _html_to_text(html_text)
+    return any(re.search(p, t, re.I) for p in patterns)
+
+def _anchor_hm(env_name: str, default: str) -> tuple[int, int]:
+    """Parse 'HH' or 'HH:MM' -> (h, m)."""
+    s = (os.getenv(env_name, default) or default).strip()
+    m = re.match(r"^\s*(\d{1,2})(?::(\d{1,2}))?\s*$", s)
+    if not m:
+        return 12, 0
+    h = max(0, min(23, int(m.group(1))))
+    mi = max(0, min(59, int(m.group(2) or "0")))
+    return h, mi
+
+def _mk_dt(y: int, mo: int, d: int, env_name: str, default: str) -> datetime:
+    h, mi = _anchor_hm(env_name, default)
+    return datetime(y, mo, d, h, mi, 0, tzinfo=timezone.utc)
+
+_MONTH = {m:i for i,m in enumerate(
+    ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"], start=1
+)}
+def _scan_dates_any(text: str) -> list[tuple[int,int,int]]:
+    """Универсальный сканер дат (EU/US стили и ISO). Возвращает список (y, m, d)."""
+    cur_year = datetime.now(timezone.utc).year
+    t = _html_to_text(text)
+    out: list[tuple[int,int,int]] = []
+
+    p1 = re.compile(
+        r"\b(\d{1,2})(?:\s*[–—\-]\s*\d{1,2})?\s+"
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+        r"Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\s*,?\s*(20\d{2})\b", re.I)
+    for m in p1.finditer(t):
+        d = int(m.group(1)); mo = _MONTH[m.group(2).lower()[:3]]; y = int(m.group(3))
+        out.append((y, mo, d))
+
+    p2 = re.compile(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+        r"Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
+        r"(\d{1,2})(?:\s*[–—\-]\s*\d{1,2})?,\s*(20\d{2})\b", re.I)
+    for m in p2.finditer(t):
+        mo = _MONTH[m.group(1).lower()[:3]]; d = int(m.group(2)); y = int(m.group(3))
+        out.append((y, mo, d))
+
+    p3 = re.compile(r"\b(20\d{2})[./\-](\d{1,2})[./\-](\d{1,2})\b")
+    for m in p3.finditer(t):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        out.append((y, mo, d))
+
+    p4 = re.compile(
+        r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(20\d{2})\b", re.I)
+    for m in p4.finditer(t):
+        d = int(m.group(1)); mo = _MONTH[m.group(2).lower()[:3]]; y = int(m.group(3))
+        out.append((y, mo, d))
+
     uniq = {}
-    for ev in out:
-        uniq[ev.utc.date()] = ev
+    for y, mo, d in out:
+        if not (cur_year - 1 <= y <= cur_year + 1):
+            continue
+        try:
+            datetime(y, mo, d)
+            uniq[(y, mo, d)] = (y, mo, d)
+        except ValueError:
+            pass
+    return list(uniq.values())
+
+# ---- Calendar parsers ----
+def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
+    if "govc/html" not in url and not _has_policy_context(html, [
+        r"governing council", r"monetary policy", r"rate decision"
+    ]):
+        return []
+    out: list[CalEvent] = []
+    for y, mo, d in _scan_dates_any(html):
+        try:
+            dt = _mk_dt(y, mo, d, "CAL_ECB_ANCHOR_UTC", "12:45")
+            out.append(CalEvent(
+                utc=dt, country="euro area", currency="EUR",
+                title="ECB Governing Council — Monetary Policy Meeting",
+                impact="high", source="ECB", url=url
+            ))
+        except Exception:
+            continue
+    uniq = {ev.utc.date(): ev for ev in out}
+    return list(uniq.values())
+
+def parse_boe_calendar(html: str, url: str) -> list[CalEvent]:
+    if not _has_policy_context(html, [r"monetary policy committee", r"\bMPC\b", r"bank rate", r"policy decision"]):
+        return []
+    out: list[CalEvent] = []
+    for y, mo, d in _scan_dates_any(html):
+        try:
+            dt = _mk_dt(y, mo, d, "CAL_BOE_ANCHOR_UTC", "11:00")
+            out.append(CalEvent(
+                utc=dt, country="united kingdom", currency="GBP",
+                title="BoE MPC Meeting / Rate Decision",
+                impact="high", source="BoE", url=url
+            ))
+        except Exception:
+            continue
+    uniq = {ev.utc.date(): ev for ev in out}
+    return list(uniq.values())
+
+def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
+    if not _has_policy_context(html, [r"monetary policy board", r"cash rate", r"board meeting"]):
+        return []
+    out: list[CalEvent] = []
+    for y, mo, d in _scan_dates_any(html):
+        try:
+            dt = _mk_dt(y, mo, d, "CAL_RBA_ANCHOR_UTC", "03:30")
+            out.append(CalEvent(
+                utc=dt, country="australia", currency="AUD",
+                title="RBA Monetary Policy Board Meeting",
+                impact="high", source="RBA", url=url
+            ))
+        except Exception:
+            continue
+    uniq = {ev.utc.date(): ev for ev in out}
+    return list(uniq.values())
+
+def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
+    out: List[CalEvent] = []
+    for y, mo, d in _scan_dates_any(html):
+        try:
+            dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", "14:00")
+            out.append(CalEvent(
+                utc=dt, country="united states", currency="USD",
+                title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
+            ))
+        except Exception:
+            continue
+    uniq = {ev.utc.date(): ev for ev in out}
     return list(uniq.values())
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
-    text = _html_to_text(html)
     out: List[CalEvent] = []
-    # Ловим 2025/9/17, 2025-09-17, 2025.9.17 и т.п.
-    for m in re.finditer(r"(20\d{2})\s*[./\-]\s*(\d{1,2})\s*[./\-]\s*(\d{1,2})", text):
+    for y, mo, d in _scan_dates_any(html):
         try:
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            dt = datetime(y, mo, d, 3, 0, 0, tzinfo=timezone.utc)
+            dt = _mk_dt(y, mo, d, "CAL_BOJ_ANCHOR_UTC", "03:00")
             out.append(CalEvent(
                 utc=dt, country="japan", currency="JPY",
                 title="BoJ Monetary Policy Meeting", impact="high", source="BoJ", url=url
             ))
         except Exception:
             continue
-    uniq = {}
-    for ev in out:
-        if 2000 <= ev.utc.year <= 2100:
-            uniq[ev.utc.date()] = ev
+    uniq = {ev.utc.date(): ev for ev in out}
     return list(uniq.values())
+
+def _log_calendar_coverage(events: List[CalEvent]):
+    cnt = {}
+    for e in events: cnt[e.currency] = cnt.get(e.currency, 0) + 1
+    for c in ["USD","JPY","EUR","GBP","AUD"]:
+        log.info("CALENDAR coverage %s: %d", c, cnt.get(c, 0))
 
 def collect_calendar() -> List[CalEvent]:
     events: List[CalEvent] = []
-
-    # FOMC
     url_fomc = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
     txt, code, f_url = fetch_text(url_fomc)
-    if code:
+    if code == 200 and txt:
         f = parse_fomc_calendar(txt, f_url)
         log.info("FOMC parsed: %d", len(f))
-        events += f
+        events.extend(f)
 
-    # BoJ
     url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
     txt, code, b_url = fetch_text(url_boj)
-    if code:
+    if code == 200 and txt:
         b = parse_boj_calendar(txt, b_url)
         log.info("BoJ parsed: %d", len(b))
-        events += b
+        events.extend(b)
 
-    return events
+    ecb_events = []
+    for url in ECB_CAL_URLS:
+        txt, code, u = fetch_text(url)
+        if code == 200 and txt:
+            ecb_events.extend(parse_ecb_calendar(txt, u))
+    uniq_ecb = {ev.utc.date(): ev for ev in ecb_events}
+    final_ecb = list(uniq_ecb.values())
+    log.info("ECB parsed: %d", len(final_ecb))
+    events.extend(final_ecb)
+
+    boe_events = []
+    for url in BOE_CAL_URLS:
+        txt, code, u = fetch_text(url)
+        if code == 200 and txt:
+            boe_events.extend(parse_boe_calendar(txt, u))
+    uniq_boe = {ev.utc.date(): ev for ev in boe_events}
+    final_boe = list(uniq_boe.values())
+    log.info("BoE parsed: %d", len(final_boe))
+    events.extend(final_boe)
+
+    rba_events = []
+    for url in RBA_CAL_URLS:
+        txt, code, u = fetch_text(url)
+        if code == 200 and txt:
+            rba_events.extend(parse_rba_calendar(txt, u))
+    uniq_rba = {ev.utc.date(): ev for ev in rba_events}
+    final_rba = list(uniq_rba.values())
+    log.info("RBA parsed: %d", len(final_rba))
+    events.extend(final_rba)
+    
+    final_unique_events = {}
+    for ev in events:
+        final_unique_events[(ev.utc.date(), ev.country)] = ev
+        
+    out = list(final_unique_events.values())
+    out.sort(key=lambda e: (e.utc, e.country))
+    _log_calendar_coverage(out)
+    return out
 
 # ---- NEWS scrapers ----
 @dataclass
@@ -298,57 +452,63 @@ class NewsItem:
             self.key_hash(),
         ]
 
+def _mof_fx_best_url() -> Optional[str]:
+    cands = [
+        "https://www.mof.go.jp/english/policy/international_policy/reference/feio/index.html",
+        "https://www.mof.go.jp/en/policy/international_policy/reference/feio/index.html",
+        "https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/",
+    ]
+    for u in cands:
+        txt, code, _ = fetch_text(u)
+        if code == 200 and re.search(r"(foreign|fx).{0,20}intervention|feio", txt, re.I):
+            return u
+    return None
+
 def collect_news() -> List[NewsItem]:
     items: List[NewsItem] = []
     now = datetime.now(timezone.utc)
 
-    # FED
     txt, code, _ = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
-    if code:
+    if code == 200 and txt:
         for m in re.finditer(r'href="(/newsevents/pressreleases/(?:20\d{2}-press-(?:fomc|monetary)|20\d{2}-press-\w+)\.htm)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://www.federalreserve.gov" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip() or "Fed press release"
             items.append(NewsItem(now, "US_FED_PR", t, u, "united states", "USD", "policy", "high"))
 
-    # US Treasury
     txt, code, _ = fetch_text("https://home.treasury.gov/news/press-releases")
-    if code:
+    if code == 200 and txt:
         for m in re.finditer(r'href="(/news/press-releases/sb\d+)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://home.treasury.gov" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             items.append(NewsItem(now, "US_TREASURY", t, u, "united states", "USD", "treasury", "medium"))
 
-    # ECB
     txt, code, _ = fetch_text("https://www.ecb.europa.eu/press/pubbydate/html/index.en.html?name_of_publication=Press%20release")
-    if code:
+    if code == 200 and txt:
         for m in re.finditer(r'href="(/press/(?:govcdec|press_conference|pr)/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://www.ecb.europa.eu" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             imp = "high" if KW_RE.search(t) else "medium"
             items.append(NewsItem(now, "ECB_PR", t, u, "euro area", "EUR", "ecb", imp))
 
-    # BoE
     txt, code, _ = fetch_text("https://www.bankofengland.co.uk/news")
-    if code:
+    if code == 200 and txt:
         for m in re.finditer(r'href="(/news/20\d{2}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://www.bankofengland.co.uk" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             imp = "high" if KW_RE.search(t) else "medium"
             items.append(NewsItem(now, "BOE_PR", t, u, "united kingdom", "GBP", "boe", imp))
 
-    # RBA
     txt, code, _ = fetch_text("https://www.rba.gov.au/media-releases/")
-    if code:
+    if code == 200 and txt:
         for m in re.finditer(r'href="(/media-releases/\d{4}/[^"]+)"[^>]*>(.*?)</a>', txt, re.I):
             u = "https://www.rba.gov.au" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip()
             imp = "high" if KW_RE.search(t) else "medium"
             items.append(NewsItem(now, "RBA_MR", t, u, "australia", "AUD", "rba", imp))
 
-    # JP MoF FX
-    txt, code, url = fetch_text("https://www.mof.go.jp/english/policy/international_policy/reference/foreign_exchange_intervention/")
-    if code == 200 and re.search(r"intervention|announcement", txt, re.I):
-        items.append(NewsItem(now, "JP_MOF_FX", "FX intervention reference page", url, "japan", "JPY", "mof", "high"))
+    u = _mof_fx_best_url()
+    if u:
+        items.append(NewsItem(now, "JP_MOF_FX", "FX intervention reference page", u, "japan", "JPY", "mof", "high"))
 
     max_age_days = int(os.getenv("NEWS_MAX_AGE_DAYS", "90") or "90")
     cutoff = now - timedelta(days=max_age_days)
@@ -443,8 +603,8 @@ def _read_existing_hashes(ws, hash_col_letter: str) -> set[str]:
     except Exception:
         return set()
 
-# >>> ВАЖНО: окно по КАЛЕНДАРНЫМ суткам
 def _calendar_window_filter(events: Iterable[CalEvent]) -> List[CalEvent]:
+    """ВАЖНО: окно по КАЛЕНДАРНЫМ суткам"""
     today_utc = datetime.now(timezone.utc).date()
     d1 = datetime.combine(today_utc - timedelta(days=FREE_LOOKBACK_DAYS), _time.min, tzinfo=timezone.utc)
     d2 = datetime.combine(today_utc + timedelta(days=FREE_LOOKAHEAD_DAYS), _time.max, tzinfo=timezone.utc)
@@ -486,8 +646,17 @@ def collect_once():
     try:
         existing = ws_cal.get_all_records()
         seen = {(_norm_iso_key(r.get("utc_iso")), (r.get("title") or "").strip()) for r in existing}
+        seen_date_cty = set()
+        for r in existing:
+            try:
+                d = datetime.fromisoformat(str(r.get("utc_iso")).replace("Z","+00:00")).date()
+                c = str(r.get("country","")).strip().lower()
+                seen_date_cty.add((d, c))
+            except Exception:
+                pass
     except Exception:
         seen = set()
+        seen_date_cty = set()
 
     all_events = collect_calendar()
     win_events = _calendar_window_filter(all_events)
@@ -495,17 +664,19 @@ def collect_once():
         log.info(
             "CALENDAR window: %d/%d kept (from %s to %s)",
             len(win_events), len(all_events),
-            win_events[0].utc, win_events[-1].utc
+            min(e.utc for e in win_events), max(e.utc for e in win_events)
         )
     else:
         log.info("CALENDAR window: 0/%d kept", len(all_events))
 
     new_rows = []
     for ev in win_events:
-        key = (_norm_iso_key(_to_utc_iso(ev.utc)), ev.title.strip())
-        if key not in seen:
-            new_rows.append(ev.to_row())
-            seen.add(key)
+        key1 = (_norm_iso_key(_to_utc_iso(ev.utc)), ev.title.strip())
+        key2 = (ev.utc.date(), ev.country.strip().lower())
+        if key1 in seen or key2 in seen_date_cty:
+            continue
+        new_rows.append(ev.to_row())
+        seen.add(key1); seen_date_cty.add(key2)
 
     if new_rows:
         ws_cal.append_rows(new_rows, value_input_option="RAW")
