@@ -321,45 +321,94 @@ def _selftest_scan_dates():
             log.error("FAIL: '%s' -> %s (expected %s)", s, res, expected)
     log.info("--- Selftest done ---")
 
-# ---- Calendar parsers ----
-def _fomc_range_end_dates(text: str) -> set[tuple[int,int,int]]:
-    """Концы диапазонов (вторые дни) для FOMC: 'Sep 16–17, 2025', '16–17 Sep 2025',
-    а также варианты БЕЗ года ('Sep 16–17' / '16–17 Sep') с подстановкой контекстного года."""
-    t = _html_to_text(text)
+# --- FOMC helpers (новое) ---
+
+def _slice_year_block_for_fomc(html: str) -> str:
+    """
+    Берём кусок страницы вокруг заголовка с годом (напр. '2025 FOMC meeting calendar'
+    или 'Meeting dates 2025'), чтобы не ловить посторонние даты.
+    """
+    t = _html_to_text(html)
+    y = _guess_context_year(t)
+    # кандидаты заголовков
+    pat = re.compile(rf"(?i)(fomc.*?\b{y}\b.*?(calendar|meeting\s+dates)|"
+                     rf"(meeting\s+dates).*?\b{y}\b)")
+    m = pat.search(t)
+    if not m:
+        return html  # fallback: весь HTML
+    start = m.start()
+    # следующий год/заголовок — граница блока
+    nxt = re.search(r"(?i)\b20\d{2}\b.*?(calendar|meeting\s+dates)", t[start+1:])
+    end = (start + 1 + nxt.start()) if nxt else len(t)
+    return t[start:end]
+
+
+def _fomc_meeting_range_ends(html: str) -> set[tuple[int, int, int]]:
+    """
+    Ищем ТОЛЬКО диапазоны дат со словом 'meeting' поблизости.
+    Возвращаем ВТОРЫЕ дни диапазона (конец).
+    Поддерживаем варианты с/без года.
+    """
+    t = html  # уже "срезанный" текст желательно
     ctx_year = _guess_context_year(t)
     cur_year = datetime.now(timezone.utc).year
-    MON = (
-        r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
-        r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
-        r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)"
-    )
+
+    MON = (r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
+           r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
+           r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)")
     def mon2num(s: str) -> int:
-        return _MONTH[s.lower().replace('.', '')[:3]]
-    ends: set[tuple[int,int,int]] = set()
-    # Вариант: Month d1–d2, YYYY
+        return _MONTH[s.lower().replace(".", "")[:3]]
+
+    ends: set[tuple[int, int, int]] = set()
+
+    # Month d1–d2, YYYY
     pA = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s*,\s*(20\d{{2}})\b", re.I)
+    # d1–d2 Month YYYY
+    pB = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I)
+    # Month d1–d2 (без года)
+    pC = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I)
+    # d1–d2 Month (без года)
+    pD = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I)
+
+    def _close_has_meeting(mobj: re.Match) -> bool:
+        seg = _html_to_text(t[max(0, mobj.start()-80): mobj.end()+80]).lower()
+        if "meeting" not in seg:
+            return False
+        # исключения
+        bad = ("minutes", "transcript", "press conference")  # при желании расширить
+        return not any(b in seg for b in bad)
+
     for m in pA.finditer(t):
+        if not _close_has_meeting(m): continue
         mo = mon2num(m.group(1)); d2 = int(m.group(3)); y = int(m.group(4))
         ends.add((y, mo, d2))
-    # Вариант: d1–d2 Month YYYY
-    pB = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I)
+
     for m in pB.finditer(t):
+        if not _close_has_meeting(m): continue
         d2 = int(m.group(2)); mo = mon2num(m.group(3)); y = int(m.group(4))
         ends.add((y, mo, d2))
-    # Вариант БЕЗ года: Month d1–d2  -> год = контекстный
-    pC = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I)
+
     for m in pC.finditer(t):
-        mo = mon2num(m.group(1)); d2 = int(m.group(3))
+        if not _close_has_meeting(m): continue
+        mo = mon2num(m.group(1)); d2 = int(m.group(2))
         ends.add((ctx_year, mo, d2))
-    # Вариант БЕЗ года: d1–d2 Month  -> год = контекстный
-    pD = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I)
+
     for m in pD.finditer(t):
+        if not _close_has_meeting(m): continue
         d2 = int(m.group(2)); mo = mon2num(m.group(3))
         ends.add((ctx_year, mo, d2))
-    # Слегка ограничим «дальние» года, чтобы не тащить 2028+ в coverage.
-    ends = { (y, mo, d) for (y, mo, d) in ends if (cur_year - 1) <= y <= (cur_year + 1) }
+
+    # ограничим «далёкие» годы
+    ends = {(y, mo, d) for (y, mo, d) in ends if (cur_year - 1) <= y <= (cur_year + 1)}
+
     return ends
 
+
+def _fomc_anchor_utc(y: int, mo: int, d: int) -> str:
+    """14:00 ET => 18:00Z (март–окт) или 19:00Z (нояб–фев). Эвристика по месяцам."""
+    return "18:00" if 3 <= mo <= 10 else "19:00"
+
+# ---- Calendar parsers ----
 def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
     if "govc/html" not in url and not _has_policy_context(html, [
         r"governing council", r"monetary policy", r"rate decision"
@@ -402,19 +451,28 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
     return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
-    """FOMC: берём вторые дни диапазонов (с учётом строк без года). Если ничего не нашли — fallback на общий сканер."""
+    # 1) Сужаемся до блока года
+    block = _slice_year_block_for_fomc(html)
+
+    # 2) Берём только диапазоны с 'meeting'
+    range_ends = _fomc_meeting_range_ends(block)
+
+    # 3) Если вдруг не нашли — очень осторожный fallback на весь html
+    if not range_ends:
+        range_ends = _fomc_meeting_range_ends(html)
+
     out: List[CalEvent] = []
-    range_ends = _fomc_range_end_dates(html)
-    triples = range_ends or set(_scan_dates_any(html))
-    for (y, mo, d) in triples:
+    for (y, mo, d) in sorted(range_ends):
         try:
-            dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", "18:00")
+            dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", _fomc_anchor_utc(y, mo, d))
             out.append(CalEvent(
                 utc=dt, country="united states", currency="USD",
                 title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
             ))
         except Exception:
             continue
+
+    # по одному событию на дату
     return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
