@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-news_augment.py — добавляет «недостающие» источники в лист NEWS (GBP/JPY),
+news_augment.py — добавляет «недостающие» источники в лист NEWS (GBP/JPY/AUD),
 не меняя существующий рабочий collector.
 
 Источники:
 - Bank of England (BoE): /news/* списки + site search (строгая фильтрация по ключевым словам)
 - Bank of Japan (BoJ): Monetary Policy Releases + Schedules/Minutes/Summary of Opinions
 - Japan MoF FX: reference page для интервенций (устойчивый перебор путей + fallback)
-
-ENV:
-  SHEET_ID=...                        (обязателен)
-  GOOGLE_CREDENTIALS_JSON_B64=...     (или GOOGLE_CREDENTIALS_JSON / GOOGLE_CREDENTIALS)
-  NEWS_WS=NEWS                        (имя листа)
-  LOG_LEVEL=INFO
-  JINA_PROXY=https://r.jina.ai/http/   (для обхода 403/404)
-  STRICT_BOE=1                        (строгая фильтрация BoE: 1 — строго, 0 — шире)
+- Reserve Bank of Australia (RBA): media releases, publications, speeches + search
 """
 
 import os, re, json, base64, logging, html as _html
@@ -55,6 +48,21 @@ KW_RE = re.compile(
 )
 
 NEWS_HEADERS = ["ts_utc", "source", "title", "url", "countries", "ccy", "tags", "importance_guess", "hash"]
+
+# --- RBA (AUD) ---
+RBA_BASE = "https://www.rba.gov.au"
+# берем свежие годы; при желании расширь до 2023
+RBA_YEAR_OK_RE = re.compile(r"/20(24|25)\b", re.I)
+
+# Поисковые доборы на случай, если что-то не попало из хабов
+RBA_SEARCH_QUERIES = [
+    "Monetary Policy Decision",
+    "Cash rate decision",
+    "Statement on Monetary Policy",
+    "Minutes of the Monetary Policy Meeting",
+    "RBA Board minutes",
+    "SOMP",
+]
 
 
 # --------- Google Sheets helpers ----------
@@ -382,6 +390,104 @@ def collect_mof_fx(now: datetime) -> List[NewsItem]:
     return items
 
 
+def _rba_importance_and_tags(title: str, url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Возвращает (importance, tags) для RBA или (None, None) если нерелевантно."""
+    t = (title or "").lower()
+    u = (url or "").lower()
+
+    # Решения/ставка/политика
+    if ("/media-releases/" in u) and any(k in t for k in ("decision", "cash rate", "monetary policy", "board")):
+        return "high", "policy"
+
+    # Statement on Monetary Policy (SOMP)
+    if "/publications/smp/" in u or "statement on monetary policy" in t or "somp" in t:
+        return "high", "policy somp"
+
+    # Протоколы заседаний
+    if "/monetary-policy/rba-board-minutes" in u or ("minutes" in t and "monetary policy" in t):
+        return "medium", "minutes"
+
+    # Речи по монетарной политике
+    if "/speeches/" in u and "monetary policy" in t and any(k in t for k in ("speech", "address", "governor")):
+        return "medium", "speech"
+
+    return None, None
+
+
+def collect_rba(now: datetime) -> List[NewsItem]:
+    """AUD: хабы + поисковые доборы. Строгая фильтрация + годовой фильтр."""
+    items: List[NewsItem] = []
+
+    hubs = [
+        f"{RBA_BASE}/media-releases/",
+        f"{RBA_BASE}/publications/smp/",
+        f"{RBA_BASE}/monetary-policy/rba-board-minutes/",
+        f"{RBA_BASE}/monetary-policy/",
+        f"{RBA_BASE}/speeches/",
+    ]
+
+    total_kept = 0
+
+    # 1) обходим хабы
+    for url in hubs:
+        html_src, code, final_url = fetch_text(url)
+        if code != 200 or not html_src:
+            log.info("news_augment: RBA hub %s: failed status %s", url, code)
+            continue
+
+        kept_here = 0
+        for link_url, text in _iter_links(html_src, final_url, domain_must="rba.gov.au"):
+            if not RBA_YEAR_OK_RE.search(link_url):
+                continue
+            imp, tags = _rba_importance_and_tags(text.strip(), link_url)
+            if not imp:
+                continue
+            items.append(NewsItem(now, "RBA_PR", text.strip(), link_url, "australia", "AUD", tags, imp))
+            kept_here += 1
+
+        total_kept += kept_here
+        log.info("news_augment: RBA hub kept from %s: %d", url, kept_here)
+
+    # 2) поисковые доборы
+    for q in RBA_SEARCH_QUERIES:
+        search_url = f"{RBA_BASE}/search/?{os.environ.get('RBA_QUERY_PARAM','q')}={q.replace(' ', '+')}"
+        # по умолчанию параметр 'q', но оставил хук через ENV на случай изменений
+        html_src, code, final_url = fetch_text(search_url)
+        if code != 200 or not html_src:
+            log.info("news_augment: RBA search fail %s: status %s", q, code)
+            continue
+
+        kept_here = 0
+        for link_url, text in _iter_links(html_src, RBA_BASE, domain_must="rba.gov.au"):
+            if not RBA_YEAR_OK_RE.search(link_url):
+                continue
+            imp, tags = _rba_importance_and_tags(text.strip(), link_url)
+            if not imp:
+                continue
+            items.append(NewsItem(now, "RBA_PR", text.strip(), link_url, "australia", "AUD", tags, imp))
+            kept_here += 1
+
+        total_kept += kept_here
+        log.info("news_augment: RBA search '%s': kept=%d", q, kept_here)
+
+    # 3) если ничего не собрали (403/блок со стороны сайта) — оставим “маяк”
+    if not items:
+        items.append(NewsItem(
+            now, "RBA_PR", "RBA hub (beacon)", f"{RBA_BASE}/media-releases/",
+            "australia", "AUD", "rba hub", "medium"
+        ))
+        log.warning("news_augment: RBA fallback beacon inserted")
+
+    # дедуп по URL внутри батча
+    uniq: Dict[str, NewsItem] = {}
+    for it in items:
+        uniq[it.url] = it
+    out = list(uniq.values())
+
+    log.info("news_augment: RBA collected: %d", len(out))
+    return out
+
+
 # --------- Write to NEWS ----------
 def write_news_rows(sh, items: List[NewsItem]):
     ws, _ = ensure_worksheet(sh, NEWS_WS, NEWS_HEADERS)
@@ -424,6 +530,13 @@ def main():
         all_items.extend(mof_items)
     except Exception:
         log.exception("collect_mof_fx failed")
+        
+    # AUD / RBA
+    try:
+        rba_items = collect_rba(now)
+        all_items.extend(rba_items)
+    except Exception:
+        log.exception("collect_rba failed")
 
     # Дедуп по hash внутри батча
     uniq: Dict[str, NewsItem] = {}
