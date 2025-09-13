@@ -323,7 +323,6 @@ def _selftest_scan_dates():
 
 # --- FOMC helpers ---
 def _slice_year_block_for_fomc(html: str) -> str:
-    """Take a slice of the page around the year title to avoid catching extraneous dates."""
     t = _html_to_text(html)
     y = _guess_context_year(t)
     m = re.search(rf"\b{y}\b", t)
@@ -333,45 +332,63 @@ def _slice_year_block_for_fomc(html: str) -> str:
     end = (m.end() + nxt.start()) if nxt else len(t)
     return t[start:end]
 
-def _scan_range_ends_simple(text: str) -> set[tuple[int, int, int]]:
-    """Scan for date ranges and return the end dates, with simple filtering."""
-    t = _html_to_text(text)
+def _scan_range_ends_simple(text: str) -> set[tuple[int,int,int]]:
+    """
+    Достаём ВТОРЫЕ дни диапазонов вида:
+      - Sep 16–17, 2025
+      - 16–17 Sep 2025
+      - Sep 16–17       (год = контекстный)
+      - 16–17 Sep       (год = контекстный)
+    Игнорируем «minutes / press conference / transcript».
+    """
+    t = text or ""
     ctx_year = _guess_context_year(t)
     cur_year = datetime.now(timezone.utc).year
-    MON = (r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
+
+    MON = (r"Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
            r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
-           r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)")
-    def mon2num(s: str) -> int: return _MONTH[s.lower().replace(".", "")[:3]]
-    ends: set[tuple[int, int, int]] = set()
-    patterns = [
-        re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s*,\s*(20\d{{2}})\b", re.I),
-        re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I),
-        re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I),
-        re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I),
+           r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?")
+
+    pats = [
+        re.compile(rf"\b(?P<mon>{MON})\s+(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\s*,\s*(?P<y>20\d{{2}})\b", re.I),
+        re.compile(rf"\b(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\s+(?P<mon>{MON})\s*,?\s*(?P<y>20\d{{2}})\b", re.I),
+        re.compile(rf"\b(?P<mon>{MON})\s+(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\b", re.I),
+        re.compile(rf"\b(?P<d1>\d{{1,2}})\s*[–—\-]\s*(?P<d2>\d{{1,2}})\s+(?P<mon>{MON})\b", re.I),
     ]
-    for p in patterns:
-        for m in p.finditer(t):
-            seg = t[max(0, m.start() - 80): m.end() + 80].lower()
-            bad = ("minutes", "transcript", "press conference")
-            if any(b in seg for b in bad):
+
+    def mon2num_safe(s: str) -> Optional[int]:
+        if not s: return None
+        key = s.lower().replace(".", "")[:3]
+        return _MONTH.get(key)
+
+    def good_context(lo: int, hi: int) -> bool:
+        seg = t[max(0, lo-80): hi+80].lower()
+        if any(b in seg for b in ("minutes", "press conference", "transcript")):
+            return False
+        return ("meeting" in seg) or ("fomc" in seg)
+
+    ends: set[tuple[int,int,int]] = set()
+
+    for pat in pats:
+        for m in pat.finditer(t):
+            if not good_context(m.start(), m.end()):
                 continue
-            groups = m.groups()
-            y, mo, d2 = None, None, None
-            if len(groups) == 4: # Month d1-d2, YYYY
-                mo = mon2num(groups[0]); d2 = int(groups[2]); y = int(groups[3])
-            elif len(groups) == 4 and groups[0].isdigit(): # d1-d2 Month YYYY
-                d2 = int(groups[1]); mo = mon2num(groups[2]); y = int(groups[3])
-            elif len(groups) == 3: # Month d1-d2
-                mo = mon2num(groups[0]); d2 = int(groups[2]); y = ctx_year
-            elif len(groups) == 3 and groups[0].isdigit(): # d1-d2 Month
-                d2 = int(groups[1]); mo = mon2num(groups[2]); y = ctx_year
-            if all((y, mo, d2)):
-                ends.add((y, mo, d2))
-    ends = {
-        (y, mo, d) for (y, mo, d) in ends
-        if (cur_year - 1) <= y <= (cur_year + 1)
-        and datetime(y, mo, d, tzinfo=timezone.utc).weekday() < 5
-    }
+            gd = m.groupdict()
+            mon = gd.get("mon"); d1 = int(gd["d1"]); d2 = int(gd["d2"])
+            if d2 < d1:
+                d1, d2 = d2, d1
+            y = int(gd.get("y") or ctx_year)
+            mo = mon2num_safe(mon)
+            if not mo:
+                continue
+            if not ((cur_year - 1) <= y <= (cur_year + 1)):
+                continue
+            try:
+                datetime(y, mo, d2)
+            except ValueError:
+                continue
+            ends.add((y, mo, d2))
+
     return ends
 
 def _fomc_anchor_utc(y: int, mo: int, d: int) -> str:
@@ -422,10 +439,15 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
     block = _slice_year_block_for_fomc(html)
-    range_ends = _scan_range_ends_simple(block)
+    t_block = _html_to_text(block)
+    t_full  = _html_to_text(html)
+    try:
+        range_ends = _scan_range_ends_simple(t_block)
+    except Exception as e:
+        log.warning("FOMC simple scan failed: %s", e)
+        range_ends = set()
     if not range_ends:
-        log.debug("FOMC: simple scan on slice failed, fallback to full page scan")
-        range_ends = _scan_range_ends_simple(_html_to_text(html))
+        range_ends = _scan_range_ends_simple(t_full)
     out: List[CalEvent] = []
     for (y, mo, d) in sorted(range_ends):
         try:
