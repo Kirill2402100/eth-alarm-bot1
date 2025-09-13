@@ -303,10 +303,12 @@ def append_row(sh, title: str, row: list):
 
 def _set_bank_target_in_bmr(sh, symbol: str, amount: float):
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return
+    if not sheet_name:
+        return
     ws = sh.worksheet(sheet_name)
     hdr = ws.row_values(1)
-    if "Bank_Target_USDT" not in hdr: return
+    if "Bank_Target_USDT" not in hdr:
+        return
     col = hdr.index("Bank_Target_USDT") + 1
     vals = ws.get_all_values()
     last = len(vals)
@@ -320,10 +322,6 @@ def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
 def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> tuple[str, Optional[str]]:
-    """
-    Индивидуальная новость для пары: сначала только "домашняя" страна пары.
-    Новости США показываем отдельно в USD-блоке, чтобы не дублировать на всех парах.
-    """
     now_utc = now_utc or datetime.now(timezone.utc)
     primary = _PRIMARY_COUNTRY.get(pair)
     countries = {primary} if primary else set()
@@ -589,43 +587,46 @@ def price_fmt(symbol: str, value: Optional[float]) -> str:
         return "—"
     return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
 
-def get_last_nonempty_row(sh, symbol: str,
-                          needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
+_COL_ALIASES = {
+    "Side": ["Side", "Position", "Dir"],
+    "Avg_Price": ["Avg_Price", "Avg price", "AvgPrice", "Average", "Avg"],
+    "Next_DCA_Price": ["Next_DCA_Price", "Next DCA Price", "NextPrice", "Next_Buy_Price", "Next Entry", "Next_Entry_Price", "Next_Buy"],
+    "Bank_Target_USDT": ["Bank_Target_USDT", "Bank Target USDT", "Target_Bank_USDT", "Bank_Target"],
+    "Bank_Fact_USDT": ["Bank_Fact_USDT", "Bank Fact USDT", "Bank_Fact", "Fact_Bank_USDT"],
+}
+
+def _last_nonempty(rows: List[dict], cand_names: List[str], treat_zero_empty=True):
+    for r in reversed(rows):
+        for n in cand_names:
+            if n in r:
+                v = r.get(n)
+                s = str(v).strip()
+                if s == "": continue
+                if treat_zero_empty and s in ("0", "0.0"): continue
+                return v
+    return None
+
+def read_latest_snapshot(sh, symbol: str) -> Optional[dict]:
+    """Для каждого ключевого поля берём последнее непустое значение."""
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name:
-        return None
+    if not sheet_name: return None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows:
-            return None
-        for r in reversed(rows):
-            if any(r.get(f) not in (None, "", 0, "0", "0.0") for f in needed_fields):
-                return r
-        return rows[-1]
+        if not rows: return None
+        return {
+            "Side": (_last_nonempty(rows, _COL_ALIASES["Side"], treat_zero_empty=False) or "").upper() or "LONG",
+            "Avg_Price": _to_float(_last_nonempty(rows, _COL_ALIASES["Avg_Price"]), None),
+            "Next_DCA_Price": _to_float(_last_nonempty(rows, _COL_ALIASES["Next_DCA_Price"]), None),
+            "Bank_Target_USDT": _to_float(_last_nonempty(rows, _COL_ALIASES["Bank_Target_USDT"]), None),
+            "Bank_Fact_USDT": _to_float(_last_nonempty(rows, _COL_ALIASES["Bank_Fact_USDT"], treat_zero_empty=False), None),
+        }
     except Exception:
         return None
 
 def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
-    sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name:
-        return None, None
-    try:
-        ws = sh.worksheet(sheet_name)
-        rows = ws.get_all_records()
-        if not rows:
-            return None, None
-        tgt = fac = None
-        for r in reversed(rows):
-            if tgt is None and r.get("Bank_Target_USDT") not in (None, "", 0, "0", "0.0"):
-                tgt = _to_float(r.get("Bank_Target_USDT"), None)
-            if fac is None and r.get("Bank_Fact_USDT") not in (None, "", 0, "0", "0.0"):
-                fac = _to_float(r.get("Bank_Fact_USDT"), None)
-            if tgt is not None and fac is not None:
-                break
-        return tgt, fac
-    except Exception:
-        return None, None
+    snap = read_latest_snapshot(sh, symbol) or {}
+    return snap.get("Bank_Target_USDT"), snap.get("Bank_Fact_USDT")
 
 def _effect_hint(pair: str, origin: Optional[str]) -> str:
     o = (origin or "").lower()
@@ -653,7 +654,7 @@ async def _effect_explain_line(pair: str, headline: str, origin: Optional[str]) 
     return "⚠️ LLM не дал расшифровку; ориентир по эффекту: " + _effect_hint(pair, origin)
 
 def _symbol_hints(symbol: str) -> tuple[str,str]:
-    # This is now a pure fallback for when no news/event is found at all
+    # Fallback for when no news/event is found at all
     if symbol == "USDJPY": return ("Новостей нет. Ориентир — ближайшее заседание FOMC.", "")
     if symbol == "AUDUSD": return ("Новостей нет. Ориентир — ближайшее заседание РБА.", "")
     if symbol == "EURUSD": return ("Новостей нет. Ориентир — ближайшее заседание ЕЦБ.", "")
@@ -676,7 +677,7 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     risk, bias = fa_data.get("risk", "Green"), fa_data.get("bias", "neutral")
     dca, reserve = float(fa_data.get("dca_scale", 1.0)), "OFF" if fa_data.get("reserve_off") else "ON"
     title = f"{_pair_to_title(pair)} — {_fa_icon(risk)} фон {risk.lower()}, bias: {bias.upper()}"
-    side, avg, nxt = (row.get("Side") or "LONG").upper(), price_fmt(pair, _to_float(row.get("Avg_Price"))), price_fmt(pair, _to_float(row.get("Next_DCA_Price")))
+    side, avg, nxt = row.get("Side") or "LONG", price_fmt(pair, row.get("Avg_Price")), price_fmt(pair, row.get("Next_DCA_Price"))
     lines = [title,
              f"•\tСводка рынка: {'движения ровные, резких скачков не ждём до США.'}",
              f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.",
@@ -686,7 +687,7 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
         lines.append(f"•\tТоп-новость: {top_line}.")
         clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line))
         expl = await _effect_explain_line(pair, clean_hl, origin)
-        if expl: lines.append(f"•\tЧто это значит для цены: {expl}")
+        if expl: lines.append(f"•\tЧто это значит для цены: {_h(expl)}")
     else:
         what_means, _ = _symbol_hints(pair)
         lines.append(f"•\tЧто это значит для цены: {what_means}")
@@ -700,8 +701,7 @@ def render_usd_block(sh) -> str:
         return "USD — общий фон: свежих новостей нет; смотрим к ближайшему FOMC."
     ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
     when = f"{ts_local:%H:%M}" if ev["from"] == "news" else f"{ts_local:%Y-%m-%d %H:%M}"
-    href = (ev.get("url") or "").strip()
-    ttl = _h(ev["title"])
+    href, ttl = (ev.get("url") or "").strip(), _h(ev["title"])
     ttl_html = f'<a href="{_h(href)}">{ttl}</a>' if href else ttl
     line = f"USD — общий фон: {when} — {ttl_html} ({_h(ev['src'])})."
     hint = "В общем случае: чем жёстче риторика ФРС — тем сильнее доллар; мягче — слабее."
@@ -723,19 +723,14 @@ def build_main_thought(sh, fa_sheet_data: dict) -> str:
     reds   = [p for p, r in risks.items() if r == "Red"]
     ambers = [p for p, r in risks.items() if r == "Amber"]
     parts: list[str] = []
-    if reds:
-        parts.append("стоп докупок по " + ", ".join(reds))
-    if ambers:
-        parts.append("осторожность по " + ", ".join(ambers))
-    if not parts:
-        parts.append("фон спокойный, работаем по плану")
-    # Ключевой драйвер — США
+    if reds: parts.append("стоп докупок по " + ", ".join(reds))
+    if ambers: parts.append("осторожность по " + ", ".join(ambers))
+    if not parts: parts.append("фон спокойный, работаем по плану")
     ev = _pick_top_event(sh, {"united states"}, datetime.now(timezone.utc), ttl_min=NEWS_TTL_MIN)
     if ev:
         ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
         when = f"{ts_local:%H:%M}" if ev["from"] == "news" else f"{ts_local:%Y-%m-%d %H:%M}"
         parts.append(f"драйвер: {when} — {ev['title']} ({ev['src']})")
-    # Наибольшее расхождение план/факт
     worst = _largest_plan_fact_delta(sh)
     if worst and abs(worst[3]) >= 0.05:
         sym, plan, fact, d = worst
@@ -747,7 +742,7 @@ async def build_digest_text(sh, fa_sheet_data: dict) -> str:
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
     parts: List[str] = [header]
     for i, sym in enumerate(SYMBOLS):
-        row = get_last_nonempty_row(sh, sym) or {}
+        row = read_latest_snapshot(sh, sym) or {}
         fa_data = fa_sheet_data.get(sym, {})
         block = await render_morning_pair_block(sh, sym, row, fa_data)
         parts.append(block)
@@ -781,6 +776,22 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
 
 # -------------------- Диагностика --------------------
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _llm_selfcheck() -> str:
+        if not explain_pair_event:
+            return "LLM: ⚠️ explain_pair_event не подключён (llm_client.py?)"
+        try:
+            txt = await explain_pair_event(pair="EURUSD",
+                                             headline="ECB monetary policy decision",
+                                             origin="euro area", lang="ru")
+            if txt and txt.strip():
+                return "LLM: ✅ ответ получен"
+            return "LLM: ⚠️ нет ответа (используется фоллбэк) — проверь модель/ключ в llm_client.py"
+        except Exception as e:
+            return f"LLM: ❌ error: {e}"
+    llm_line = await _llm_selfcheck()
+    await update.message.reply_text(f"{llm_line}\n{sheets_diag_text()}\n{await _diag_news_line()}")
+
 def sheets_diag_text() -> str:
     sid_state = "set" if SHEET_ID else "empty"
     if not _GSHEETS_AVAILABLE: return f"Sheets: ❌ (libs not installed)"
@@ -802,11 +813,6 @@ async def _diag_news_line() -> str:
         return f"NEWS: ✅ {len(_read_news_rows_simple(sh))} строк в листе NEWS; TTL {NEWS_TTL_MIN} мин."
     except Exception as e:
         return f"NEWS: ❌ ошибка: {e}"
-
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: llm_line = "LLM: ✅ ok" if await llm_ping() else "LLM: ❌ no key"
-    except Exception: llm_line = "LLM: ❌ error"
-    await update.message.reply_text(f"{llm_line}\n{sheets_diag_text()}\n{await _diag_news_line()}")
 
 async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not SHEET_ID: return await update.message.reply_text("SHEET_ID не задан.")
