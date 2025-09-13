@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-news_augment.py — сбор ссылок с регуляторов (Fed/ECB/BoJ/BoE/US Treasury) + JP MoF FX.
+news_augment.py — сбор ссылок с регуляторов (Fed/ECB/BoJ/BoE/RBA/US Treasury) + JP MoF FX.
 Логи в стиле:
     INFO news_augment: Starting Container
     INFO news_augment: ...
@@ -130,6 +130,15 @@ def _abs_url(base: str, href: str) -> str:
     return urllib.parse.urljoin(base, href)
 
 
+def _unwrap_mirror_base(base_url: str) -> str:
+    pref = "https://r.jina.ai/http/"
+    if base_url.startswith(pref):
+        raw = base_url[len(pref):]
+        if raw.startswith(("http://", "https://")):
+            return raw
+    return base_url
+
+
 A_TAG_RE = re.compile(
     r"<a\b([^>]+)>(.*?)</a>",
     re.I | re.DOTALL,
@@ -152,16 +161,17 @@ def _iter_links(html_src: str, base_url: str, domain_must: Optional[str] = None)
     """
     Итератор (url, text). Если задан domain_must, пропускаем чужие домены.
     """
+    join_base = _unwrap_mirror_base(base_url)
     for m in A_TAG_RE.finditer(html_src):
         a_attrs = m.group(1) or ""
         a_inner = m.group(2) or ""
         href_match = HREF_RE.search(a_attrs)
         if not href_match:
             continue
-        href = href_match.group("u") or href_match.group("u2") or ""
+        href = (href_match.group("u") or href_match.group("u2") or "").strip()
         if not href:
             continue
-        url = _abs_url(base_url, href.strip())
+        url = _abs_url(join_base, href)
         if domain_must:
             try:
                 netloc = urllib.parse.urlparse(url).netloc
@@ -387,6 +397,94 @@ def collect_boe() -> List[NewsItem]:
     return items
 
 
+# --- Reserve Bank of Australia ---
+
+RBA_BASE = "https://www.rba.gov.au"
+RBA_SEARCH_QUERIES = [
+    "Monetary Policy Decision 2025",
+    "Statement on Monetary Policy 2025",
+    "Minutes of the Monetary Policy Meeting 2025",
+    "Governor speech monetary policy 2025",
+]
+
+def _rba_importance_and_tags(title: str) -> Tuple[Optional[str], Optional[str]]:
+    t = title.lower()
+    if "monetary policy decision" in t:
+        return "high", "policy"
+    if "statement on monetary policy" in t or "somp" in t:
+        return "high", "policy somp"
+    if "minutes of the monetary policy meeting" in t:
+        return "medium", "minutes"
+    if "governor" in t and ("speech" in t or "address" in t) and "monetary policy" in t:
+        return "medium", "speech"
+    # дефолт: отбрасываем
+    return None, None
+
+def collect_rba() -> List[NewsItem]:
+    """
+    Сканирует ключевые разделы и использует поиск по сайту Резервного банка Австралии.
+    """
+    items: List[NewsItem] = []
+
+    # 1) Главные хабы с анкерами
+    hub_pages = [
+        f"{RBA_BASE}/monetary-policy/",
+        f"{RBA_BASE}/media-releases/",
+    ]
+    for url in hub_pages:
+        html_src, code, final_url = fetch_text(url)
+        if code != 200 or not html_src:
+            LOG.info(f"news_augment: RBA hub {url}: failed status {code}")
+            continue
+
+        kept = 0
+        for link_url, text in _iter_links(html_src, final_url, domain_must="rba.gov.au"):
+            title = text.strip()
+            if not title:
+                continue
+            
+            # Фильтр по году для отсева старых материалов
+            if "2024" not in title and "2025" not in title and "2024" not in link_url and "2025" not in link_url:
+                continue
+
+            imp, tags = _rba_importance_and_tags(title)
+            if not imp:
+                continue
+
+            item = _mk_item("RBA_PR", title, link_url, "australia", "AUD", tags, imp)
+            items.append(item)
+            kept += 1
+        LOG.info(f"news_augment: RBA hub kept from {url}: {kept}")
+
+    # 2) Site search как страховка
+    for q in RBA_SEARCH_QUERIES:
+        search_url = f"{RBA_BASE}/search/?{urllib.parse.urlencode({'q': q})}"
+        html_src, code, final_url = fetch_text(search_url)
+        if code != 200 or not html_src:
+            LOG.info(f"news_augment: RBA search fail {q}: status {code}")
+            continue
+
+        kept = 0
+        # Для search results относительные пути лучше разрешать от RBA_BASE
+        for link_url, text in _iter_links(html_src, RBA_BASE, domain_must="rba.gov.au"):
+            title = text.strip()
+
+            # Фильтр по году для отсева старых материалов (дублируем логику)
+            if "2024" not in title and "2025" not in title and "2024" not in link_url and "2025" not in link_url:
+                continue
+                
+            imp, tags = _rba_importance_and_tags(title)
+            if not imp:
+                continue
+
+            item = _mk_item("RBA_PR", title, link_url, "australia", "AUD", tags, imp)
+            items.append(item)
+            kept += 1
+        LOG.info(f"news_augment: RBA search '{q}': kept={kept}")
+
+    return items
+
+
 # ---------------------------- JP MoF FX (с фиксами) ---------------------------
 def collect_mof_fx(now: datetime) -> List[NewsItem]:
     """
@@ -476,7 +574,7 @@ def collect_mof_fx(now: datetime) -> List[NewsItem]:
             url=found_url,
             countries="japan",
             ccy="JPY",
-            tags="mof",
+            tags="mof fx",  # <--- ИЗМЕНЕНО
             importance_guess="high",
             hash=_hash("JP_MOF_FX", found_url),
         ))
@@ -516,8 +614,13 @@ def run_augment() -> List[NewsItem]:
     LOG.info("news_augment: ECB collected: %d", len(ecb))
 
     boj = collect_boj()  # внутри пишет лог
+
     boe = collect_boe()
     LOG.info("news_augment: BOE collected total: %d", len(boe))
+
+    # RBA (новый источник)
+    rba = collect_rba()
+    LOG.info("news_augment: RBA collected: %d", len(rba))
 
     # JP MoF FX (сейчас скан только референсной страницы)
     mof = collect_mof_fx(_now_utc())
@@ -526,7 +629,7 @@ def run_augment() -> List[NewsItem]:
     ust = collect_us_treasury()
     LOG.info("news_augment: US Treasury collected: %d", len(ust))
 
-    all_items = merge_dedup(fed, ecb, boj, boe, mof, ust)
+    all_items = merge_dedup(fed, ecb, boj, boe, rba, mof, ust)
     LOG.info("news_augment: NEWS augment: +%d rows", len(all_items))
     LOG.info("news_augment: took %.2fs", time.time() - t0)
     return all_items
