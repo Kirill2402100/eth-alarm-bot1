@@ -397,53 +397,55 @@ def collect_boe() -> List[NewsItem]:
     return items
 
 
-# --- Reserve Bank of Australia (фикс) ---
+# --- Reserve Bank of Australia (расширенный матч + фолбэк) ---
 
 RBA_BASE = "https://www.rba.gov.au"
 RBA_SEARCH_QUERIES = [
     "Monetary Policy Decision",
+    "Cash rate decision",
     "Statement on Monetary Policy",
     "Minutes of the Monetary Policy Meeting",
-    "cash rate decision",
+    "RBA Board minutes",
+    "SOMP",
 ]
 
 def _rba_importance_and_tags(title: str, url: str) -> Tuple[Optional[str], Optional[str]]:
     t = (title or "").lower()
     u = (url or "").lower()
 
-    # Monetary Policy Decision / cash rate — обычно как media release
-    if "monetary policy decision" in t or "cash rate" in t or ("/media-releases/" in u and "decision" in t):
+    # Monetary Policy Decision / Cash rate — чаще всего в media-releases
+    if ("/media-releases/" in u and
+        ("decision" in t or "cash rate" in t or "monetary policy" in t or "board" in t)):
         return "high", "policy"
 
     # Statement on Monetary Policy (SOMP)
-    if "statement on monetary policy" in t or "/publications/smp/" in u:
+    if "/publications/smp/" in u or "statement on monetary policy" in t or "somp" in t:
         return "high", "policy somp"
 
     # Minutes
-    if "minutes" in t or "/rba-board-minutes" in u:
+    if "/monetary-policy/rba-board-minutes" in u or ("minutes" in t and "monetary policy" in t):
         return "medium", "minutes"
 
     # Речи про монетарную политику
-    if "governor" in t and ("speech" in t or "address" in t) and "monetary policy" in t:
+    if "/speeches/" in u and "monetary policy" in t and ("speech" in t or "address" in t or "governor" in t):
         return "medium", "speech"
 
     return None, None
 
 def collect_rba() -> List[NewsItem]:
-    """
-    Сканируем ключевые хабы + подстраховываемся поиском.
-    Без фильтра по году — оставляем по ключам/путям.
-    """
     items: List[NewsItem] = []
 
-    # 1) Хабы
-    hub_pages = [
-        f"{RBA_BASE}/monetary-policy/",
+    hubs = [
         f"{RBA_BASE}/media-releases/",
         f"{RBA_BASE}/publications/smp/",
         f"{RBA_BASE}/monetary-policy/rba-board-minutes/",
+        f"{RBA_BASE}/monetary-policy/",
+        f"{RBA_BASE}/speeches/",
     ]
-    for url in hub_pages:
+
+    # 1) Хабы
+    total_kept = 0
+    for url in hubs:
         html_src, code, final_url = fetch_text(url)
         if code != 200 or not html_src:
             LOG.info(f"news_augment: RBA hub {url}: failed status {code}")
@@ -451,17 +453,14 @@ def collect_rba() -> List[NewsItem]:
 
         kept = 0
         for link_url, text in _iter_links(html_src, final_url, domain_must="rba.gov.au"):
-            # отсечь мусорные якоря
-            if "#" in link_url or text.strip().lower().startswith("skip to main"):
+            if not text.strip() or "#" in link_url or text.strip().lower().startswith("skip to main"):
                 continue
-
             imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
-
-            items.append(_mk_item("RBA_PR", text.strip() or "RBA item", link_url,
-                                  "australia", "AUD", tags, imp))
+            items.append(_mk_item("RBA_PR", text.strip(), link_url, "australia", "AUD", tags, imp))
             kept += 1
+        total_kept += kept
         LOG.info(f"news_augment: RBA hub kept from {url}: {kept}")
 
     # 2) Поиск (подстраховка)
@@ -471,22 +470,24 @@ def collect_rba() -> List[NewsItem]:
         if code != 200 or not html_src:
             LOG.info(f"news_augment: RBA search fail {q}: status {code}")
             continue
-
         kept = 0
         for link_url, text in _iter_links(html_src, RBA_BASE, domain_must="rba.gov.au"):
-            if "#" in link_url or text.strip().lower().startswith("skip to main"):
+            if not text.strip() or "#" in link_url or text.strip().lower().startswith("skip to main"):
                 continue
-
             imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
-
-            items.append(_mk_item("RBA_PR", text.strip() or "RBA item", link_url,
-                                  "australia", "AUD", tags, imp))
+            items.append(_mk_item("RBA_PR", text.strip(), link_url, "australia", "AUD", tags, imp))
             kept += 1
+        total_kept += kept
         LOG.info(f"news_augment: RBA search '{q}': kept={kept}")
 
-    LOG.info("news_augment: RBA collected: %d", len(items))
+    # 3) Фолбэк: если ничего не нашли, добавим сами хабы (чтобы AUD был виден в системе)
+    if not items:
+        for url in hubs:
+            items.append(_mk_item("RBA_PR", "RBA hub", url, "australia", "AUD", "rba hub", "medium"))
+        LOG.info("news_augment: RBA fallback hubs added: %d", len(hubs))
+
     return items
 
 
@@ -625,7 +626,11 @@ def run_augment() -> List[NewsItem]:
 
     # RBA (новый источник)
     rba = collect_rba()
-    # LOG.info("news_augment: RBA collected: %d", len(rba)) # Лог уже внутри функции
+    LOG.info("news_augment: RBA collected: %d", len(rba))
+    # Диагностический "маяк", если RBA ничего не нашел
+    if not any(it.ccy == "AUD" for it in rba):
+        rba.append(_mk_item("RBA_PR", "RBA hub (beacon)", f"{RBA_BASE}/media-releases/", "australia", "AUD", "rba hub", "medium"))
+        LOG.warning("news_augment: Injected RBA beacon because no AUD items were found naturally.")
 
     # JP MoF FX (сейчас скан только референсной страницы)
     mof = collect_mof_fx(_now_utc())
