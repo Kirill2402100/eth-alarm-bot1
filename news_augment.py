@@ -397,39 +397,51 @@ def collect_boe() -> List[NewsItem]:
     return items
 
 
-# --- Reserve Bank of Australia ---
+# --- Reserve Bank of Australia (фикс) ---
 
 RBA_BASE = "https://www.rba.gov.au"
 RBA_SEARCH_QUERIES = [
-    "Monetary Policy Decision 2025",
-    "Statement on Monetary Policy 2025",
-    "Minutes of the Monetary Policy Meeting 2025",
-    "Governor speech monetary policy 2025",
+    "Monetary Policy Decision",
+    "Statement on Monetary Policy",
+    "Minutes of the Monetary Policy Meeting",
+    "cash rate decision",
 ]
 
-def _rba_importance_and_tags(title: str) -> Tuple[Optional[str], Optional[str]]:
-    t = title.lower()
-    if "monetary policy decision" in t:
+def _rba_importance_and_tags(title: str, url: str) -> Tuple[Optional[str], Optional[str]]:
+    t = (title or "").lower()
+    u = (url or "").lower()
+
+    # Monetary Policy Decision / cash rate — обычно как media release
+    if "monetary policy decision" in t or "cash rate" in t or ("/media-releases/" in u and "decision" in t):
         return "high", "policy"
-    if "statement on monetary policy" in t or "somp" in t:
+
+    # Statement on Monetary Policy (SOMP)
+    if "statement on monetary policy" in t or "/publications/smp/" in u:
         return "high", "policy somp"
-    if "minutes of the monetary policy meeting" in t:
+
+    # Minutes
+    if "minutes" in t or "/rba-board-minutes" in u:
         return "medium", "minutes"
+
+    # Речи про монетарную политику
     if "governor" in t and ("speech" in t or "address" in t) and "monetary policy" in t:
         return "medium", "speech"
-    # дефолт: отбрасываем
+
     return None, None
 
 def collect_rba() -> List[NewsItem]:
     """
-    Сканирует ключевые разделы и использует поиск по сайту Резервного банка Австралии.
+    Сканируем ключевые хабы + подстраховываемся поиском.
+    Без фильтра по году — оставляем по ключам/путям.
     """
     items: List[NewsItem] = []
 
-    # 1) Главные хабы с анкерами
+    # 1) Хабы
     hub_pages = [
         f"{RBA_BASE}/monetary-policy/",
         f"{RBA_BASE}/media-releases/",
+        f"{RBA_BASE}/publications/smp/",
+        f"{RBA_BASE}/monetary-policy/rba-board-minutes/",
     ]
     for url in hub_pages:
         html_src, code, final_url = fetch_text(url)
@@ -439,24 +451,20 @@ def collect_rba() -> List[NewsItem]:
 
         kept = 0
         for link_url, text in _iter_links(html_src, final_url, domain_must="rba.gov.au"):
-            title = text.strip()
-            if not title:
-                continue
-            
-            # Фильтр по году для отсева старых материалов
-            if "2024" not in title and "2025" not in title and "2024" not in link_url and "2025" not in link_url:
+            # отсечь мусорные якоря
+            if "#" in link_url or text.strip().lower().startswith("skip to main"):
                 continue
 
-            imp, tags = _rba_importance_and_tags(title)
+            imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
 
-            item = _mk_item("RBA_PR", title, link_url, "australia", "AUD", tags, imp)
-            items.append(item)
+            items.append(_mk_item("RBA_PR", text.strip() or "RBA item", link_url,
+                                  "australia", "AUD", tags, imp))
             kept += 1
         LOG.info(f"news_augment: RBA hub kept from {url}: {kept}")
 
-    # 2) Site search как страховка
+    # 2) Поиск (подстраховка)
     for q in RBA_SEARCH_QUERIES:
         search_url = f"{RBA_BASE}/search/?{urllib.parse.urlencode({'q': q})}"
         html_src, code, final_url = fetch_text(search_url)
@@ -465,23 +473,20 @@ def collect_rba() -> List[NewsItem]:
             continue
 
         kept = 0
-        # Для search results относительные пути лучше разрешать от RBA_BASE
         for link_url, text in _iter_links(html_src, RBA_BASE, domain_must="rba.gov.au"):
-            title = text.strip()
-
-            # Фильтр по году для отсева старых материалов (дублируем логику)
-            if "2024" not in title and "2025" not in title and "2024" not in link_url and "2025" not in link_url:
+            if "#" in link_url or text.strip().lower().startswith("skip to main"):
                 continue
-                
-            imp, tags = _rba_importance_and_tags(title)
+
+            imp, tags = _rba_importance_and_tags(text.strip(), link_url)
             if not imp:
                 continue
 
-            item = _mk_item("RBA_PR", title, link_url, "australia", "AUD", tags, imp)
-            items.append(item)
+            items.append(_mk_item("RBA_PR", text.strip() or "RBA item", link_url,
+                                  "australia", "AUD", tags, imp))
             kept += 1
         LOG.info(f"news_augment: RBA search '{q}': kept={kept}")
 
+    LOG.info("news_augment: RBA collected: %d", len(items))
     return items
 
 
@@ -574,7 +579,7 @@ def collect_mof_fx(now: datetime) -> List[NewsItem]:
             url=found_url,
             countries="japan",
             ccy="JPY",
-            tags="mof fx",  # <--- ИЗМЕНЕНО
+            tags="mof fx",
             importance_guess="high",
             hash=_hash("JP_MOF_FX", found_url),
         ))
@@ -620,7 +625,7 @@ def run_augment() -> List[NewsItem]:
 
     # RBA (новый источник)
     rba = collect_rba()
-    LOG.info("news_augment: RBA collected: %d", len(rba))
+    # LOG.info("news_augment: RBA collected: %d", len(rba)) # Лог уже внутри функции
 
     # JP MoF FX (сейчас скан только референсной страницы)
     mof = collect_mof_fx(_now_utc())
