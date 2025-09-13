@@ -36,12 +36,12 @@ log = logging.getLogger("calendar_collector")
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 
 CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
-CAL_WS_RAW = os.getenv("CAL_WS_RAW", "CALENDAR_RAW").strip() or "CALENDAR_RAW"  # запасной (сейчас не используем)
+CAL_WS_RAW = os.getenv("CAL_WS_RAW", "CALENDAR_RAW").strip() or "CALENDAR_RAW"
 
 RUN_FOREVER = (os.getenv("RUN_FOREVER", "1").lower() in ("1", "true", "yes", "on"))
 COLLECT_EVERY_MIN = int(os.getenv("COLLECT_EVERY_MIN", "20") or "20")
 
-FREE_LOOKBACK_DAYS  = int(os.getenv("FREE_LOOKBACK_DAYS", "7") or "7")
+FREE_LOOKBACK_DAYS  = int(os.getenv("FREE_LOOKBACK_DAYS", "8") or "8")
 FREE_LOOKAHEAD_DAYS = int(os.getenv("FREE_LOOKAHEAD_DAYS", "30") or "30")
 
 JINA_PROXY = os.getenv("JINA_PROXY", "https://r.jina.ai/http/").rstrip("/") + "/"
@@ -76,16 +76,19 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 FA_BADGE = {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}
 
 ECB_CAL_URLS = [
+    "https://www.ecb.europa.eu/press/govcdec/html/index.en.html",
     "https://www.ecb.europa.eu/press/calendars/govc/html/index.en.html",
     "https://www.ecb.europa.eu/press/calendar/html/index.en.html",
+    "https://www.ecb.europa.eu/press/calendar",
 ]
 BOE_CAL_URLS = [
+    "https://www.bankofengland.co.uk/interest-rates/meeting-dates",
     "https://www.bankofengland.co.uk/monetary-policy",
-    "https://www.bankofengland.co.uk/monetary-policy/the-mpc-and-its-decisions",
 ]
 RBA_CAL_URLS = [
-    "https://www.rba.gov.au/monetary-policy/rba-board.html",
+    "https://www.rba.gov.au/monetary-policy/2025.html",
     "https://www.rba.gov.au/media-releases/2025/mr-25-02.html",
+    "https://www.rba.gov.au/monetary-policy/rba-board.html",
 ]
 
 # ---- Helpers: creds ----
@@ -162,12 +165,17 @@ def _norm_iso_key(v: str) -> str:
 
 # ---- HTTP helpers ----
 def fetch_text(url: str, timeout=15.0) -> tuple[str, int, str]:
-    """GET с fallback через Jina proxy на 403/404."""
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout,
-                          headers={"User-Agent": "Mozilla/5.0 (LPBot/1.0)"}) as cli:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (LPBot/1.0)",
+                "Accept-Language": "en,en-US;q=0.9"
+            }
+        ) as cli:
             r = cli.get(url)
-            if r.status_code in (403, 404):
+            if r.status_code in (403, 404, 429, 503):
                 pr = cli.get(JINA_PROXY + url)
                 return pr.text or "", (200 if pr.text else pr.status_code), url
             return r.text, r.status_code, str(r.url)
@@ -213,12 +221,10 @@ NEWS_HEADERS = ["ts_utc", "source", "title", "url", "countries", "ccy", "tags", 
 
 # ---- Universal Calendar Parsing Helpers ----
 def _has_policy_context(html_text: str, patterns: List[str]) -> bool:
-    """Проверяет наличие ключевых слов в очищенном тексте страницы."""
     t = _html_to_text(html_text)
     return any(re.search(p, t, re.I) for p in patterns)
 
 def _anchor_hm(env_name: str, default: str) -> tuple[int, int]:
-    """Parse 'HH' or 'HH:MM' -> (h, m)."""
     s = (os.getenv(env_name, default) or default).strip()
     m = re.match(r"^\s*(\d{1,2})(?::(\d{1,2}))?\s*$", s)
     if not m:
@@ -231,30 +237,43 @@ def _mk_dt(y: int, mo: int, d: int, env_name: str, default: str) -> datetime:
     h, mi = _anchor_hm(env_name, default)
     return datetime(y, mo, d, h, mi, 0, tzinfo=timezone.utc)
 
+def _guess_context_year(text: str) -> int:
+    cur_year = datetime.now(timezone.utc).year
+    years = re.findall(r"\b(20\d{2})\b", _html_to_text(text))
+    if not years:
+        return cur_year
+    from collections import Counter
+    cnt = Counter(int(y) for y in years)
+    top = sorted(cnt.items(), key=lambda kv: (kv[1], kv[0]))[-1][0]
+    return top
+
 _MONTH = {m:i for i,m in enumerate(
     ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"], start=1
 )}
+
 def _scan_dates_any(text: str) -> list[tuple[int,int,int]]:
-    """Универсальный сканер дат (EU/US стили и ISO). Возвращает список (y, m, d)."""
-    cur_year = datetime.now(timezone.utc).year
     t = _html_to_text(text)
+    ctx_year = _guess_context_year(t)
     out: list[tuple[int,int,int]] = []
 
-    p1 = re.compile(
-        r"\b(\d{1,2})(?:\s*[–—\-]\s*\d{1,2})?\s+"
-        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
-        r"Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-        r"\s*,?\s*(20\d{2})\b", re.I)
+    MON = (
+        r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
+        r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
+        r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)"
+    )
+
+    def mon2num(s: str) -> int:
+        return _MONTH[s.lower().replace(".", "")[:3]]
+
+    p1 = re.compile(rf"\b(\d{{1,2}})(?:\s*[–—\-]\s*\d{{1,2}})?\s+{MON}"
+                    r"\s*,?\s*(20\d{2})\b", re.I)
     for m in p1.finditer(t):
-        d = int(m.group(1)); mo = _MONTH[m.group(2).lower()[:3]]; y = int(m.group(3))
+        d = int(m.group(1)); mo = mon2num(m.group(2)); y = int(m.group(3))
         out.append((y, mo, d))
 
-    p2 = re.compile(
-        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
-        r"Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
-        r"(\d{1,2})(?:\s*[–—\-]\s*\d{1,2})?,\s*(20\d{2})\b", re.I)
+    p2 = re.compile(rf"\b{MON}\s+(\d{{1,2}})(?:\s*[–—\-]\s*\d{{1,2}})?,\s*(20\d{{2}})\b", re.I)
     for m in p2.finditer(t):
-        mo = _MONTH[m.group(1).lower()[:3]]; d = int(m.group(2)); y = int(m.group(3))
+        mo = mon2num(m.group(1)); d = int(m.group(2)); y = int(m.group(3))
         out.append((y, mo, d))
 
     p3 = re.compile(r"\b(20\d{2})[./\-](\d{1,2})[./\-](\d{1,2})\b")
@@ -262,12 +281,22 @@ def _scan_dates_any(text: str) -> list[tuple[int,int,int]]:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
         out.append((y, mo, d))
 
-    p4 = re.compile(
-        r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(20\d{2})\b", re.I)
+    p4 = re.compile(rf"\b(\d{{1,2}})\s+{MON}[a-z]*\s+(20\d{{2}})\b", re.I)
     for m in p4.finditer(t):
-        d = int(m.group(1)); mo = _MONTH[m.group(2).lower()[:3]]; y = int(m.group(3))
+        d = int(m.group(1)); mo = mon2num(m.group(2)); y = int(m.group(3))
         out.append((y, mo, d))
 
+    p5 = re.compile(rf"\b{MON}\s+(\d{{1,2}})(?:\s*[–—\-]\s*\d{{1,2}})?\b", re.I)
+    for m in p5.finditer(t):
+        mo = mon2num(m.group(1)); d = int(m.group(2))
+        out.append((ctx_year, mo, d))
+
+    p6 = re.compile(rf"\b(\d{{1,2}})\s+{MON}\b", re.I)
+    for m in p6.finditer(t):
+        d = int(m.group(1)); mo = mon2num(m.group(2))
+        out.append((ctx_year, mo, d))
+
+    cur_year = datetime.now(timezone.utc).year
     uniq = {}
     for y, mo, d in out:
         if not (cur_year - 1 <= y <= cur_year + 1):
@@ -278,6 +307,25 @@ def _scan_dates_any(text: str) -> list[tuple[int,int,int]]:
         except ValueError:
             pass
     return list(uniq.values())
+
+def _selftest_scan_dates():
+    """For local testing of date regexes."""
+    log.info("--- Running date regex selftest ---")
+    samples = {
+        "11 September 2025": (2025, 9, 11),
+        "September 11, 2025": (2025, 9, 11),
+        "2025-09-11": (2025, 9, 11),
+        "Sep. 20–21": (datetime.now(timezone.utc).year, 9, 20),
+        "11 Sep 2025": (2025, 9, 11),
+        "Sep 11": (datetime.now(timezone.utc).year, 9, 11),
+    }
+    for s, expected in samples.items():
+        res = _scan_dates_any(s)
+        if res and res[0] == expected:
+            log.info("OK: '%s' -> %s", s, res)
+        else:
+            log.error("FAIL: '%s' -> %s (expected %s)", s, res, expected)
+    log.info("--- Selftest done ---")
 
 # ---- Calendar parsers ----
 def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
@@ -296,8 +344,7 @@ def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
             ))
         except Exception:
             continue
-    uniq = {ev.utc.date(): ev for ev in out}
-    return list(uniq.values())
+    return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_boe_calendar(html: str, url: str) -> list[CalEvent]:
     if not _has_policy_context(html, [r"monetary policy committee", r"\bMPC\b", r"bank rate", r"policy decision"]):
@@ -313,8 +360,7 @@ def parse_boe_calendar(html: str, url: str) -> list[CalEvent]:
             ))
         except Exception:
             continue
-    uniq = {ev.utc.date(): ev for ev in out}
-    return list(uniq.values())
+    return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
     if not _has_policy_context(html, [r"monetary policy board", r"cash rate", r"board meeting"]):
@@ -330,24 +376,24 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
             ))
         except Exception:
             continue
-    uniq = {ev.utc.date(): ev for ev in out}
-    return list(uniq.values())
+    return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
     out: List[CalEvent] = []
     for y, mo, d in _scan_dates_any(html):
         try:
-            dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", "14:00")
+            dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", "18:00")
             out.append(CalEvent(
                 utc=dt, country="united states", currency="USD",
                 title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
             ))
         except Exception:
             continue
-    uniq = {ev.utc.date(): ev for ev in out}
-    return list(uniq.values())
+    return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
+    if not _has_policy_context(html, [r"monetary policy meeting", r"\bMPM\b", r"monetary policy"]):
+        return []
     out: List[CalEvent] = []
     for y, mo, d in _scan_dates_any(html):
         try:
@@ -358,65 +404,58 @@ def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
             ))
         except Exception:
             continue
-    uniq = {ev.utc.date(): ev for ev in out}
-    return list(uniq.values())
+    return list({ev.utc.date(): ev for ev in out}.values())
 
 def _log_calendar_coverage(events: List[CalEvent]):
     cnt = {}
     for e in events: cnt[e.currency] = cnt.get(e.currency, 0) + 1
+    
     for c in ["USD","JPY","EUR","GBP","AUD"]:
         log.info("CALENDAR coverage %s: %d", c, cnt.get(c, 0))
+    
+    examples = {c: [] for c in ["USD","JPY","EUR","GBP","AUD"]}
+    for ev in sorted(events, key=lambda e: e.utc):
+        if ev.currency in examples and len(examples[ev.currency]) < 3:
+            examples[ev.currency].append(f"{ev.utc.strftime('%Y-%m-%d')} ({ev.source})")
+    
+    for c, ex_list in examples.items():
+        if ex_list:
+            log.info("CALENDAR examples %s: %s", c, ", ".join(ex_list))
 
 def collect_calendar() -> List[CalEvent]:
     events: List[CalEvent] = []
+    
     url_fomc = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
     txt, code, f_url = fetch_text(url_fomc)
     if code == 200 and txt:
         f = parse_fomc_calendar(txt, f_url)
-        log.info("FOMC parsed: %d", len(f))
+        if f: log.info("FOMC parsed: %d from %s", len(f), f_url)
         events.extend(f)
 
     url_boj = "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm"
     txt, code, b_url = fetch_text(url_boj)
     if code == 200 and txt:
         b = parse_boj_calendar(txt, b_url)
-        log.info("BoJ parsed: %d", len(b))
+        if b: log.info("BoJ parsed: %d from %s", len(b), b_url)
         events.extend(b)
 
-    ecb_events = []
-    for url in ECB_CAL_URLS:
-        txt, code, u = fetch_text(url)
-        if code == 200 and txt:
-            ecb_events.extend(parse_ecb_calendar(txt, u))
-    uniq_ecb = {ev.utc.date(): ev for ev in ecb_events}
-    final_ecb = list(uniq_ecb.values())
-    log.info("ECB parsed: %d", len(final_ecb))
-    events.extend(final_ecb)
-
-    boe_events = []
-    for url in BOE_CAL_URLS:
-        txt, code, u = fetch_text(url)
-        if code == 200 and txt:
-            boe_events.extend(parse_boe_calendar(txt, u))
-    uniq_boe = {ev.utc.date(): ev for ev in boe_events}
-    final_boe = list(uniq_boe.values())
-    log.info("BoE parsed: %d", len(final_boe))
-    events.extend(final_boe)
-
-    rba_events = []
-    for url in RBA_CAL_URLS:
-        txt, code, u = fetch_text(url)
-        if code == 200 and txt:
-            rba_events.extend(parse_rba_calendar(txt, u))
-    uniq_rba = {ev.utc.date(): ev for ev in rba_events}
-    final_rba = list(uniq_rba.values())
-    log.info("RBA parsed: %d", len(final_rba))
-    events.extend(final_rba)
-    
-    final_unique_events = {}
-    for ev in events:
-        final_unique_events[(ev.utc.date(), ev.country)] = ev
+    for name, urls in [("ECB", ECB_CAL_URLS), ("BoE", BOE_CAL_URLS), ("RBA", RBA_CAL_URLS)]:
+        cb_events, sources = [], []
+        parser = globals()[f"parse_{name.lower()}_calendar"]
+        for url in urls:
+            txt, code, u = fetch_text(url)
+            if code == 200 and txt:
+                parsed = parser(txt, u)
+                if parsed:
+                    cb_events.extend(parsed)
+                    sources.append(f"{u} ({len(parsed)})")
         
+        final_cb = list({ev.utc.date(): ev for ev in cb_events}.values())
+        if sources:
+            log.info("%s parsed: %d from %s", name, len(final_cb), ", ".join(sources))
+        events.extend(final_cb)
+    
+    final_unique_events = { (ev.utc.date(), ev.country): ev for ev in events }
     out = list(final_unique_events.values())
     out.sort(key=lambda e: (e.utc, e.country))
     _log_calendar_coverage(out)
@@ -425,31 +464,17 @@ def collect_calendar() -> List[CalEvent]:
 # ---- NEWS scrapers ----
 @dataclass
 class NewsItem:
-    ts_utc: datetime
-    source: str
-    title: str
-    url: str
-    countries: str
-    ccy: str
-    tags: str
-    importance_guess: str
+    ts_utc: datetime; source: str; title: str; url: str
+    countries: str; ccy: str; tags: str; importance_guess: str
 
     def key_hash(self) -> str:
-        base = f"{self.source}|{self.url}"
-        return re.sub(r"\s+", " ", base.strip())[:180]
+        return re.sub(r"\s+", " ", f"{self.source}|{self.url}".strip())[:180]
 
     def to_row(self) -> List[str]:
         clean_title = _html_unescape(re.sub(r"<[^>]+>", "", self.title)).strip()
         return [
-            _to_utc_iso(self.ts_utc),
-            self.source,
-            clean_title,
-            self.url,
-            self.countries,
-            self.ccy,
-            self.tags,
-            self.importance_guess,
-            self.key_hash(),
+            _to_utc_iso(self.ts_utc), self.source, clean_title, self.url,
+            self.countries, self.ccy, self.tags, self.importance_guess, self.key_hash(),
         ]
 
 def _mof_fx_best_url() -> Optional[str]:
@@ -470,10 +495,14 @@ def collect_news() -> List[NewsItem]:
 
     txt, code, _ = fetch_text("https://www.federalreserve.gov/newsevents/pressreleases.htm")
     if code == 200 and txt:
-        for m in re.finditer(r'href="(/newsevents/pressreleases/(?:20\d{2}-press-(?:fomc|monetary)|20\d{2}-press-\w+)\.htm)"[^>]*>(.*?)</a>', txt, re.I):
+        for m in re.finditer(
+            r'href="(/newsevents/pressreleases/(?:20\d{2}-press-(?:fomc|monetary)|20\d{2}-press-\w+)\.htm)"[^>]*>(.*?)</a>',
+            txt, re.I
+        ):
             u = "https://www.federalreserve.gov" + m.group(1)
             t = re.sub(r"<[^>]+>", "", m.group(2)).strip() or "Fed press release"
-            items.append(NewsItem(now, "US_FED_PR", t, u, "united states", "USD", "policy", "high"))
+            imp = "high" if KW_RE.search(t) else "medium"
+            items.append(NewsItem(now, "US_FED_PR", t, u, "united states", "USD", "policy", imp))
 
     txt, code, _ = fetch_text("https://home.treasury.gov/news/press-releases")
     if code == 200 and txt:
@@ -513,44 +542,31 @@ def collect_news() -> List[NewsItem]:
     max_age_days = int(os.getenv("NEWS_MAX_AGE_DAYS", "90") or "90")
     cutoff = now - timedelta(days=max_age_days)
     items = [i for i in items if i.ts_utc >= cutoff]
-
     log.info("NEWS collected: %d items", len(items))
     return items
 
 # ---- NEWS → FA ----
 def _news_is_high(row: dict) -> bool:
-    if ALLOWED_SOURCES and row["source"].upper() not in ALLOWED_SOURCES:
-        return False
-    hay = f"{row['title']} {row['tags']}"
-    return bool(KW_RE.search(hay))
+    if ALLOWED_SOURCES and row["source"].upper() not in ALLOWED_SOURCES: return False
+    return bool(KW_RE.search(f"{row['title']} {row['tags']}"))
 
 def _read_news_rows(sh) -> List[dict]:
-    try:
-        ws = sh.worksheet("NEWS")
-    except Exception:
-        return []
-    rows = ws.get_all_records()
+    try: ws = sh.worksheet("NEWS")
+    except Exception: return []
     out = []
-    for r in rows:
+    for r in ws.get_all_records():
         try:
             ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
-            continue
-        out.append({
-            "ts_utc": ts,
-            "source": str(r.get("source", "")).strip(),
-            "title":  str(r.get("title", "")).strip(),
-            "url":    str(r.get("url", "")).strip(),
-            "countries": str(r.get("countries", "")).strip().lower(),
-            "ccy":    str(r.get("ccy", "")).strip().upper(),
-            "tags":   str(r.get("tags", "")).strip(),
-        })
+            out.append({ "ts_utc": ts, "source": str(r.get("source", "")).strip(),
+                "title":  str(r.get("title", "")).strip(), "url": str(r.get("url", "")).strip(),
+                "countries": str(r.get("countries", "")).strip().lower(),
+                "ccy": str(r.get("ccy", "")).strip().upper(), "tags": str(r.get("tags", "")).strip() })
+        except Exception: continue
     return out
 
 def compute_fa_from_news(all_news: List[dict], now_utc: datetime) -> Dict[str, dict]:
     window_start = now_utc - timedelta(minutes=FA_NEWS_RECENT_MIN)
     recent = [r for r in all_news if r["ts_utc"] >= window_start and _news_is_high(r)]
-
     cty_hits: dict[str, int] = {}
     for r in recent:
         for c in [x.strip() for x in (r["countries"] or "").split(",") if x.strip()]:
@@ -558,67 +574,51 @@ def compute_fa_from_news(all_news: List[dict], now_utc: datetime) -> Dict[str, d
 
     out: Dict[str, dict] = {}
     for sym, countries in PAIR_COUNTRIES.items():
-        cnt = sum(cty_hits.get(c, 0) for c in countries)
+        cnt = sum(1 if cty_hits.get(c, 0) > 0 else 0 for c in countries)
         if cnt >= max(1, FA_NEWS_MIN_COUNT):
-            risk, dca_scale, reserve_off, lock_min, reason = "Red", 0.5, 1, FA_NEWS_LOCK_MIN, "news-high"
+            risk, dca, reserve, lock, reason = "Red", 0.5, 1, FA_NEWS_LOCK_MIN, "news-high"
         elif cnt == 1:
-            risk, dca_scale, reserve_off, lock_min, reason = "Amber", 0.75, 0, max(1, FA_NEWS_LOCK_MIN // 2), "news-medium"
+            risk, dca, reserve, lock, reason = "Amber", 0.75, 0, max(1, FA_NEWS_LOCK_MIN // 2), "news-medium"
         else:
-            risk, dca_scale, reserve_off, lock_min, reason = "Green", 1.0, 0, 0, "base"
+            risk, dca, reserve, lock, reason = "Green", 1.0, 0, 0, "base"
         out[sym] = {
-            "pair": sym, "risk": risk, "bias": "neutral",
-            "ttl": FA_NEWS_TTL_MIN, "updated_at": _to_utc_iso(now_utc),
-            "scan_lock_until": _to_utc_iso(now_utc + timedelta(minutes=lock_min)) if lock_min else "",
-            "reserve_off": reserve_off, "dca_scale": dca_scale,
-            "reason": reason, "risk_pct": 0,
+            "pair": sym, "risk": risk, "bias": "neutral", "ttl": FA_NEWS_TTL_MIN,
+            "updated_at": _to_utc_iso(now_utc),
+            "scan_lock_until": _to_utc_iso(now_utc + timedelta(minutes=lock)) if lock else "",
+            "reserve_off": reserve, "dca_scale": dca, "reason": reason, "risk_pct": 0,
         }
     return out
 
 def write_fa_signals(sh, signals: Dict[str, dict]):
     headers = ["pair", "risk", "bias", "ttl", "updated_at", "scan_lock_until", "reserve_off", "dca_scale", "reason", "risk_pct"]
     ws, _ = ensure_worksheet(sh, "FA_Signals", headers)
-    order = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
     values = []
-    for sym in order:
+    for sym in ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]:
         s = signals.get(sym, {})
         values.append([
-            s.get("pair", sym),
-            s.get("risk", "Green"),
-            s.get("bias", "neutral"),
-            s.get("ttl", ""),
-            s.get("updated_at", ""),
-            s.get("scan_lock_until", ""),
-            int(bool(s.get("reserve_off", 0))),
-            float(s.get("dca_scale", 1.0)),
-            s.get("reason", "base"),
-            int(s.get("risk_pct", 0)),
+            s.get("pair", sym), s.get("risk", "Green"), s.get("bias", "neutral"),
+            s.get("ttl", ""), s.get("updated_at", ""), s.get("scan_lock_until", ""),
+            int(bool(s.get("reserve_off", 0))), float(s.get("dca_scale", 1.0)),
+            s.get("reason", "base"), int(s.get("risk_pct", 0)),
         ])
     ws.update(range_name="A2", values=values)
 
-def _read_existing_hashes(ws, hash_col_letter: str) -> set[str]:
-    try:
-        rng = f"{hash_col_letter}2:{hash_col_letter}10000"
-        col = ws.get_values(rng)
-        return {r[0] for r in col if r and r[0]}
-    except Exception:
-        return set()
+def _read_existing_hashes(ws, col: str) -> set[str]:
+    try: return {r[0] for r in ws.get_values(f"{col}2:{col}10000") if r and r[0]}
+    except Exception: return set()
 
 def _calendar_window_filter(events: Iterable[CalEvent]) -> List[CalEvent]:
-    """ВАЖНО: окно по КАЛЕНДАРНЫМ суткам"""
-    today_utc = datetime.now(timezone.utc).date()
-    d1 = datetime.combine(today_utc - timedelta(days=FREE_LOOKBACK_DAYS), _time.min, tzinfo=timezone.utc)
-    d2 = datetime.combine(today_utc + timedelta(days=FREE_LOOKAHEAD_DAYS), _time.max, tzinfo=timezone.utc)
+    today = datetime.now(timezone.utc).date()
+    d1 = datetime.combine(today - timedelta(days=FREE_LOOKBACK_DAYS), _time.min, tzinfo=timezone.utc)
+    d2 = datetime.combine(today + timedelta(days=FREE_LOOKAHEAD_DAYS), _time.max, tzinfo=timezone.utc)
     return [e for e in events if d1 <= e.utc <= d2]
 
 def _render_investor_digest_text(signals: Dict[str, dict]) -> str:
     lines = ["FA-сводка (aggregated):"]
-    order = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
-    for sym in order:
+    for sym in ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]:
         s = signals.get(sym, {})
-        risk = s.get("risk", "Green")
-        badge = FA_BADGE.get(risk, "⚪️")
-        bias  = s.get("bias", "neutral")
-        reason = s.get("reason", "base")
+        risk = s.get("risk", "Green"); badge = FA_BADGE.get(risk, "⚪️")
+        bias  = s.get("bias", "neutral"); reason = s.get("reason", "base")
         dca = s.get("dca_scale", 1.0)
         extra = f" | dca×{dca:g}" if risk != "Green" or dca != 1.0 or reason != "base" else ""
         lines.append(f"• {sym[:3]}/{sym[3:]}: {badge} {risk}/{bias} | {reason}{extra}")
@@ -626,20 +626,15 @@ def _render_investor_digest_text(signals: Dict[str, dict]) -> str:
 
 def write_investor_digest_row(sh, signals: Dict[str, dict], now_utc: datetime):
     ws, _ = ensure_worksheet(sh, "INVESTOR_DIGEST", ["ts_utc", "text"])
-    text = _render_investor_digest_text(signals)
-    ws.append_row([_to_utc_iso(now_utc), text], value_input_option="RAW")
+    ws.append_row([_to_utc_iso(now_utc), _render_investor_digest_text(signals)], value_input_option="RAW")
 
 # ---- Main cycle ----
 def collect_once():
-    log.info(
-        "collector… sheet=%s ws=%s tz=%s window=[-%dd,+%dd]",
+    log.info("collector… sheet=%s ws=%s tz=%s window=[-%dd,+%dd]",
         SHEET_ID, CAL_WS_OUT, (LOCAL_TZ.key if LOCAL_TZ else "UTC"),
-        FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS
-    )
+        FREE_LOOKBACK_DAYS, FREE_LOOKAHEAD_DAYS)
     sh, _ = build_sheets_client(SHEET_ID)
-    if not sh:
-        log.error("Sheets not available — exit")
-        return
+    if not sh: return log.error("Sheets not available — exit")
 
     # CALENDAR
     ws_cal, _ = ensure_worksheet(sh, CAL_WS_OUT, CAL_HEADERS)
@@ -651,36 +646,26 @@ def collect_once():
             try:
                 d = datetime.fromisoformat(str(r.get("utc_iso")).replace("Z","+00:00")).date()
                 c = str(r.get("country","")).strip().lower()
-                seen_date_cty.add((d, c))
-            except Exception:
-                pass
-    except Exception:
-        seen = set()
-        seen_date_cty = set()
+                if c: seen_date_cty.add((d, c))
+            except Exception: pass
+    except Exception: seen, seen_date_cty = set(), set()
 
     all_events = collect_calendar()
     win_events = _calendar_window_filter(all_events)
-    if win_events:
-        log.info(
-            "CALENDAR window: %d/%d kept (from %s to %s)",
-            len(win_events), len(all_events),
-            min(e.utc for e in win_events), max(e.utc for e in win_events)
-        )
-    else:
-        log.info("CALENDAR window: 0/%d kept", len(all_events))
+    if win_events: log.info("CALENDAR window: %d/%d kept", len(win_events), len(all_events))
+    else: log.info("CALENDAR window: 0/%d kept", len(all_events))
 
     new_rows = []
     for ev in win_events:
         key1 = (_norm_iso_key(_to_utc_iso(ev.utc)), ev.title.strip())
         key2 = (ev.utc.date(), ev.country.strip().lower())
-        if key1 in seen or key2 in seen_date_cty:
-            continue
+        if key1 in seen or key2 in seen_date_cty: continue
         new_rows.append(ev.to_row())
         seen.add(key1); seen_date_cty.add(key2)
 
     if new_rows:
         ws_cal.append_rows(new_rows, value_input_option="RAW")
-    log.info("CALENDAR: +%d rows", len(new_rows))
+        log.info("CALENDAR: +%d rows", len(new_rows))
 
     # NEWS
     news = collect_news()
@@ -689,7 +674,7 @@ def collect_once():
     news_rows = [n.to_row() for n in news if n.key_hash() not in existing_hash]
     if news_rows:
         ws_news.append_rows(news_rows, value_input_option="RAW")
-    log.info("NEWS: +%d rows", len(news_rows))
+        log.info("NEWS: +%d rows", len(news_rows))
 
     # FA signals & investor digest
     all_news = _read_news_rows(sh)
@@ -697,19 +682,17 @@ def collect_once():
     fa = compute_fa_from_news(all_news, now)
     write_fa_signals(sh, fa)
     write_investor_digest_row(sh, fa, now)
-
     log.info("cycle done.")
 
 def main():
-    if not SHEET_ID:
-        raise RuntimeError("SHEET_ID env empty")
+    # For local testing of date regexes, uncomment the line below
+    # _selftest_scan_dates()
+    if not SHEET_ID: raise RuntimeError("SHEET_ID env empty")
     if RUN_FOREVER:
         interval = max(1, COLLECT_EVERY_MIN) * 60
         while True:
-            try:
-                collect_once()
-            except Exception:
-                log.exception("collect_once failed")
+            try: collect_once()
+            except Exception: log.exception("collect_once failed")
             time.sleep(interval)
     else:
         collect_once()
