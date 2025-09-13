@@ -28,13 +28,6 @@ LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Belgrade")) if ZoneInfo else N
 MORNING_HOUR = int(os.getenv("MORNING_HOUR", "9"))
 MORNING_MINUTE = int(os.getenv("MORNING_MINUTE", "30"))
 
-# --- FA badges (трёхстатусная шкала) ---
-FA_BADGE = {
-    "Green": "✅ спокойно",
-    "Amber": "🟡 осторожно",
-    "Red":   "🛑 стоп докупок",
-}
-
 # --- Лимитер Telegram (может быть не установлен) ---
 try:
     from telegram.ext import AIORateLimiter
@@ -63,12 +56,14 @@ except Exception:
 
 # --- LLM-клиент (опционально) ---
 try:
-    from llm_client import generate_digest, llm_ping
+    from llm_client import generate_digest, llm_ping, explain_pair_event
 except Exception:
     async def generate_digest(*args, **kwargs) -> str:
         return "⚠️ LLM сейчас недоступен (нет llm_client.py)."
     async def llm_ping() -> bool:
         return bool(os.getenv("OPENAI_API_KEY"))
+    explain_pair_event = None
+
 
 # -------------------- ЛОГИ --------------------
 logging.basicConfig(
@@ -101,21 +96,19 @@ LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
 # --- Рекомендации по весам (ENV) ---
-RECO_ENABLED            = (os.getenv("RECO_ENABLED","1").lower() in ("1","true","yes","on"))
-RECO_MIN_PERSIST_MIN   = int(os.getenv("RECO_MIN_PERSIST_MIN","120") or "120")  # риск Amber/Red держится не меньше
-RECO_COOLDOWN_MIN      = int(os.getenv("RECO_COOLDOWN_MIN","360") or "360")      # не спамить чаще
-RECO_POLL_MIN          = int(os.getenv("RECO_POLL_MIN","10") or "10")            # как часто проверять
-RECO_MIN_SHIFT_PCT     = float(os.getenv("RECO_MIN_SHIFT_PCT","0.06") or "0.06")# суммарное отклонение весов
+RECO_ENABLED             = (os.getenv("RECO_ENABLED","1").lower() in ("1","true","yes","on"))
+RECO_MIN_PERSIST_MIN   = int(os.getenv("RECO_MIN_PERSIST_MIN","120") or "120")
+RECO_COOLDOWN_MIN      = int(os.getenv("RECO_COOLDOWN_MIN","360") or "360")
+RECO_POLL_MIN          = int(os.getenv("RECO_POLL_MIN","10") or "10")
+RECO_MIN_SHIFT_PCT     = float(os.getenv("RECO_MIN_SHIFT_PCT","0.06") or "0.06")
 RECO_MULT_GREEN        = float(os.getenv("RECO_MULT_GREEN","1.0") or "1.0")
 RECO_MULT_AMBER        = float(os.getenv("RECO_MULT_AMBER","0.90") or "0.90")
 RECO_MULT_RED          = float(os.getenv("RECO_MULT_RED","0.75") or "0.75")
 RECO_TRACK_WS          = os.getenv("RECO_TRACK_WS","FA_Reco_Track").strip() or "FA_Reco_Track"
 
-# сопоставление актив ↔ пара
 ASSET_BY_PAIR = {"USDJPY":"JPY","AUDUSD":"AUD","EURUSD":"EUR","GBPUSD":"GBP"}
 PAIR_BY_ASSET = {"JPY":"USDJPY","AUD":"AUDUSD","EUR":"EURUSD","GBP":"GBPUSD"}
 
-# --- Названия листов с логами по парам (переопределяются через ENV) ---
 BMR_SHEETS = {
     "USDJPY": os.getenv("BMR_SHEET_USDJPY", "BMR_DCA_USDJPY"),
     "AUDUSD": os.getenv("BMR_SHEET_AUDUSD", "BMR_DCA_AUDUSD"),
@@ -123,10 +116,8 @@ BMR_SHEETS = {
     "GBPUSD": os.getenv("BMR_SHEET_GBPUSD", "BMR_DCA_GBPUSD"),
 }
 
-# --- Календарь ---
 CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
 
-# страны по парам — для фильтрации NEWS/CALENDAR
 PAIR_COUNTRIES = {
     "USDJPY": {"united states", "japan"},
     "AUDUSD": {"australia", "united states"},
@@ -134,10 +125,8 @@ PAIR_COUNTRIES = {
     "GBPUSD": {"united kingdom", "united states"},
 }
 
-# та же логика ключевых слов/источников, что в calendar_collector.py
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
-    # добавили: fomc/mpc, policy statement(s), rate statement, cash rate
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
     "intervention|FX intervention|press conference|policy statement|policy statements|"
     "rate statement|cash rate|fomc|mpc"
@@ -148,6 +137,84 @@ ALLOWED_SOURCES = {
     if s.strip()
 }
 NEWS_TTL_MIN = int(os.getenv("FA_NEWS_TTL_MIN", "120") or "120")
+
+def _clean_headline_for_llm(line: str) -> str:
+    s = re.sub(r"^(\d{2}:\d{2}|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*[—\-]\s*", "", line).strip()
+    s = re.sub(r"\([^()]*\)\s*$", "", s).strip(" .–—-")
+    return s
+
+def _src_country_guess(src: str, title: str = "", fallback: str = "") -> str:
+    s = (src or "").upper()
+    if s in {"US_FED_PR", "US_TREASURY", "FOMC"}: return "united states"
+    if s in {"ECB_PR", "ECB"}:                     return "euro area"
+    if s in {"BOE_PR", "BOE"}:                     return "united kingdom"
+    if s in {"RBA_MR", "RBA"}:                     return "australia"
+    if s in {"BOJ_PR", "BOJ"}:                     return "japan"
+    t = (title or "").lower()
+    if "fomc" in t or "federal reserve" in t:      return "united states"
+    if "ecb" in t or "european central bank" in t: return "euro area"
+    if "bank of england" in t or "mpc" in t:       return "united kingdom"
+    if "rba" in t or "reserve bank of australia" in t: return "australia"
+    if "boj" in t or "bank of japan" in t or "mpm" in t: return "japan"
+    return (fallback or "").lower().strip()
+
+def _pick_top_event(sh, countries: set[str], now_utc: datetime, ttl_min: int = None) -> Optional[dict]:
+    ttl_min = ttl_min or NEWS_TTL_MIN
+    cutoff = now_utc - timedelta(minutes=ttl_min)
+    try:
+        rows = sh.worksheet("NEWS").get_all_records()
+    except Exception:
+        rows = []
+    best = None
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        src = str(r.get("source","")).upper().strip()
+        if ALLOWED_SOURCES and src not in ALLOWED_SOURCES:
+            continue
+        title = str(r.get("title","")).strip()
+        tags  = str(r.get("tags","")).strip()
+        kw_ok = bool(KW_RE.search(f"{title} {tags}"))
+        if not kw_ok and src in {"US_FED_PR","ECB_PR","BOE_PR","RBA_MR","BOJ_PR"}:
+            kw_ok = True
+        if not kw_ok:
+            continue
+        row_cty = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
+        if not (row_cty & countries):
+            continue
+        if (best is None) or (ts > best["ts"]):
+            best = {
+                "from": "news", "ts": ts, "title": title, "src": src, "url": str(r.get("url", "")).strip(),
+                "country": (_src_country_guess(src, title) or next(iter(row_cty or []), "")),
+            }
+    if best:
+        return best
+    try:
+        events = sh.worksheet(CAL_WS_OUT).get_all_records()
+    except Exception:
+        events = []
+    soon, last_past = None, None
+    for e in events:
+        try:
+            dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        cty = str(e.get("country","")).strip().lower()
+        if dt <= now_utc:
+            if cty in countries and (last_past is None or dt > last_past["ts"]):
+                last_past = {"from":"calendar","ts":dt,"title":str(e.get("title","")).strip(), "url": str(e.get("url","")).strip(),
+                             "src":str(e.get("source","")).strip() or "CAL","country":cty}
+            continue
+        if cty not in countries:
+            continue
+        if (soon is None) or (dt < soon["ts"]):
+            soon = {"from":"calendar","ts":dt,"title":str(e.get("title","")).strip(), "url": str(e.get("url","")).strip(),
+                    "src":str(e.get("source","")).strip() or "CAL","country":cty}
+    return soon or last_past
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
 STATE = {
@@ -175,21 +242,17 @@ def load_google_service_info() -> Tuple[Optional[dict], str, Optional[str]]:
         try:
             decoded = _decode_b64_maybe_padded(b64)
             info = json.loads(decoded)
-            client_email = info.get("client_email")
-            return info, "env:GOOGLE_CREDENTIALS_JSON_B64", client_email
+            return info, "env:GOOGLE_CREDENTIALS_JSON_B64", info.get("client_email")
         except Exception as e:
             return None, f"b64 present but decode/json error: {e}", None
-
     for name in ("GOOGLE_CREDENTIALS_JSON", "GOOGLE_CREDENTIALS"):
         raw = _env(name)
         if raw:
             try:
                 info = json.loads(raw)
-                client_email = info.get("client_email")
-                return info, f"env:{name}", client_email
+                return info, f"env:{name}", info.get("client_email")
             except Exception as e:
                 return None, f"{name} present but invalid JSON: {e}", None
-
     return None, "not-found", None
 
 def build_sheets_client(sheet_id: str):
@@ -197,11 +260,9 @@ def build_sheets_client(sheet_id: str):
         return None, "gsheets libs not installed"
     if not sheet_id:
         return None, "sheet_id empty"
-
     info, src, client_email = load_google_service_info()
     if not info:
         return None, src
-
     try:
         creds = service_account.Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
         gc = gspread.authorize(creds)
@@ -234,107 +295,40 @@ def append_row(sh, title: str, row: list):
     ws.append_row(row, value_input_option="RAW")
 
 def _set_bank_target_in_bmr(sh, symbol: str, amount: float):
-    """Обновляет Bank_Target_USDT в листе BMR_DCA_* для пары symbol."""
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name:
-        return
+    if not sheet_name: return
     ws = sh.worksheet(sheet_name)
     hdr = ws.row_values(1)
-    if "Bank_Target_USDT" not in hdr:
-        return
+    if "Bank_Target_USDT" not in hdr: return
     col = hdr.index("Bank_Target_USDT") + 1
-
-    # найдём последнюю реально заполненную строку (минимум 2)
     vals = ws.get_all_values()
     last = len(vals)
     while last > 1 and not any((c or "").strip() for c in vals[last-1]):
         last -= 1
-    row_ix = max(2, last)  # пишем в последнюю непустую строку
-
+    row_ix = max(2, last)
     ws.update_cell(row_ix, col, float(amount))
 
-
-# --- helpers: Google Sheets → FA/NEWS -------------------------------------------------
+# --- helpers: Google Sheets → FA/NEWS ---
 def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
-def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> str:
-    """
-    Возвращает строку вида 'HH:MM — Title (SRC)' для КОНКРЕТНОЙ пары.
-    1) Ищем свежую high-новость из NEWS за TTL (по странам пары).
-    2) Если нет — ближайшее событие из CALENDAR (по странам пары).
-    """
+def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> tuple[str, Optional[str]]:
     now_utc = now_utc or datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(minutes=NEWS_TTL_MIN)
     countries = PAIR_COUNTRIES.get(pair, set())
-
-    # 1) NEWS
-    try:
-        rows = sh.worksheet("NEWS").get_all_records()
-    except Exception:
-        rows = []
-    best = None
-    for r in rows:
-        try:
-            ts = datetime.fromisoformat(str(r.get("ts_utc")).replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
-            continue
-        if ts < cutoff:
-            continue
-        src = str(r.get("source", "")).upper().strip()
-        if ALLOWED_SOURCES and src not in ALLOWED_SOURCES:
-            continue
-        title = str(r.get("title", "")).strip()
-        tags  = str(r.get("tags", "")).strip()
-        kw_ok = bool(KW_RE.search(f"{title} {tags}"))
-        # Разрешаем «якорные» источники ЦБ даже без ключевых слов
-        if not kw_ok and src in {"US_FED_PR","ECB_PR","BOE_PR","RBA_MR","BOJ_PR"}:
-            kw_ok = True
-        if not kw_ok:
-            continue
-        row_cty = {x.strip().lower() for x in str(r.get("countries","")).split(",") if x.strip()}
-        if not (row_cty & countries):
-            continue
-        if (best is None) or (ts > best["ts"]):
-            best = {"ts": ts, "title": title, "src": src}
-    if best:
-        lt = best["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else best["ts"]
-        return f"{lt:%H:%M} — {best['title']} ({best['src']})"
-
-    # 2) CALENDAR (fallback: ближайшее важное)
-    try:
-        events = sh.worksheet(CAL_WS_OUT).get_all_records()
-    except Exception:
-        events = []
-    soon = None
-    last_past = None
-    for e in events:
-        try:
-            dt = datetime.fromisoformat(str(e.get("utc_iso")).replace("Z", "+00:00")).astimezone(timezone.utc)
-        except Exception:
-            continue
-        if dt <= now_utc:
-            # запомним самое близкое ПРОШЕДШЕЕ событие (как крайний фолбэк)
-            if last_past is None or dt > last_past["ts"]:
-                last_past = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
-            continue
-        if str(e.get("country","")).strip().lower() not in countries:
-            continue
-        if (soon is None) or (dt < soon["ts"]):
-            soon = {"ts": dt, "title": str(e.get("title","")).strip(), "src": str(e.get("source","")).strip() or "cal"}
-    if soon:
-        lt = soon["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else soon["ts"]
-        return f"{lt:%Y-%m-%d %H:%M} — {soon['title']} ({soon['src']})"
-    if last_past:
-        lt = last_past["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else last_past["ts"]
-        return f"{lt:%H:%M} — {last_past['title']} ({last_past['src']})"
-    return ""
+    ev = _pick_top_event(sh, countries, now_utc, ttl_min=NEWS_TTL_MIN)
+    if not ev:
+        return "", None
+    ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
+    href = ev.get("url","").strip()
+    title_text = _h(ev['title'])
+    title_html = f'<a href="{_h(href)}">{title_text}</a>' if href else title_text
+    if ev["from"] == "news":
+        line = f"{ts_local:%H:%M} — {title_html} ({_h(ev['src'])})"
+    else:
+        line = f"{ts_local:%Y-%m-%d %H:%M} — {title_html} ({_h(ev['src'])})"
+    return line, (ev.get("country") or None)
 
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
-    """
-    Лист FA_Signals: pair,risk,bias,ttl,updated_at,scan_lock_until,reserve_off,dca_scale,reason,risk_pct
-    Возвращает только НЕ протухшие по TTL записи.
-    """
     try:
         ws = sh.worksheet("FA_Signals")
         rows = ws.get_all_records()
@@ -344,8 +338,7 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
     for r in rows:
         pair = str(r.get("pair", "")).upper()
-        if not pair:
-            continue
+        if not pair: continue
         ttl = int(r.get("ttl") or 0)
         upd_raw = str(r.get("updated_at", "")).strip()
         try:
@@ -353,15 +346,14 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
         except Exception:
             upd_ts = None
         if ttl and upd_ts and now > upd_ts + timedelta(minutes=ttl):
-            # протухло — игнорируем
             continue
         out[pair] = {
-            "risk":        (str(r.get("risk", "Green")).capitalize()),
-            "bias":        (str(r.get("bias", "neutral")).lower()),
-            "dca_scale":   float(r.get("dca_scale") or 1.0),
+            "risk": (str(r.get("risk", "Green")).capitalize()),
+            "bias": (str(r.get("bias", "neutral")).lower()),
+            "dca_scale": float(r.get("dca_scale") or 1.0),
             "reserve_off": bool(int(r.get("reserve_off") or 0)),
-            "reason":      str(r.get("reason", "base")),
-            "updated_at":  upd_raw,
+            "reason": str(r.get("reason", "base")),
+            "updated_at": upd_raw,
         }
     return out
 
@@ -369,21 +361,19 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
 def _h(x) -> str:
     return _html_escape(str(x), quote=True)
 
+def _strip_html_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s)
+
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
 
-# ---- helpers: рекомендации по весам -----------------------------------------
+# ---- helpers: рекомендации по весам ----
 def _normalize_int_weights(weight_floats: Dict[str, float], keep_total: int) -> Dict[str, int]:
-    # округляем так, чтобы сумма осталась неизменной
     floors = {k: int(v) for k, v in weight_floats.items()}
     diff = keep_total - sum(floors.values())
-    if diff == 0:
-        return floors
-    # распределяем по убыванию дробной части
+    if diff == 0: return floors
     fracs = sorted(((k, weight_floats[k] - floors[k]) for k in floors), key=lambda x: x[1], reverse=True)
-    i = 0
-    step = 1 if diff > 0 else -1
-    diff = abs(diff)
+    i, step, diff = 0, 1 if diff > 0 else -1, abs(diff)
     while diff > 0 and fracs:
         k, _ = fracs[i % len(fracs)]
         floors[k] += step
@@ -397,14 +387,12 @@ def _reco_multipliers_for_pair_risk(risk: str) -> float:
 
 def compute_recommended_weights(cur: Dict[str,int], fa_sheet: Dict[str,dict]) -> Dict[str,int]:
     total = max(sum(cur.values()), 1)
-    # применяем множители к весам по активам согласно риску по соответствующим парам
     floated = {}
     for asset, w in cur.items():
         pair = PAIR_BY_ASSET.get(asset)
         risk = (fa_sheet.get(pair, {}) or {}).get("risk", "Green")
         m = _reco_multipliers_for_pair_risk(risk)
         floated[asset] = w * m
-    # нормируем к той же сумме и округляем
     norm_sum = sum(floated.values()) or 1.0
     rescaled = {k: (v / norm_sum) * total for k, v in floated.items()}
     return _normalize_int_weights(rescaled, total)
@@ -419,192 +407,111 @@ def _fmt_age(mins: int) -> str:
     return f"{h}ч{m:02d}м"
 
 def _load_reco_track(sh):
-    # headers: pair,risk,started_at,last_seen,announced_at
     headers = ["pair","risk","started_at","last_seen","announced_at"]
     ws, _ = ensure_worksheet(sh, RECO_TRACK_WS)
-    try:
-        rows = ws.get_all_records()
-    except Exception:
-        rows = []
+    try: rows = ws.get_all_records()
+    except Exception: rows = []
     d = {}
     for r in rows:
         p = str(r.get("pair","")).upper()
-        if not p: 
-            continue
-        d[p] = {
-            "risk": str(r.get("risk","")).capitalize(),
-            "started_at": str(r.get("started_at","")).strip(),
-            "last_seen": str(r.get("last_seen","")).strip(),
-            "announced_at": str(r.get("announced_at","")).strip(),
-        }
-    # гарантируем заголовки
-    try:
-        ws.update("A1", [headers])
-    except Exception:
-        pass
+        if p: d[p] = { "risk": str(r.get("risk","")).capitalize(), "started_at": str(r.get("started_at","")).strip(),
+                       "last_seen": str(r.get("last_seen","")).strip(), "announced_at": str(r.get("announced_at","")).strip(), }
+    try: ws.update("A1", [headers])
+    except Exception: pass
     return ws, d
 
 def _save_reco_track(ws, d: Dict[str,dict]):
     order = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
-    out = []
-    for p in order:
-        row = d.get(p, {})
-        out.append([
-            p,
-            row.get("risk",""),
-            row.get("started_at",""),
-            row.get("last_seen",""),
-            row.get("announced_at",""),
-        ])
+    out = [[p, d.get(p,{}).get("risk",""), d.get(p,{}).get("started_at",""),
+            d.get(p,{}).get("last_seen",""), d.get(p,{}).get("announced_at","")] for p in order]
     ws.update("A2", out)
 
 async def _maybe_send_reco_message(app, sh, fa_sheet: Dict[str,dict]):
-    if not RECO_ENABLED or not MASTER_CHAT_ID:
-        return
+    if not RECO_ENABLED or not MASTER_CHAT_ID: return
     now = datetime.now(timezone.utc)
     ws, track = _load_reco_track(sh)
     changed = False
-    # обновляем трекинг
     for pair in SYMBOLS:
         risk = (fa_sheet.get(pair, {}) or {}).get("risk","Green").capitalize()
         t = track.get(pair, {})
+        now_iso = now.isoformat(timespec="seconds")+"Z"
         if risk in ("Amber","Red"):
             if not t or t.get("risk") != risk or not t.get("started_at"):
-                t = {
-                    "risk": risk,
-                    "started_at": now.isoformat(timespec="seconds")+"Z",
-                    "last_seen":  now.isoformat(timespec="seconds")+"Z",
-                    "announced_at": t.get("announced_at",""),
-                }
+                t = {"risk": risk, "started_at": now_iso, "last_seen": now_iso, "announced_at": t.get("announced_at","")}
             else:
-                t["risk"] = risk
-                t["last_seen"] = now.isoformat(timespec="seconds")+"Z"
-            track[pair] = t
-            changed = True
+                t["risk"], t["last_seen"] = risk, now_iso
+            track[pair] = t; changed = True
         else:
-            # сбрасываем, когда риск зелёный
             if pair in track:
-                track[pair] = {"risk":"Green","started_at":"","last_seen":now.isoformat(timespec="seconds")+"Z","announced_at":""}
-                changed = True
-    if changed:
-        _save_reco_track(ws, track)
-
-    # выбираем пары, где риск держится достаточно долго и не было рассылки/кулдаун прошёл
+                track[pair] = {"risk":"Green","started_at":"","last_seen":now_iso,"announced_at":""}; changed = True
+    if changed: _save_reco_track(ws, track)
     reasons = []
-    min_ok = RECO_MIN_PERSIST_MIN
-    cd_min = RECO_COOLDOWN_MIN
+    min_ok, cd_min = RECO_MIN_PERSIST_MIN, RECO_COOLDOWN_MIN
     for pair, row in track.items():
-        if row.get("risk") not in ("Amber","Red") or not row.get("started_at"):
-            continue
-        try:
-            start = datetime.fromisoformat(row["started_at"].replace("Z","+00:00")).astimezone(timezone.utc)
-        except Exception:
-            continue
-        age_min = int((now - start).total_seconds() // 60)
-        if age_min < min_ok:
-            continue
-        # кулдаун
+        if row.get("risk") not in ("Amber","Red") or not row.get("started_at"): continue
+        try: start = datetime.fromisoformat(row["started_at"].replace("Z","+00:00")).astimezone(timezone.utc)
+        except Exception: continue
+        if (now - start).total_seconds() < min_ok * 60: continue
         announced_ok = True
         if row.get("announced_at"):
             try:
                 ann = datetime.fromisoformat(row["announced_at"].replace("Z","+00:00")).astimezone(timezone.utc)
-                announced_ok = (now - ann).total_seconds() >= cd_min*60
-            except Exception:
-                announced_ok = True
-        if not announced_ok:
-            continue
-        reasons.append((pair, row.get("risk"), age_min))
-
-    if not reasons:
-        return
-
-    # считаем рекомендацию и проверяем порог отличия
-    cur_w = STATE["weights"].copy()
-    reco_w = compute_recommended_weights(cur_w, fa_sheet)
-    if _weights_shift_pct(cur_w, reco_w) < RECO_MIN_SHIFT_PCT:
-        return
-
-    # собираем текст
+                announced_ok = (now - ann).total_seconds() >= cd_min * 60
+            except Exception: pass
+        if announced_ok: reasons.append((pair, row.get("risk"), int((now - start).total_seconds() // 60)))
+    if not reasons: return
+    cur_w, reco_w = STATE["weights"].copy(), compute_recommended_weights(cur_w, fa_sheet)
+    if _weights_shift_pct(cur_w, reco_w) < RECO_MIN_SHIFT_PCT: return
     rr = ", ".join([f"{p} — {r} ({_fmt_age(m)})" for p, r, m in reasons])
     cmd = f"/setweights jpy={reco_w['JPY']} aud={reco_w['AUD']} eur={reco_w['EUR']} gbp={reco_w['GBP']}"
-    text = (
-        "⚖️ Рекомендация по весам (риск>2ч)\n"
-        f"Текущие: {human_readable_weights(cur_w)}\n"
-        f"Рекомендованные: {human_readable_weights(reco_w)}\n"
-        f"Команда, если согласен: {cmd}\n"
-        f"Основание: {rr}"
-    )
+    text = (f"⚖️ Рекомендация по весам (риск>{_fmt_age(min_ok)})\n"
+            f"Текущие: {human_readable_weights(cur_w)}\nРекомендованные: {human_readable_weights(reco_w)}\n"
+            f"Команда, если согласен: {cmd}\nОснование: {rr}")
     try:
         await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=text)
-        # фиксируем рассылку
         now_iso = now.isoformat(timespec="seconds")+"Z"
-        for pair, _, _ in reasons:
-            track[pair]["announced_at"] = now_iso
+        for pair, _, _ in reasons: track[pair]["announced_at"] = now_iso
         _save_reco_track(ws, track)
     except Exception as e:
         log.warning("reco notify failed: %s", e)
 
-
 def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, float]:
     s = max(sum(weights.values()), 1)
-    return {
-        "USDJPY": round(total * weights.get("JPY", 0) / s, 2),
-        "AUDUSD": round(total * weights.get("AUD", 0) / s, 2),
-        "EURUSD": round(total * weights.get("EUR", 0) / s, 2),
-        "GBPUSD": round(total * weights.get("GBP", 0) / s, 2),
-    }
+    return { sym: round(total * weights.get(ASSET_BY_PAIR[sym], 0) / s, 2) for sym in SYMBOLS }
 
 def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
     now = now or datetime.now(timezone.utc)
-    sec = int((dt_to - now).total_seconds())
-    sign = "через" if sec >= 0 else "назад"
+    sec, sign = int((dt_to - now).total_seconds()), "через" if dt_to >= now else "назад"
     sec = abs(sec)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    if h and m:
-        return f"{h} ч {m:02d} мин {sign}"
-    if h:
-        return f"{h} ч {sign}"
+    h, m = sec // 3600, (sec % 3600) // 60
+    if h and m: return f"{h} ч {m:02d} мин {sign}"
+    if h: return f"{h} ч {sign}"
     return f"{m} мин {sign}"
 
 def assert_master_chat(update: Update) -> bool:
-    if MASTER_CHAT_ID and update.effective_chat:
-        return update.effective_chat.id == MASTER_CHAT_ID
-    return True
+    return not MASTER_CHAT_ID or (update.effective_chat and update.effective_chat.id == MASTER_CHAT_ID)
 
 def _split_for_tg_html(msg: str, limit: int = 3500) -> List[str]:
-    parts, cur = [], []
-    cur_len = 0
+    parts, cur, cur_len = [], [], 0
     for para in msg.split("\n\n"):
         block = (para + "\n\n")
         if cur_len + len(block) > limit and cur:
-            parts.append("".join(cur).rstrip())
-            cur, cur_len = [], 0
-        cur.append(block)
-        cur_len += len(block)
-    if cur:
-        parts.append("".join(cur).rstrip())
+            parts.append("".join(cur).rstrip()); cur, cur_len = [], 0
+        cur.append(block); cur_len += len(block)
+    if cur: parts.append("".join(cur).rstrip())
     return parts
 
 # -------------------- КОМАНДЫ --------------------
-HELP_TEXT = (
-    "Что я умею\n"
-    "/settotal 2800 — задать общий банк (только в мастер-чате).\n"
-    "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
-    "/weights — показать целевые веса.\n"
-    "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
-    "/digest — утренний дайджест (человеческий язык + события + новости).\n"
-    "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
-    "/init_sheet — создать/проверить лист в Google Sheets.\n"
-    "/sheet_test — записать тестовую строку в лист.\n"
-    "/diag — диагностика LLM / Sheets / NEWS.\n"
-)
+HELP_TEXT = ("/settotal 2800 — задать общий банк (мастер-чат).\n"
+             "/setweights jpy=40 aud=25 eur=20 gbp=15 — выставить целевые веса.\n"
+             "/weights — показать целевые веса.\n"
+             "/alloc — расчёт сумм и готовые команды /setbank для торговых чатов.\n"
+             "/digest — утренний дайджест (человеческий язык + события + новости).\n"
+             "/digest pro — краткий «трейдерский» дайджест (по цифрам, LLM).\n"
+             "/diag — диагностика LLM / Sheets / NEWS.\n")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(f"Привет! Я фунд-бот.\nТекущий чат id: <code>{update.effective_chat.id}</code>\n\nКоманды: /help", parse_mode=ParseMode.HTML)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT)
@@ -613,100 +520,50 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
 async def cmd_settotal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not assert_master_chat(update):
-        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
-        return
+    if not assert_master_chat(update): return await update.message.reply_text("Эта команда доступна только в мастер-чате.")
     try:
-        parts = update.message.text.strip().split()
-        if len(parts) < 2:
-            raise ValueError
-        total = float(parts[1])
-    except Exception:
-        await update.message.reply_text("Пример: /settotal 2800")
-        return
-
+        parts = update.message.text.strip().split(); total = float(parts[1]) if len(parts) > 1 else None
+        if total is None: raise ValueError
+    except Exception: return await update.message.reply_text("Пример: /settotal 2800")
     STATE["total"] = total
     await update.message.reply_text(f"OK. Общий банк = {total:.2f} USDT.\nИспользуйте /alloc для расчёта по чатам.")
 
 async def cmd_setweights(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not assert_master_chat(update):
-        await update.message.reply_text("Эта команда доступна только в мастер-чате.")
-        return
-
-    text = update.message.text[len("/setweights"):].strip().lower()
-    new_w = STATE["weights"].copy()
+    if not assert_master_chat(update): return await update.message.reply_text("Эта команда доступна только в мастер-чате.")
+    text, new_w = update.message.text[len("/setweights"):].strip().lower(), STATE["weights"].copy()
     try:
         for token in text.split():
-            if "=" not in token:
-                continue
-            k, v = token.split("=", 1)
-            k = k.strip().upper()
-            v = int(v.strip())
-            if k in ("JPY", "AUD", "EUR", "GBP"):
-                new_w[k] = v
-    except Exception:
-        await update.message.reply_text("Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
-        return
-
+            if "=" not in token: continue
+            k, v = token.split("=", 1); k, v = k.strip().upper(), int(v.strip())
+            if k in ("JPY", "AUD", "EUR", "GBP"): new_w[k] = v
+    except Exception: return await update.message.reply_text("Пример: /setweights jpy=40 aud=25 eur=20 gbp=15")
     STATE["weights"] = new_w
-    await update.message.reply_text(
-        f"Целевые веса обновлены: {human_readable_weights(new_w)}"
-    )
+    await update.message.reply_text(f"Целевые веса обновлены: {human_readable_weights(new_w)}")
 
 async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Целевые веса: {human_readable_weights(STATE['weights'])}")
 
 async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = float(STATE["total"])
-    if total <= 0:
-        await update.message.reply_text("Сначала задайте общий банк: /settotal 2800")
-        return
-
-    w = STATE["weights"]
-    alloc = split_total_by_weights(total, w)
-
-    lines = [
-        f"Целевые веса: {human_readable_weights(w)}",
-        "",
-        "Распределение:",
-    ]
-    for sym in SYMBOLS:
-        lines.append(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}")
-    msg = "\n".join(lines)
-    await update.message.reply_text(msg)
-
-    sh, _src = build_sheets_client(SHEET_ID)
-    if sh:
+    if total <= 0: return await update.message.reply_text("Сначала задайте общий банк: /settotal 2800")
+    w, alloc = STATE["weights"], split_total_by_weights(total, w)
+    lines = [f"Целевые веса: {human_readable_weights(w)}", "\nРаспределение:"]
+    lines.extend(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}" for sym in SYMBOLS)
+    await update.message.reply_text("\n".join(lines))
+    if sh := await get_sheets():
         try:
-            append_row(
-                sh,
-                SHEET_WS,
-                [
-                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                    str(update.effective_chat.id),
-                    "alloc",
-                    f"{total:.2f}",
-                    json.dumps(w, ensure_ascii=False),
-                    json.dumps(alloc, ensure_ascii=False),
-                ],
-            )
-        except Exception as e:
-            log.warning("append_row alloc failed: %s", e)
-        
-        # автозапись целевых банков в листы BMR_DCA_*
-        try:
-            for sym, amt in alloc.items():
-                _set_bank_target_in_bmr(sh, sym, amt)
-        except Exception as e:
-            log.warning("auto write BMR failed: %s", e)
+            append_row(sh, SHEET_WS, [datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                      str(update.effective_chat.id), "alloc", f"{total:.2f}",
+                                      json.dumps(w), json.dumps(alloc)])
+            for sym, amt in alloc.items(): _set_bank_target_in_bmr(sh, sym, amt)
+        except Exception as e: log.warning("alloc sheets update failed: %s", e)
 
-# ---------- Вспомогательные для «инвесторского» дайджеста ----------
+# ---------- Вспомогательные для дайджеста ----------
 _RU_WD = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 _RU_MM = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
 
 def header_ru(dt) -> str:
-    wd = _RU_WD[dt.weekday()]
-    mm = _RU_MM[dt.month - 1]
+    wd, mm = _RU_WD[dt.weekday()], _RU_MM[dt.month - 1]
     return f"🧭 Утренний фон — {wd}, {dt.day} {mm} {dt.year}, {dt:%H:%M} (Europe/Belgrade)"
 
 def _to_float(x, default: Optional[float] = 0.0) -> Optional[float]:
@@ -715,13 +572,21 @@ def _to_float(x, default: Optional[float] = 0.0) -> Optional[float]:
     except Exception:
         return default
 
-def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
+def price_fmt(symbol: str, value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
+
+def get_last_nonempty_row(sh, symbol: str,
+                          needed_fields=("Avg_Price","Next_DCA_Price","Bank_Target_USDT","Bank_Fact_USDT")) -> Optional[dict]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return None
+    if not sheet_name:
+        return None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows: return None
+        if not rows:
+            return None
         for r in reversed(rows):
             if any(r.get(f) not in (None, "", 0, "0", "0.0") for f in needed_fields):
                 return r
@@ -731,11 +596,13 @@ def get_last_nonempty_row(sh, symbol: str, needed_fields=("Avg_Price","Next_DCA_
 
 def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[float]]:
     sheet_name = BMR_SHEETS.get(symbol)
-    if not sheet_name: return None, None
+    if not sheet_name:
+        return None, None
     try:
         ws = sh.worksheet(sheet_name)
         rows = ws.get_all_records()
-        if not rows: return None, None
+        if not rows:
+            return None, None
         tgt = fac = None
         for r in reversed(rows):
             if tgt is None and r.get("Bank_Target_USDT") not in (None, "", 0, "0", "0.0"):
@@ -748,289 +615,214 @@ def latest_bank_target_fact(sh, symbol: str) -> tuple[Optional[float], Optional[
     except Exception:
         return None, None
 
-def price_fmt(symbol: str, value: Optional[float]) -> str:
-    if value is None: return "—"
-    return f"{value:.{3 if symbol.endswith('JPY') else 5}f}"
+def _effect_hint(pair: str, origin: Optional[str]) -> str:
+    o = (origin or "").lower()
+    if pair == "USDJPY":
+        if o in ("united states", ""): return "жёстче ФРС → USD/JPY вверх; мягче → вниз."
+        if o == "japan": return "жёстче BoJ → иена сильнее → USD/JPY вниз; мягче → вверх."
+    elif pair == "AUDUSD":
+        if o == "australia": return "жёстче РБА → AUD/USD вверх; мягче → вниз."
+        if o == "united states": return "жёстче ФРС → доллар сильнее → AUD/USD вниз; мягче → вверх."
+    elif pair == "EURUSD":
+        if o == "euro area": return "жёстче ЕЦБ → EUR/USD вверх; мягче → вниз."
+        if o == "united states": return "жёстче ФРС → EUR/USD вниз; мягче → вверх."
+    elif pair == "GBPUSD":
+        if o == "united kingdom": return "жёстче Банк Англии → GBP/USD вверх; мягче → вниз."
+        if o == "united states": return "жёстче ФРС → GBP/USD вниз; мягче → вверх."
+    return "ястребиный тон укрепляет валюту эмитента, голубиный — ослабляет."
+
+async def _effect_explain_line(pair: str, headline: str, origin: Optional[str]) -> str:
+    if explain_pair_event:
+        try:
+            if txt := await explain_pair_event(pair=pair, headline=headline, origin=(origin or ""), lang="ru"):
+                return txt.strip()
+        except Exception: pass
+    return _effect_hint(pair, origin)
 
 def _symbol_hints(symbol: str) -> tuple[str,str]:
-    # (что это значит для цены, простыми словами)
-    if symbol == "USDJPY":
-        return (
-            "до решения ФРС сильного тренда не ждём. Резкие слова ФРС — укрепляют доллар (часто рост USD/JPY); мягкие — ослабляют доллар (падение USD/JPY).",
-            "если ФРС жёстче ожидаемого — доллар дороже; мягче — доллар дешевле."
-        )
-    if symbol == "AUDUSD":
-        return (
-            "комментарии РБА, намекающие «держим ставку дольше», обычно поддерживают AUD (AUD/USD может подрасти).",
-            "если РБА не спешит снижать ставку — австралийский доллар сильнее."
-        )
-    if symbol == "EURUSD":
-        return (
-            "публикации ЕЦБ про экономику без сюрпризов — нейтрально; жёсткий тон ЕЦБ — поддержка евро (EUR/USD вверх), мягкий — давление на евро (вниз).",
-            "ищем намёки — «больше боимся инфляции» → евро сильнее; «больше боимся слабой экономики» → евро слабее."
-        )
-    # GBPUSD
-    return (
-        "если представители Банка Англии говорят «зарплаты и услуги давят на инфляцию», рынок ждёт ставку повыше дольше — фунт крепче (GBP/USD вверх). Мягче — фунт слабее.",
-        "больше тревоги по инфляции — фунт сильнее; меньше — слабее."
-    )
+    # This is now a pure fallback for when no news/event is found at all
+    if symbol == "USDJPY": return ("Новостей нет. Ориентир — ближайшее заседание FOMC.", "")
+    if symbol == "AUDUSD": return ("Новостей нет. Ориентир — ближайшее заседание РБА.", "")
+    if symbol == "EURUSD": return ("Новостей нет. Ориентир — ближайшее заседание ЕЦБ.", "")
+    return ("Новостей нет. Ориентир — ближайшее заседание Банка Англии.", "")
 
-def _pair_to_title(symbol: str) -> str:
-    return f"<b>{symbol[:3]}/{symbol[3:]}</b>"
+def _pair_to_title(symbol: str) -> str: return f"<b>{symbol[:3]}/{symbol[3:]}</b>"
 
 def _plan_vs_fact_line(sh, symbol: str) -> str:
     target, fact = latest_bank_target_fact(sh, symbol)
-    if target is None and fact is None:
-        return "план —; факт —."
-    tt = target if target is not None else 0.0
-    ff = fact if fact is not None else 0.0
-    if tt <= 0:
-        return f"план {tt:g} / факт {ff:g} — —."
-    delta = 0 if tt == 0 else (ff - tt) / tt
-    ap = abs(delta)
-    if ap <= 0.02: mark = "✅ в норме."
-    elif ap <= 0.05: mark = f"⚠️ {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
+    if target is None and fact is None: return "план —; факт —."
+    tt, ff = target or 0.0, fact or 0.0
+    if tt <= 0: return f"план {tt:g} / факт {ff:g} — —."
+    delta = (ff - tt) / tt
+    if abs(delta) <= 0.02: mark = "✅ в норме."
+    elif abs(delta) <= 0.05: mark = f"⚠️ {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
     else: mark = f"🚧 {'ниже' if delta<0 else 'выше'} плана ({delta:+.0%})."
     return f"план {tt:g} / факт {ff:g} — {mark}"
 
-def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
-    risk = fa_data.get("risk", "Green")
-    bias = fa_data.get("bias", "neutral")
-    dca_scale = float(fa_data.get("dca_scale", 1.0))
-    reserve_on_str = "OFF" if fa_data.get("reserve_off") else "ON"
-    icon = _fa_icon(risk)
-    
-    title = f"{_pair_to_title(pair)} — {icon} фон {risk.lower()}, bias: {bias.upper()}"
-    
-    side = (row.get("Side") or row.get("SIDE") or "").upper() or "LONG"
-    avg = price_fmt(pair, _to_float(row.get("Avg_Price"), None))
-    nxt = price_fmt(pair, _to_float(row.get("Next_DCA_Price"), None))
-    what_means, simple_words = _symbol_hints(pair)
-    plan_fact = _plan_vs_fact_line(sh, pair)
-
-    lines = [title]
-    lines.append(f"•\tСводка рынка: {('подъём заметнее обычного, волатильность ниже нормы.' if bias=='short' and pair=='AUDUSD' else 'движения ровные, резких скачков не ждём до США.')}")
-    lines.append(f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.")
-    lines.append(f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve_on_str}; dca_scale <b>{dca_scale:.2f}</b>.")
-
-    top_news_line = _top_news_for_pair(sh, pair, now_utc=datetime.now(timezone.utc))
-    if top_news_line:
-        lines.append(f"•\tТоп-новость: {top_news_line}.")
-
-    lines.append(f"•\tЧто это значит для цены: {what_means}")
-    lines.append(f"•\tПлан vs факт по банку: {plan_fact}.")
-    lines.append(f"Простыми словами: {simple_words}")
-
+async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
+    risk, bias = fa_data.get("risk", "Green"), fa_data.get("bias", "neutral")
+    dca, reserve = float(fa_data.get("dca_scale", 1.0)), "OFF" if fa_data.get("reserve_off") else "ON"
+    title = f"{_pair_to_title(pair)} — {_fa_icon(risk)} фон {risk.lower()}, bias: {bias.upper()}"
+    side, avg, nxt = (row.get("Side") or "LONG").upper(), price_fmt(pair, _to_float(row.get("Avg_Price"))), price_fmt(pair, _to_float(row.get("Next_DCA_Price")))
+    lines = [title,
+             f"•\tСводка рынка: {'движения ровные, резких скачков не ждём до США.'}",
+             f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.",
+             f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve}; dca_scale <b>{dca:.2f}</b>."]
+    top_line, origin = _top_news_for_pair(sh, pair, now_utc=datetime.now(timezone.utc))
+    if top_line:
+        lines.append(f"•\tТоп-новость: {top_line}.")
+        clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line))
+        expl = await _effect_explain_line(pair, clean_hl, origin)
+        if expl: lines.append(f"•\tЧто это значит для цены: {expl}")
+    else:
+        what_means, _ = _symbol_hints(pair)
+        lines.append(f"•\tЧто это значит для цены: {what_means}")
+    lines.append(f"•\tПлан vs факт по банку: {_plan_vs_fact_line(sh, pair)}.")
     return "\n".join(lines)
 
+def render_usd_block(sh) -> str:
+    now_utc = datetime.now(timezone.utc)
+    ev = _pick_top_event(sh, {"united states"}, now_utc, ttl_min=NEWS_TTL_MIN)
+    if not ev:
+        return "USD — общий фон: свежих новостей нет; смотрим к ближайшему FOMC."
+    ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
+    when = f"{ts_local:%H:%M}" if ev["from"] == "news" else f"{ts_local:%Y-%m-%d %H:%M}"
+    href = (ev.get("url") or "").strip()
+    ttl = _h(ev["title"])
+    ttl_html = f'<a href="{_h(href)}">{ttl}</a>' if href else ttl
+    line = f"USD — общий фон: {when} — {ttl_html} ({_h(ev['src'])})."
+    hint = "В общем случае: чем жёстче риторика ФРС — тем сильнее доллар; мягче — слабее."
+    return f"{line}\n{hint}"
 
-# ---------- Digest helpers (сборка полного текста) ----------
-def build_digest_text(sh, fa_sheet_data: dict) -> str:
+async def build_digest_text(sh, fa_sheet_data: dict) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
-    
     parts: List[str] = [header]
-    
     for i, sym in enumerate(SYMBOLS):
         row = get_last_nonempty_row(sh, sym) or {}
         fa_data = fa_sheet_data.get(sym, {})
-        
-        block = render_morning_pair_block(sh, sym, row, fa_data)
+        block = await render_morning_pair_block(sh, sym, row, fa_data)
         parts.append(block)
-        if i < len(SYMBOLS) - 1:
-            parts.append("⸻")
-
+        if i < len(SYMBOLS) - 1: parts.append("⸻")
+    parts.append("⸻")
+    parts.append(render_usd_block(sh))
     parts.append("Главная мысль дня: до ФРС — аккуратно; после пресс-конференции вернёмся к обычному режиму, если не будет сюрпризов.")
     return "\n".join(parts)
-
 
 # -------------------- /digest --------------------
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = (update.message.text or "").split()
     pro = len(args) > 1 and args[1].lower() == "pro"
-
     if pro:
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-            txt = await generate_digest(
-                symbols=SYMBOLS,
-                model=LLM_MINI,
-                token_budget=LLM_TOKEN_BUDGET_PER_DAY,
-            )
+            txt = await generate_digest(symbols=SYMBOLS, model=LLM_MINI, token_budget=LLM_TOKEN_BUDGET_PER_DAY)
             await update.message.reply_text(txt)
-        except Exception as e:
-            await update.message.reply_text(f"LLM ошибка: {e}")
+        except Exception as e: await update.message.reply_text(f"LLM ошибка: {e}")
         return
-
     sh = await get_sheets()
-    if not sh:
-        await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
-        return
-
+    if not sh: return await update.message.reply_text("Sheets недоступен: не могу собрать инвесторский дайджест.")
     try:
         fa_sheet = _read_fa_signals_from_sheet(sh)
-        msg = build_digest_text(sh, fa_sheet)
-        
+        msg = await build_digest_text(sh, fa_sheet)
         for chunk in _split_for_tg_html(msg, 3500):
             await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
-        # после дайджеста — проверить, не пора ли рекомендовать веса
         await _maybe_send_reco_message(context.application, sh, fa_sheet)
     except Exception as e:
         log.exception("Ошибка сборки дайджеста")
         await update.message.reply_text(f"Ошибка сборки дайджеста: {e}")
 
-
 # -------------------- Диагностика --------------------
 def sheets_diag_text() -> str:
     sid_state = "set" if SHEET_ID else "empty"
-    b64_len = len(_env("GOOGLE_CREDENTIALS_JSON_B64"))
-    raw_json_len = len(_env("GOOGLE_CREDENTIALS_JSON")) or len(_env("GOOGLE_CREDENTIALS"))
-
-    if not _GSHEETS_AVAILABLE:
-        return f"Sheets: ❌ (libs not installed, SID={sid_state}, b64_len={b64_len}, raw_len={raw_json_len})"
-
+    if not _GSHEETS_AVAILABLE: return f"Sheets: ❌ (libs not installed)"
     sh, src = build_sheets_client(SHEET_ID)
-    if sh is None:
-        return f"Sheets: ❌ (SID={sid_state}, source={src}, b64_len={b64_len}, raw_len={raw_json_len})"
-    else:
-        try:
-            ws, created = ensure_worksheet(sh, SHEET_WS)
-            mark = "created" if created else "exists"
-            return f"Sheets: ✅ ok (SID={sid_state}, {src}, ws={ws.title}:{mark})"
-        except Exception as e:
-            return f"Sheets: ❌ (open ok, ws error: {e})"
+    if sh is None: return f"Sheets: ❌ (SID={sid_state}, source={src})"
+    try:
+        ws, created = ensure_worksheet(sh, SHEET_WS)
+        return f"Sheets: ✅ ok (SID={sid_state}, {src}, ws={ws.title}:{'created' if created else 'exists'})"
+    except Exception as e:
+        return f"Sheets: ❌ (open ok, ws error: {e})"
 
 async def _diag_news_line() -> str:
-    # простое чтение NEWS без внешних зависимостей
     def _read_news_rows_simple(sh) -> list[dict]:
-        try:
-            ws = sh.worksheet("NEWS")
-            return ws.get_all_records()
-        except Exception:
-            return []
+        try: return sh.worksheet("NEWS").get_all_records()
+        except Exception: return []
     try:
         sh, _ = build_sheets_client(SHEET_ID)
-        if not sh:
-            return "NEWS: ❌ Sheets недоступен"
-        rows = _read_news_rows_simple(sh)
-        return f"NEWS: ✅ {len(rows)} строк в листе NEWS; TTL {NEWS_TTL_MIN} мин."
+        if not sh: return "NEWS: ❌ Sheets недоступен"
+        return f"NEWS: ✅ {len(_read_news_rows_simple(sh))} строк в листе NEWS; TTL {NEWS_TTL_MIN} мин."
     except Exception as e:
         return f"NEWS: ❌ ошибка: {e}"
 
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        ok = await llm_ping()
-        llm_line = "LLM: ✅ ok" if ok else "LLM: ❌ no key"
-    except Exception:
-        llm_line = "LLM: ❌ error"
-    sheets_line = sheets_diag_text()
-    news_line = await _diag_news_line()
-    await update.message.reply_text(f"{llm_line}\n{sheets_line}\n{news_line}")
+    try: llm_line = "LLM: ✅ ok" if await llm_ping() else "LLM: ❌ no key"
+    except Exception: llm_line = "LLM: ❌ error"
+    await update.message.reply_text(f"{llm_line}\n{sheets_diag_text()}\n{await _diag_news_line()}")
 
 async def cmd_init_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not SHEET_ID:
-        await update.message.reply_text("SHEET_ID не задан.")
-        return
+    if not SHEET_ID: return await update.message.reply_text("SHEET_ID не задан.")
     sh, src = build_sheets_client(SHEET_ID)
-    if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
-        return
+    if not sh: return await update.message.reply_text(f"Sheets: ❌ {src}")
     try:
         ws, created = ensure_worksheet(sh, SHEET_WS)
-        await update.message.reply_text(
-            f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
+        await update.message.reply_text(f"Sheets: ✅ ws='{ws.title}' {'создан' if created else 'уже есть'} ({src})")
+    except Exception as e: await update.message.reply_text(f"Sheets: ❌ ошибка создания листа: {e}")
 
 async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sh, src = build_sheets_client(SHEET_ID)
-    if not sh:
-        await update.message.reply_text(f"Sheets: ❌ {src}")
-        return
+    if not sh: return await update.message.reply_text(f"Sheets: ❌ {src}")
     try:
-        append_row(
-            sh,
-            SHEET_WS,
-            [
-                datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                str(update.effective_chat.id),
-                "test",
-                f"{STATE['total']:.2f}",
-                json.dumps(STATE['weights'], ensure_ascii=False),
-                "manual /sheet_test",
-            ],
-        )
+        append_row(sh, SHEET_WS, [datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                  str(update.effective_chat.id), "test", f"{STATE['total']:.2f}",
+                                  json.dumps(STATE['weights']), "manual /sheet_test"])
         await update.message.reply_text("Sheets: ✅ записано (test row).")
-    except Exception as e:
-        await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
+    except Exception as e: await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
-    cmds = [
-        BotCommand("start", "Запуск бота"),
-        BotCommand("help", "Список команд"),
-        BotCommand("ping", "Проверка связи"),
-        BotCommand("settotal", "Задать общий банк (мастер-чат)"),
-        BotCommand("setweights", "Задать целевые веса (мастер-чат)"),
-        BotCommand("weights", "Показать целевые веса"),
-        BotCommand("alloc", "Рассчитать распределение банка"),
-        BotCommand("digest", "Утренний дайджест (investor) / pro (trader)"),
-        BotCommand("init_sheet", "Создать/проверить лист в Google Sheets"),
-        BotCommand("sheet_test", "Тестовая запись в лист"),
-        BotCommand("diag", "Диагностика LLM и Sheets"),
-    ]
-    try:
-        await app.bot.set_my_commands(cmds)
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
+    cmds = [BotCommand(c, d) for c, d in [
+        ("start", "Запуск бота"), ("help", "Список команд"), ("ping", "Проверка связи"),
+        ("settotal", "Задать общий банк (мастер-чат)"), ("setweights", "Задать целевые веса (мастер-чат)"),
+        ("weights", "Показать целевые веса"), ("alloc", "Рассчитать распределение банка"),
+        ("digest", "Утренний дайджест (investor) / pro (trader)"),
+        ("diag", "Диагностика LLM и Sheets"),
+    ]]
+    try: await app.bot.set_my_commands(cmds)
+    except Exception as e: log.warning("set_my_commands failed: %s", e)
 
 async def morning_digest_scheduler(app: Application):
     from datetime import datetime as _dt, timedelta as _td, time as _time
-    import asyncio as _asyncio
     while True:
-        if LOCAL_TZ:
-            now = _dt.now(LOCAL_TZ)
-            target_time = _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)
-        else:
-            now = _dt.now(timezone.utc)
-            target_time = _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=timezone.utc)
+        if LOCAL_TZ: now, target_time = _dt.now(LOCAL_TZ), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=LOCAL_TZ)
+        else: now, target_time = _dt.now(timezone.utc), _time(MORNING_HOUR, MORNING_MINUTE, tzinfo=timezone.utc)
         target = _dt.combine(now.date(), target_time)
-        if now >= target:
-            target += _td(days=1)
-        wait_s = (target - now).total_seconds()
-        await _asyncio.sleep(max(1.0, wait_s))
+        if now >= target: target += _td(days=1)
+        await asyncio.sleep(max(1.0, (target - now).total_seconds()))
         try:
             sh, _ = build_sheets_client(SHEET_ID)
             if sh:
                 fa_sheet_data = _read_fa_signals_from_sheet(sh)
-                msg = build_digest_text(sh, fa_sheet_data)
+                msg = await build_digest_text(sh, fa_sheet_data)
                 for chunk in _split_for_tg_html(msg):
                     await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
-                # и тут тоже: после утреннего дайджеста проверим рекомендацию
                 await _maybe_send_reco_message(app, sh, fa_sheet_data)
             else:
                 await app.bot.send_message(chat_id=MASTER_CHAT_ID, text="Sheets недоступен: утренний дайджест пропущен.")
         except Exception as e:
-            try:
-                await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
-            except Exception:
-                pass
+            try: await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=f"Ошибка утреннего дайджеста: {e}")
+            except Exception: pass
 
 async def reco_watch_scheduler(app: Application):
-    # фоновый наблюдатель каждые RECO_POLL_MIN минут
-    if not RECO_ENABLED:
-        return
-    import asyncio as _asyncio
+    if not RECO_ENABLED: return
     while True:
         try:
             sh, _ = build_sheets_client(SHEET_ID)
             if sh:
                 fa = _read_fa_signals_from_sheet(sh)
                 await _maybe_send_reco_message(app, sh, fa)
-        except Exception:
-            log.exception("reco_watch iteration failed")
-        await _asyncio.sleep(max(60, RECO_POLL_MIN*60))
+        except Exception: log.exception("reco_watch iteration failed")
+        await asyncio.sleep(max(60, RECO_POLL_MIN*60))
 
 async def _post_init(app: Application):
     await _set_bot_commands(app)
@@ -1041,8 +833,7 @@ def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
     builder = Application.builder().token(BOT_TOKEN)
     if _RATE_LIMITER_AVAILABLE: builder = builder.rate_limiter(AIORateLimiter())
-    builder = builder.post_init(_post_init)
-    app = builder.build()
+    app = builder.post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
