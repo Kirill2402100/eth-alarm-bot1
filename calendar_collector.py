@@ -180,8 +180,13 @@ def fetch_text(url: str, timeout=15.0) -> tuple[str, int, str]:
                 return pr.text or "", (200 if pr.text else pr.status_code), url
             return r.text, r.status_code, str(r.url)
     except Exception as e:
-        log.warning("fetch failed %s: %s", url, e)
-        return "", 0, url
+        log.warning("fetch failed %s: %s (retry via proxy)", url, e)
+        try:
+            pr = httpx.get(JINA_PROXY + url, timeout=timeout)
+            return pr.text or "", (200 if pr.text else pr.status_code), url
+        except Exception as e2:
+            log.warning("proxy fetch failed %s: %s", url, e2)
+            return "", 0, url
 
 def _html_to_text(s: str) -> str:
     if not s:
@@ -317,6 +322,29 @@ def _selftest_scan_dates():
     log.info("--- Selftest done ---")
 
 # ---- Calendar parsers ----
+def _fomc_range_end_dates(text: str) -> set[tuple[int,int,int]]:
+    """Вытащить концы диапазонов (вторые дни) для FOMC: Sep 16–17, 2025 / 16–17 Sep 2025."""
+    t = _html_to_text(text)
+    MON = (
+        r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
+        r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
+        r"Sep(?:\.|t|tember)?|Oct(?:\.|ober)?|Nov(?:\.|ember)?|Dec(?:\.|ember)?)"
+    )
+    def mon2num(s: str) -> int:
+        return _MONTH[s.lower().replace('.', '')[:3]]
+    ends: set[tuple[int,int,int]] = set()
+    # Вариант: Month d1–d2, YYYY
+    pA = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s*,\s*(20\d{{2}})\b", re.I)
+    for m in pA.finditer(t):
+        mo = mon2num(m.group(1)); d2 = int(m.group(3)); y = int(m.group(4))
+        ends.add((y, mo, d2))
+    # Вариант: d1–d2 Month YYYY
+    pB = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\s*(20\d{{2}})\b", re.I)
+    for m in pB.finditer(t):
+        d2 = int(m.group(2)); mo = mon2num(m.group(3)); y = int(m.group(4))
+        ends.add((y, mo, d2))
+    return ends
+
 def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
     if "govc/html" not in url and not _has_policy_context(html, [
         r"governing council", r"monetary policy", r"rate decision"
@@ -359,13 +387,20 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
     return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
+    """Для FOMC берём только даты, являющиеся вторыми днями диапазонов заседаний."""
     out: List[CalEvent] = []
-    for y, mo, d in _scan_dates_any(html):
+    range_ends = _fomc_range_end_dates(html)
+    # fallback: если ничего не нашли, используем общий сканер (на всякий случай)
+    triples = range_ends or set(_scan_dates_any(html))
+    for (y, mo, d) in triples:
         try:
             dt = _mk_dt(y, mo, d, "CAL_FOMC_ANCHOR_UTC", "18:00")
-            out.append(CalEvent(utc=dt, country="united states", currency="USD",
-                title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url))
-        except Exception: continue
+            out.append(CalEvent(
+                utc=dt, country="united states", currency="USD",
+                title="FOMC Meeting / Rate Decision", impact="high", source="FOMC", url=url
+            ))
+        except Exception:
+            continue
     return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
