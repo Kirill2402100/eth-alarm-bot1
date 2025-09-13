@@ -1,26 +1,38 @@
 # llm_client.py
 # -*- coding: utf-8 -*-
+"""
+Универсальная обёртка для OpenAI:
+- сначала пробует Responses API;
+- если текст пустой/ошибка — падает в Chat Completions;
+- совместимо с gpt-5 (без mini/nano);
+- не использует несовместимые параметры (temperature/max_tokens).
+"""
+
 import os
 import asyncio
 import logging
 from typing import Dict, List, Optional
+
 from openai import OpenAI
+from openai.types.chat import ChatCompletion
 
-LOG = logging.getLogger("llm_client")
-if os.getenv("DEBUG_LLM"):
-    logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger("llm_client")
+if not log.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
+# Все модели указываем на gpt-5, чтобы не целиться в снятые mini/nano
+LLM_NANO: str = os.getenv("LLM_NANO", "gpt-5")
+LLM_MINI: str = os.getenv("LLM_MINI", "gpt-5")
 LLM_MAJOR: str = os.getenv("LLM_MAJOR", "gpt-5")
-LLM_MINI:  str = os.getenv("LLM_MINI",  LLM_MAJOR)
-LLM_NANO:  str = os.getenv("LLM_NANO",  LLM_MAJOR)
 
-DEFAULT_TEMPERATURE = 0.3
+# Токены выхода: для Responses -> max_output_tokens, для Chat -> max_completion_tokens
 DEFAULT_MAX_OUT_TOKENS = 500
 
 _client: Optional[OpenAI] = None
 
 
 def _client_singleton() -> OpenAI:
+    """Ленивая инициализация клиента OpenAI из переменной OPENAI_API_KEY."""
     global _client
     if _client is None:
         api_key = os.environ["OPENAI_API_KEY"]
@@ -28,114 +40,140 @@ def _client_singleton() -> OpenAI:
     return _client
 
 
-def _extract_responses_text(resp) -> str:
-    if not resp:
-        return ""
-    txt = getattr(resp, "output_text", None)
-    if txt:
-        return str(txt).strip()
-    out = getattr(resp, "output", None)
-    parts: List[str] = []
-    if isinstance(out, list):
-        for item in out:
-            content = getattr(item, "content", None)
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict):
-                        t = (c.get("text") or c.get("output_text") or "").strip()
-                        if t:
-                            parts.append(t)
-    return "\n".join(parts).strip()
+# ---------- НИЗКОУРОВНЕВЫЕ ВЫЗОВЫ ----------
 
-
-def _extract_chat_text(resp) -> str:
-    if not resp or not getattr(resp, "choices", None):
-        return ""
-    msg = resp.choices[0].message
-    return (getattr(msg, "content", "") or "").strip()
-
-
-def _create_responses(client: OpenAI, **kwargs):
-    try:
-        return client.responses.create(**kwargs)
-    except Exception as e:
-        # если модель не поддерживает temperature — убираем и повторяем
-        msg = str(e).lower()
-        if "temperature" in msg and "not supported" in msg:
-            kwargs.pop("temperature", None)
-            return client.responses.create(**kwargs)
-        raise
-
-
-def _respond_sync(
+def _responses_ask(
+    client: OpenAI,
     model: str,
     system: str,
     user: str,
     max_output_tokens: int,
-    temperature: Optional[float],
 ) -> str:
+    """
+    Пытается вызвать Responses API. Делает 2 попытки:
+    1) с message-структурой
+    2) со строковым input
+    Если ответ пустой — возвращает "" (пусть вызывающий решит делать фоллбэк).
+    """
+
+    def _create(**kwargs):
+        # Иногда модели ругаются на temperature — просто не передаём его.
+        # Иногда возвращают 400 на неизвестные поля — оставляем только безопасные.
+        return client.responses.create(**kwargs)
+
+    # Попытка №1 — messages формат
+    try:
+        resp = _create(
+            model=model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+        text = getattr(resp, "output_text", None)
+        if text:
+            return str(text).strip()
+        log.warning("Responses #1: пустой текст, повторим строковым input…")
+    except Exception as e:
+        # 400/… — пойдём дальше, не падаем
+        log.info("Responses #1 ошибка: %s", e)
+
+    # Попытка №2 — строковый формат (часто помогает)
+    try:
+        combined = f"[SYSTEM]\n{system}\n\n[USER]\n{user}"
+        resp = _create(
+            model=model,
+            input=combined,
+            max_output_tokens=max_output_tokens,
+        )
+        text = getattr(resp, "output_text", None)
+        if text:
+            return str(text).strip()
+        log.warning("Responses #2: снова пусто — пойдём в Chat Completions…")
+    except Exception as e:
+        log.info("Responses #2 ошибка: %s", e)
+
+    return ""
+
+
+def _chat_ask(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    max_completion_tokens: int,
+) -> str:
+    """
+    Chat Completions фоллбэк.
+    ВАЖНО: не передаём temperature (некоторые ревизии gpt-5 не принимают произвольные значения).
+    Обязательно используем max_completion_tokens (а не max_tokens).
+    """
+    try:
+        comp: ChatCompletion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            # Не указывать temperature/top_p и пр.
+            max_completion_tokens=max_completion_tokens,
+        )
+        msg = (comp.choices[0].message.content or "").strip() if comp.choices else ""
+        return msg
+    except Exception as e:
+        # На случай если и это не понравится модели — попробуем вообще без max_*.
+        log.error("Chat Completions упал: %s", e)
+        try:
+            comp: ChatCompletion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            msg = (comp.choices[0].message.content or "").strip() if comp.choices else ""
+            return msg
+        except Exception as e2:
+            log.error("Chat Completions (повтор без max_*) тоже упал: %s", e2)
+            return ""
+
+
+def _respond(
+    model: str,
+    system: str,
+    user: str,
+    max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
+) -> str:
+    """
+    Унифицированный синхронный запрос: Responses → (если пусто) Chat.
+    """
     client = _client_singleton()
 
-    # 1) Responses API — попытка №1
-    try:
-        r1 = _create_responses(
-            client,
-            model=model,
-            input=[{"role": "system", "content": system},
-                   {"role": "user",   "content": user}],
-            max_output_tokens=max_output_tokens,
-            **({"temperature": temperature} if temperature is not None else {}),
-        )
-        text = _extract_responses_text(r1)
-        if text:
-            return text
-        LOG.warning("Responses #1: пустой текст, повторим строковым input…")
-    except Exception as e:
-        LOG.warning("Responses #1: ошибка: %s", e)
+    # 1) Пытаемся через Responses
+    text = _responses_ask(
+        client=client,
+        model=model,
+        system=system,
+        user=user,
+        max_output_tokens=max_output_tokens,
+    )
+    if text:
+        return text
 
-    # 1b) Responses API — попытка №2 (склеенный input)
-    try:
-        stitched = f"[system]\n{system}\n\n[user]\n{user}"
-        r2 = _create_responses(
-            client,
-            model=model,
-            input=stitched,
-            max_output_tokens=max_output_tokens,
-            **({"temperature": temperature} if temperature is not None else {}),
-        )
-        text = _extract_responses_text(r2)
-        if text:
-            return text
-        LOG.warning("Responses #2: снова пусто — падаем в Chat Completions…")
-    except Exception as e:
-        LOG.warning("Responses #2: ошибка: %s — падаем в Chat Completions…", e)
+    # 2) Фоллбэк в Chat Completions
+    text = _chat_ask(
+        client=client,
+        model=model,
+        system=system,
+        user=user,
+        max_completion_tokens=max_output_tokens,
+    )
+    if text:
+        return text
 
-    # 2) Chat Completions — ВАЖНО: без кастомной temperature
-    try:
-        kwargs = dict(
-            model=model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user",   "content": user}],
-            max_completion_tokens=max_output_tokens,
-            # temperature по умолчанию (1). Не передаём параметр вовсе.
-        )
-        cc = client.chat.completions.create(**kwargs)
-        return _extract_chat_text(cc)
-    except Exception as e:
-        msg = str(e).lower()
-        LOG.error("Chat Completions упал: %s", e)
-        # крайняя попытка: вообще минимум параметров
-        try:
-            cc2 = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user",   "content": user}],
-                max_completion_tokens=max_output_tokens,
-            )
-            return _extract_chat_text(cc2)
-        except Exception as e2:
-            LOG.error("Chat Completions (повтор) тоже упал: %s", e2)
-            return ""
+    # Совсем fallback — пустая строка, пусть вызывающий решает
+    return ""
 
 
 async def _respond_async(
@@ -143,24 +181,22 @@ async def _respond_async(
     system: str,
     user: str,
     max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
-    temperature: Optional[float] = DEFAULT_TEMPERATURE,
 ) -> str:
-    return await asyncio.to_thread(
-        _respond_sync, model, system, user, max_output_tokens, temperature
-    )
+    """Асинхронная обёртка над _respond (в пуле потоков)."""
+    return await asyncio.to_thread(_respond, model, system, user, max_output_tokens)
 
 
-# -------- Публичные функции (совместимы с fa_bot.py) --------
+# ---------- ВЫСОКОУРОВНЕВЫЕ ХЕЛПЕРЫ ----------
 
 def quick_classify(labeling_prompt: str) -> str:
     system = "Ты коротко и точно классифицируешь вход. Отвечай одной строкой."
-    return _respond_sync(
+    out = _respond(
         model=LLM_NANO,
         system=system,
         user=labeling_prompt,
         max_output_tokens=64,
-        temperature=0.2,
-    ) or ""
+    )
+    return out or ""
 
 
 def fx_digest_ru(pairs_state: Dict[str, str]) -> str:
@@ -176,21 +212,13 @@ def fx_digest_ru(pairs_state: Dict[str, str]) -> str:
         "\n".join(lines)
         + "\n\nФормат ответа строго:\nUSD/JPY — <заметка>\nAUD/USD — <заметка>\nEUR/USD — <заметка>\nGBP/USD — <заметка>"
     )
-    text = _respond_sync(
+    out = _respond(
         model=LLM_MINI,
         system=system,
         user=user,
         max_output_tokens=400,
-        temperature=0.3,
     )
-    if text:
-        return text
-    return (
-        "USD/JPY — фон спокойный; обычный режим\n"
-        "AUD/USD — фон спокойный; обычный режим\n"
-        "EUR/USD — фон спокойный; обычный режим\n"
-        "GBP/USD — фон спокойный; обычный режим"
-    )
+    return out or ""
 
 
 def deep_analysis(question: str, context: str = "") -> str:
@@ -199,48 +227,54 @@ def deep_analysis(question: str, context: str = "") -> str:
         "Сначала краткий вывод (1–2 предложения), затем маркированные пункты."
     )
     user = f"Вопрос:\n{question}\n\nКонтекст:\n{context}".strip()
-    return _respond_sync(
+    out = _respond(
         model=LLM_MAJOR,
         system=system,
         user=user,
         max_output_tokens=800,
-        temperature=0.4,
-    ) or "Краткий вывод: контекст недостаточен.\n• Уточните данные и цели анализа."
+    )
+    return out or ""
 
 
 async def llm_ping() -> bool:
-    """Smoke-test: хотя бы одна модель отвечает."""
+    """
+    Лёгкий смоук-тест, что хотя бы одна конфигурация отвечает.
+    """
     if not os.environ.get("OPENAI_API_KEY"):
         return False
+
     client = _client_singleton()
-    models_to_try = [LLM_MINI, LLM_MAJOR, LLM_NANO]
 
-    async def _try(mdl: str) -> bool:
-        # Responses ping
-        try:
-            await asyncio.to_thread(
-                _create_responses, client,
-                model=mdl, input="ping", max_output_tokens=8
-            )
+    # Пробуем Responses коротко
+    try:
+        txt = await asyncio.to_thread(
+            _responses_ask,
+            client,
+            LLM_MINI,
+            "Проверка связи. Ответь одной буквой.",
+            "ping",
+            8,
+        )
+        if txt:
             return True
-        except Exception:
-            pass
-        # Chat ping (без temperature!)
-        try:
-            await asyncio.to_thread(
-                client.chat.completions.create,
-                model=mdl,
-                messages=[{"role": "system", "content": "Проверка связи. Ответь одной буквой."},
-                          {"role": "user", "content": "ping"}],
-                max_completion_tokens=8,
-            )
-            return True
-        except Exception:
-            return False
+    except Exception:
+        pass
 
-    for mdl in models_to_try:
-        if await _try(mdl):
+    # Пробуем Chat коротко
+    try:
+        txt = await asyncio.to_thread(
+            _chat_ask,
+            client,
+            LLM_MINI,
+            "Проверка связи. Ответь одной буквой.",
+            "ping",
+            8,
+        )
+        if txt:
             return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -249,6 +283,9 @@ async def generate_digest(
     model: Optional[str] = None,
     token_budget: int = 30000,
 ) -> str:
+    """
+    Короткий трейдерский дайджест: по одной строке на пару (RU).
+    """
     mdl = (model or LLM_MINI).strip()
     max_out = max(200, min(500, (token_budget // 50) if token_budget else 400))
     pretty = {"USDJPY": "USD/JPY", "AUDUSD": "AUD/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
@@ -265,9 +302,12 @@ async def generate_digest(
         system=system,
         user=user,
         max_output_tokens=max_out,
-        temperature=0.3,
     )
 
+    if not text:
+        return "\n".join(f"{pretty.get(s, s[:3]+'/'+s[3:])} — фон спокойный; обычный режим" for s in ordered)
+
+    # Подчистим и приведём к ожидаемому виду
     lines: List[str] = []
     by_symbol = {s: None for s in ordered}
     for raw in (text or "").splitlines():
@@ -278,7 +318,10 @@ async def generate_digest(
                 by_symbol[s] = line
                 break
     for s in ordered:
-        lines.append(by_symbol[s] or f"{pretty.get(s, s[:3]+'/'+s[3:])} — фон спокойный; обычный режим")
+        if by_symbol[s]:
+            lines.append(by_symbol[s])
+        else:
+            lines.append(f"{pretty.get(s, s[:3]+'/'+s[3:])} — фон спокойный; обычный режим")
     return "\n".join(lines)
 
 
@@ -289,6 +332,11 @@ async def explain_pair_event(
     lang: str = "ru",
     model: Optional[str] = None,
 ) -> str:
+    """
+    Коротко объясняет, что означает событие для данной FX-пары.
+    Возвращает 1–2 фразы (без эмодзи, цен, вероятностей).
+    Пример: await explain_pair_event("USDJPY", "FOMC Meeting / Rate Decision", "united states")
+    """
     mdl = (model or LLM_MINI).strip()
     pair = (pair or "").upper().strip()
     origin = (origin or "").lower().strip()
@@ -319,13 +367,16 @@ async def explain_pair_event(
         system=system,
         user=user,
         max_output_tokens=140,
-        temperature=0.2,
     )
 
-    text = " ".join((text or "").split())
     if not text:
-        return ("Жёстче ожиданий усиливает валюту источника и сдвигает пару в соответствующем направлении; "
-                "мягче ожиданий — наоборот.")
+        # Нейтральный fallback
+        return (
+            "Жёстче ожиданий усиливает валюту источника и сдвигает пару в соответствующем направлении; "
+            "мягче ожиданий — наоборот."
+        )
+
+    text = " ".join((text or "").split())
     if len(text) > 400:
         text = text[:400].rsplit(". ", 1)[0] + "."
     return text
