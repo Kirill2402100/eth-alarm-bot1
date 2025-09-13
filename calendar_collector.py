@@ -323,8 +323,11 @@ def _selftest_scan_dates():
 
 # ---- Calendar parsers ----
 def _fomc_range_end_dates(text: str) -> set[tuple[int,int,int]]:
-    """Вытащить концы диапазонов (вторые дни) для FOMC: Sep 16–17, 2025 / 16–17 Sep 2025."""
+    """Концы диапазонов (вторые дни) для FOMC: 'Sep 16–17, 2025', '16–17 Sep 2025',
+    а также варианты БЕЗ года ('Sep 16–17' / '16–17 Sep') с подстановкой контекстного года."""
     t = _html_to_text(text)
+    ctx_year = _guess_context_year(t)
+    cur_year = datetime.now(timezone.utc).year
     MON = (
         r"(Jan(?:\.|uary)?|Feb(?:\.|ruary)?|Mar(?:\.|ch)?|Apr(?:\.|il)?|"
         r"May|Jun(?:\.|e)?|Jul(?:\.|y)?|Aug(?:\.|ust)?|"
@@ -343,6 +346,18 @@ def _fomc_range_end_dates(text: str) -> set[tuple[int,int,int]]:
     for m in pB.finditer(t):
         d2 = int(m.group(2)); mo = mon2num(m.group(3)); y = int(m.group(4))
         ends.add((y, mo, d2))
+    # Вариант БЕЗ года: Month d1–d2  -> год = контекстный
+    pC = re.compile(rf"\b{MON}\s+(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\b", re.I)
+    for m in pC.finditer(t):
+        mo = mon2num(m.group(1)); d2 = int(m.group(3))
+        ends.add((ctx_year, mo, d2))
+    # Вариант БЕЗ года: d1–d2 Month  -> год = контекстный
+    pD = re.compile(rf"\b(\d{{1,2}})\s*[–—\-]\s*(\d{{1,2}})\s+{MON}\b", re.I)
+    for m in pD.finditer(t):
+        d2 = int(m.group(2)); mo = mon2num(m.group(3))
+        ends.add((ctx_year, mo, d2))
+    # Слегка ограничим «дальние» года, чтобы не тащить 2028+ в coverage.
+    ends = { (y, mo, d) for (y, mo, d) in ends if (cur_year - 1) <= y <= (cur_year + 1) }
     return ends
 
 def parse_ecb_calendar(html: str, url: str) -> list[CalEvent]:
@@ -387,10 +402,9 @@ def parse_rba_calendar(html: str, url: str) -> list[CalEvent]:
     return list({ev.utc.date(): ev for ev in out}.values())
 
 def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
-    """Для FOMC берём только даты, являющиеся вторыми днями диапазонов заседаний."""
+    """FOMC: берём вторые дни диапазонов (с учётом строк без года). Если ничего не нашли — fallback на общий сканер."""
     out: List[CalEvent] = []
     range_ends = _fomc_range_end_dates(html)
-    # fallback: если ничего не нашли, используем общий сканер (на всякий случай)
     triples = range_ends or set(_scan_dates_any(html))
     for (y, mo, d) in triples:
         try:
@@ -405,7 +419,7 @@ def parse_fomc_calendar(html: str, url: str) -> List[CalEvent]:
 
 def parse_boj_calendar(html: str, url: str) -> List[CalEvent]:
     if not _has_policy_context(html, [r"monetary policy meeting", r"\bMPM\b", r"monetary policy"]): return []
-    out: List[CalEvent] = []
+    out: list[CalEvent] = []
     for y, mo, d in _scan_dates_any(html):
         try:
             dt = _mk_dt(y, mo, d, "CAL_BOJ_ANCHOR_UTC", "03:00")
