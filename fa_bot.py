@@ -125,6 +125,13 @@ PAIR_COUNTRIES = {
     "GBPUSD": {"united kingdom", "united states"},
 }
 
+_PRIMARY_COUNTRY = {
+    "USDJPY": "japan",
+    "AUDUSD": "australia",
+    "EURUSD": "euro area",
+    "GBPUSD": "united kingdom",
+}
+
 KW_RE = re.compile(os.getenv(
     "FA_NEWS_KEYWORDS",
     "rate decision|monetary policy|bank rate|policy decision|unscheduled|emergency|"
@@ -313,9 +320,14 @@ def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
 def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> tuple[str, Optional[str]]:
+    """
+    Индивидуальная новость для пары: сначала только "домашняя" страна пары.
+    Новости США показываем отдельно в USD-блоке, чтобы не дублировать на всех парах.
+    """
     now_utc = now_utc or datetime.now(timezone.utc)
-    countries = PAIR_COUNTRIES.get(pair, set())
-    ev = _pick_top_event(sh, countries, now_utc, ttl_min=NEWS_TTL_MIN)
+    primary = _PRIMARY_COUNTRY.get(pair)
+    countries = {primary} if primary else set()
+    ev = _pick_top_event(sh, countries, now_utc, ttl_min=NEWS_TTL_MIN) if countries else None
     if not ev:
         return "", None
     ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
@@ -634,10 +646,11 @@ def _effect_hint(pair: str, origin: Optional[str]) -> str:
 async def _effect_explain_line(pair: str, headline: str, origin: Optional[str]) -> str:
     if explain_pair_event:
         try:
-            if txt := await explain_pair_event(pair=pair, headline=headline, origin=(origin or ""), lang="ru"):
+            txt = await explain_pair_event(pair=pair, headline=headline, origin=(origin or ""), lang="ru")
+            if txt and txt.strip():
                 return txt.strip()
         except Exception: pass
-    return _effect_hint(pair, origin)
+    return "⚠️ LLM не дал расшифровку; ориентир по эффекту: " + _effect_hint(pair, origin)
 
 def _symbol_hints(symbol: str) -> tuple[str,str]:
     # This is now a pure fallback for when no news/event is found at all
@@ -694,6 +707,41 @@ def render_usd_block(sh) -> str:
     hint = "В общем случае: чем жёстче риторика ФРС — тем сильнее доллар; мягче — слабее."
     return f"{line}\n{hint}"
 
+def _largest_plan_fact_delta(sh) -> Optional[tuple[str, float, float, float]]:
+    """Возвращает (symbol, plan, fact, delta) с максимальным |delta|."""
+    best = None
+    for sym in SYMBOLS:
+        plan, fact = latest_bank_target_fact(sh, sym)
+        if plan and plan > 0 and fact is not None:
+            d = (fact - plan) / plan
+            if (best is None) or (abs(d) > abs(best[3])):
+                best = (sym, plan, fact, d)
+    return best
+
+def build_main_thought(sh, fa_sheet_data: dict) -> str:
+    risks = {p: (fa_sheet_data.get(p, {}) or {}).get("risk", "Green") for p in SYMBOLS}
+    reds   = [p for p, r in risks.items() if r == "Red"]
+    ambers = [p for p, r in risks.items() if r == "Amber"]
+    parts: list[str] = []
+    if reds:
+        parts.append("стоп докупок по " + ", ".join(reds))
+    if ambers:
+        parts.append("осторожность по " + ", ".join(ambers))
+    if not parts:
+        parts.append("фон спокойный, работаем по плану")
+    # Ключевой драйвер — США
+    ev = _pick_top_event(sh, {"united states"}, datetime.now(timezone.utc), ttl_min=NEWS_TTL_MIN)
+    if ev:
+        ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
+        when = f"{ts_local:%H:%M}" if ev["from"] == "news" else f"{ts_local:%Y-%m-%d %H:%M}"
+        parts.append(f"драйвер: {when} — {ev['title']} ({ev['src']})")
+    # Наибольшее расхождение план/факт
+    worst = _largest_plan_fact_delta(sh)
+    if worst and abs(worst[3]) >= 0.05:
+        sym, plan, fact, d = worst
+        parts.append(f"наибольшее отклонение по {sym}: план {plan:g} / факт {fact:g} ({d:+.0%})")
+    return "Главная мысль дня: " + "; ".join(parts) + "."
+
 async def build_digest_text(sh, fa_sheet_data: dict) -> str:
     now_utc = datetime.now(timezone.utc)
     header = header_ru(now_utc.astimezone(LOCAL_TZ)) if LOCAL_TZ else f"🧭 Утренний фон — {now_utc.strftime('%d %b %Y, %H:%M')} (UTC)"
@@ -706,7 +754,7 @@ async def build_digest_text(sh, fa_sheet_data: dict) -> str:
         if i < len(SYMBOLS) - 1: parts.append("⸻")
     parts.append("⸻")
     parts.append(render_usd_block(sh))
-    parts.append("Главная мысль дня: до ФРС — аккуратно; после пресс-конференции вернёмся к обычному режиму, если не будет сюрпризов.")
+    parts.append(build_main_thought(sh, fa_sheet_data))
     return "\n".join(parts)
 
 # -------------------- /digest --------------------
