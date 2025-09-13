@@ -589,20 +589,38 @@ def price_fmt(symbol: str, value: Optional[float]) -> str:
 
 _COL_ALIASES = {
     "Side": ["Side", "Position", "Dir"],
-    "Avg_Price": ["Avg_Price", "Avg price", "AvgPrice", "Average", "Avg"],
-    "Next_DCA_Price": ["Next_DCA_Price", "Next DCA Price", "NextPrice", "Next_Buy_Price", "Next Entry", "Next_Entry_Price", "Next_Buy"],
-    "Bank_Target_USDT": ["Bank_Target_USDT", "Bank Target USDT", "Target_Bank_USDT", "Bank_Target"],
-    "Bank_Fact_USDT": ["Bank_Fact_USDT", "Bank Fact USDT", "Bank_Fact", "Fact_Bank_USDT"],
+    "Avg_Price": ["Avg_Price","Avg price","AvgPrice","Average","Avg",
+                  "Средняя","Средняя цена","Средняя_Цена","Средн.","Средняя по позиции"],
+    "Next_DCA_Price": ["Next_DCA_Price","Next DCA Price","NextPrice","Next_Buy_Price",
+                       "Next Entry","Next_Entry_Price","Next_Buy",
+                       "Следующее докупление","След. докупление","Следующее усреднение","Следующая покупка"],
+    "Bank_Target_USDT": ["Bank_Target_USDT","Bank Target USDT","Target_Bank_USDT","Bank_Target",
+                         "План банк","План USDT","Целевой банк"],
+    "Bank_Fact_USDT": ["Bank_Fact_USDT","Bank Fact USDT","Bank_Fact","Fact_Bank_USDT",
+                       "Факт банк","Факт USDT","Текущий банк","Фактический банк"],
 }
+
+_ZERO_RE = re.compile(r"^0+(?:[.,]0+)?$")
+def _is_zeroish(v) -> bool:
+    if v is None: return True
+    if isinstance(v, (int, float)): return abs(float(v)) < 1e-12
+    s = str(v).strip().replace(",", ".")
+    return bool(_ZERO_RE.match(s))
+
+def _norm_side(v: str) -> str:
+    t = str(v or "").strip().lower()
+    if any(w in t for w in ("short","sell","шорт","прод")):
+        return "SHORT"
+    return "LONG"
 
 def _last_nonempty(rows: List[dict], cand_names: List[str], treat_zero_empty=True):
     for r in reversed(rows):
         for n in cand_names:
             if n in r:
                 v = r.get(n)
-                s = str(v).strip()
-                if s == "": continue
-                if treat_zero_empty and s in ("0", "0.0"): continue
+                if v is None: continue
+                if str(v).strip() == "": continue
+                if treat_zero_empty and _is_zeroish(v): continue
                 return v
     return None
 
@@ -615,7 +633,7 @@ def read_latest_snapshot(sh, symbol: str) -> Optional[dict]:
         rows = ws.get_all_records()
         if not rows: return None
         return {
-            "Side": (_last_nonempty(rows, _COL_ALIASES["Side"], treat_zero_empty=False) or "").upper() or "LONG",
+            "Side": _norm_side(_last_nonempty(rows, _COL_ALIASES["Side"], treat_zero_empty=False)),
             "Avg_Price": _to_float(_last_nonempty(rows, _COL_ALIASES["Avg_Price"]), None),
             "Next_DCA_Price": _to_float(_last_nonempty(rows, _COL_ALIASES["Next_DCA_Price"]), None),
             "Bank_Target_USDT": _to_float(_last_nonempty(rows, _COL_ALIASES["Bank_Target_USDT"]), None),
@@ -677,7 +695,9 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     risk, bias = fa_data.get("risk", "Green"), fa_data.get("bias", "neutral")
     dca, reserve = float(fa_data.get("dca_scale", 1.0)), "OFF" if fa_data.get("reserve_off") else "ON"
     title = f"{_pair_to_title(pair)} — {_fa_icon(risk)} фон {risk.lower()}, bias: {bias.upper()}"
-    side, avg, nxt = row.get("Side") or "LONG", price_fmt(pair, row.get("Avg_Price")), price_fmt(pair, row.get("Next_DCA_Price"))
+    side = row.get("Side") or "LONG"
+    avg  = price_fmt(pair, (row.get("Avg_Price") if row.get("Avg_Price") is not None else None))
+    nxt  = price_fmt(pair, (row.get("Next_DCA_Price") if row.get("Next_DCA_Price") is not None else None))
     lines = [title,
              f"•\tСводка рынка: {'движения ровные, резких скачков не ждём до США.'}",
              f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.",
@@ -833,6 +853,22 @@ async def cmd_sheet_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sheets: ✅ записано (test row).")
     except Exception as e: await update.message.reply_text(f"Sheets: ❌ ошибка записи: {e}")
 
+async def cmd_positions_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sh = await get_sheets()
+    if not sh:
+        return await update.message.reply_text("Sheets недоступен")
+    lines = []
+    for sym in SYMBOLS:
+        snap = read_latest_snapshot(sh, sym) or {}
+        lines.append(
+            f"{sym}: side={snap.get('Side')}; "
+            f"avg={price_fmt(sym, snap.get('Avg_Price'))}; "
+            f"next={price_fmt(sym, snap.get('Next_DCA_Price'))}; "
+            f"plan={snap.get('Bank_Target_USDT')}; "
+            f"fact={snap.get('Bank_Fact_USDT')}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
 # -------------------- СТАРТ --------------------
 async def _set_bot_commands(app: Application):
     cmds = [BotCommand(c, d) for c, d in [
@@ -841,6 +877,7 @@ async def _set_bot_commands(app: Application):
         ("weights", "Показать целевые веса"), ("alloc", "Рассчитать распределение банка"),
         ("digest", "Утренний дайджест (investor) / pro (trader)"),
         ("diag", "Диагностика LLM и Sheets"),
+        ("positions_debug", "Отладка позиций из Sheets"),
     ]]
     try: await app.bot.set_my_commands(cmds)
     except Exception as e: log.warning("set_my_commands failed: %s", e)
@@ -899,6 +936,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("init_sheet", cmd_init_sheet))
     app.add_handler(CommandHandler("sheet_test", cmd_sheet_test))
+    app.add_handler(CommandHandler("positions_debug", cmd_positions_debug))
     return app
 
 def main():
