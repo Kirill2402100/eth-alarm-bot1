@@ -1,67 +1,76 @@
 # llm_client.py
+# -*- coding: utf-8 -*-
+"""
+LLM-клиент под единственную модель GPT-5 через Responses API.
+Совместим с текущим кодом бота: generate_digest, llm_ping, explain_pair_event
+(+ quick_classify, fx_digest_ru, deep_analysis).
+
+Зависимости:  pip install --upgrade openai>=1.40
+
+ENV:
+  OPENAI_API_KEY  — проектный ключ (sk-proj-…)
+  LLM_MAJOR       — опц., имя основной модели (игнорируется, но может быть 'gpt-5')
+  LLM_MINI        — опц., может быть задано как gpt-5-mini (в любом случае маппится на gpt-5)
+  LLM_NANO        — опц., аналогично
+"""
+
+from __future__ import annotations
+
 import os
 import asyncio
 from typing import Dict, List, Optional
+
 from openai import OpenAI
 
-LLM_NANO: str = os.getenv("LLM_NANO", "gpt-5-nano")
-LLM_MINI: str = os.getenv("LLM_MINI", "gpt-5-mini")
-LLM_MAJOR: str = os.getenv("LLM_MAJOR", "gpt-5")
+# ---- Константы/настройки ----------------------------------------------------
 
+_DEFAULT_MODEL = "gpt-5"
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_OUT_TOKENS = 500
 
-_client: Optional[OpenAI] = None
+_client_singleton_obj: Optional[OpenAI] = None
+
+
+def _resolve_model(_: Optional[str] = None) -> str:
+    """Любые 'mini'/'nano'/кастом → всегда gpt-5."""
+    return _DEFAULT_MODEL
 
 
 def _client_singleton() -> OpenAI:
     """Lazy OpenAI client with API key from env."""
-    global _client
-    if _client is None:
-        api_key = os.environ["OPENAI_API_KEY"]
-        _client = OpenAI(api_key=api_key)
-    return _client
+    global _client_singleton_obj
+    if _client_singleton_obj is None:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        _client_singleton_obj = OpenAI(api_key=api_key)
+    return _client_singleton_obj
 
 
 def _create_response(client: OpenAI, **kwargs):
-    """Wrapper to retry without temperature if model doesn't support it."""
+    """
+    Обёртка: если модель ругнётся на temperature — перезапросим без него.
+    """
     try:
         return client.responses.create(**kwargs)
     except Exception as e:
-        msg = str(e).lower()
+        msg = (str(e) or "").lower()
         if "temperature" in msg and "not supported" in msg:
             kwargs.pop("temperature", None)
             return client.responses.create(**kwargs)
         raise
 
 
-def _respond(
-    model: str,
-    system: str,
-    user: str,
-    max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
-    temperature: Optional[float] = DEFAULT_TEMPERATURE,
-) -> str:
-    """Synchronous helper: returns plain text from Responses API."""
-    client = _client_singleton()
-    kwargs = dict(
-        model=model,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_output_tokens=max_output_tokens,
-    )
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    resp = _create_response(client, **kwargs)
-
-    # Preferred way
+def _extract_text(resp) -> str:
+    """
+    Унифицированное извлечение текста из ответа Responses API.
+    """
+    # Нормальный путь
     text = getattr(resp, "output_text", None)
     if text:
         return str(text).strip()
 
-    # Fallback: scan content parts
+    # Фоллбэк — собрать руками
     parts: List[str] = []
     output = getattr(resp, "output", None)
     if isinstance(output, list):
@@ -69,30 +78,58 @@ def _respond(
             content = getattr(item, "content", None)
             if isinstance(content, list):
                 for c in content:
+                    # у разных версий SDK тип бывает "output_text" или "text"
                     if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
                         parts.append(c.get("text", ""))
     return "\n".join(parts).strip()
 
 
-async def _respond_async(
-    model: str,
-    system: str,
+def _respond(
+    model: Optional[str],
+    system: Optional[str],
     user: str,
     max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
     temperature: Optional[float] = DEFAULT_TEMPERATURE,
 ) -> str:
-    """Async wrapper around _respond (runs in thread)."""
+    """
+    Синхронный вызов Responses API → plain text.
+    """
+    client = _client_singleton()
+    mdl = _resolve_model(model)
+    kwargs = dict(
+        model=mdl,
+        input=(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            if system else user
+        ),
+        max_output_tokens=max_output_tokens,
+    )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    resp = _create_response(client, **kwargs)
+    return _extract_text(resp)
+
+
+async def _respond_async(
+    model: Optional[str],
+    system: Optional[str],
+    user: str,
+    max_output_tokens: int = DEFAULT_MAX_OUT_TOKENS,
+    temperature: Optional[float] = DEFAULT_TEMPERATURE,
+) -> str:
+    """Async wrapper над _respond (в отдельном потоке, чтобы не блокировать event loop)."""
     return await asyncio.to_thread(
         _respond, model, system, user, max_output_tokens, temperature
     )
 
 
-# ------------ High-level helpers ------------
+# ==================== ПУБЛИЧНЫЕ ФУНКЦИИ (совместимые) ========================
 
 def quick_classify(labeling_prompt: str) -> str:
     system = "Ты коротко и точно классифицируешь вход. Отвечай одной строкой."
     return _respond(
-        model=LLM_NANO,
+        model="gpt-5",
         system=system,
         user=labeling_prompt,
         max_output_tokens=64,
@@ -114,7 +151,7 @@ def fx_digest_ru(pairs_state: Dict[str, str]) -> str:
         + "\n\nФормат ответа строго:\nUSD/JPY — <заметка>\nAUD/USD — <заметка>\nEUR/USD — <заметка>\nGBP/USD — <заметка>"
     )
     return _respond(
-        model=LLM_MINI,
+        model="gpt-5",
         system=system,
         user=user,
         max_output_tokens=400,
@@ -129,7 +166,7 @@ def deep_analysis(question: str, context: str = "") -> str:
     )
     user = f"Вопрос:\n{question}\n\nКонтекст:\n{context}".strip()
     return _respond(
-        model=LLM_MAJOR,
+        model="gpt-5",
         system=system,
         user=user,
         max_output_tokens=800,
@@ -138,37 +175,17 @@ def deep_analysis(question: str, context: str = "") -> str:
 
 
 async def llm_ping() -> bool:
-    """Smoke-test that at least one configured model responds."""
+    """
+    Smoke-тест: модель отвечает и ключ валиден.
+    """
     if not os.environ.get("OPENAI_API_KEY"):
         return False
-    client = _client_singleton()
-    models_to_try = [LLM_MINI, LLM_MAJOR, LLM_NANO]
-
-    async def _try(mdl: str) -> bool:
-        try:
-            await asyncio.to_thread(_create_response, client, model=mdl, input="ping", max_output_tokens=8)
-            return True
-        except Exception:
-            pass
-        try:
-            await asyncio.to_thread(
-                _create_response,
-                client,
-                model=mdl,
-                input=[
-                    {"role": "system", "content": "Проверка связи. Ответь одной буквой."},
-                    {"role": "user", "content": "ping"},
-                ],
-                max_output_tokens=8,
-            )
-            return True
-        except Exception:
-            return False
-
-    for mdl in models_to_try:
-        if await _try(mdl):
-            return True
-    return True
+    try:
+        # самый дешёвый возможный запрос
+        txt = await _respond_async("gpt-5", None, "ping", max_output_tokens=8, temperature=None)
+        return bool(txt)
+    except Exception:
+        return False
 
 
 async def generate_digest(
@@ -176,8 +193,11 @@ async def generate_digest(
     model: Optional[str] = None,
     token_budget: int = 30000,
 ) -> str:
-    """Short trader-style digest: one line per pair (RU)."""
-    mdl = (model or LLM_MINI).strip()
+    """
+    Короткий трейдерский дайджест: по одной строке на каждую пару (RU).
+    Параметр model игнорируется — всегда gpt-5.
+    """
+    mdl = "gpt-5"
     max_out = max(200, min(500, (token_budget // 50) if token_budget else 400))
     pretty = {"USDJPY": "USD/JPY", "AUDUSD": "AUD/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
     ordered = [s for s in (symbols or []) if isinstance(s, str)] or ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
@@ -216,8 +236,6 @@ async def generate_digest(
     return "\n".join(lines)
 
 
-# ------------ New: concise event → pair explainer ------------
-
 async def explain_pair_event(
     pair: str,
     headline: str,
@@ -226,11 +244,10 @@ async def explain_pair_event(
     model: Optional[str] = None,
 ) -> str:
     """
-    Коротко объясняет, что означает событие для данной FX-пары.
-    Возвращает 1–2 фразы (без эмодзи, цен, вероятностей).
-    Пример вызова: await explain_pair_event("USDJPY", "FOMC Meeting / Rate Decision", "united states")
+    Коротко объясняет эффект события для валютной пары.
+    Возвращает 1–2 фразы, без эмодзи/цен/вероятностей.
     """
-    mdl = (model or LLM_MINI).strip()
+    mdl = "gpt-5"
     pair = (pair or "").upper().strip()
     origin = (origin or "").lower().strip()
 
@@ -264,7 +281,6 @@ async def explain_pair_event(
             temperature=0.2,
         )
     except Exception:
-        # Нейтральный fallback
         return (
             "Жёстче ожиданий усиливает валюту источника и сдвигает пару в соответствующем направлении; "
             "мягче ожиданий — наоборот."
