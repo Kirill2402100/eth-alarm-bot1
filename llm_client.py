@@ -49,7 +49,7 @@ def _chat_completion(
         "response_format": {"type": "text"},
         "max_completion_tokens": max_completion_tokens,
     }
-
+    
     resp = client.chat.completions.create(**params)
 
     # Робастное извлечение текста
@@ -67,7 +67,7 @@ def _chat_completion(
                 text = "".join([getattr(part, "text", "") or "" for part in c]).strip()
     except Exception:
         text = ""
-
+    
     return (text or "").strip()[:1200]
 
 
@@ -195,7 +195,6 @@ async def explain_pair_event(
     model: Optional[str] = None,
     consensus: Optional[str] = None,
 ) -> str:
-    client = _client_singleton()
     mdl = (model or LLM_MINI).strip()
     origin = origin or "united states"
     cons = f" Консенсус: {consensus}." if consensus else ""
@@ -209,24 +208,14 @@ async def explain_pair_event(
         "Не используй форматирование и вводные слова."
     )
 
-    async def _chat(msg: str):
-        # Используем to_thread для асинхронного вызова синхронной библиотеки
-        return await asyncio.to_thread(
-            client.chat.completions.create,
+    try:
+        # Прямой вызов без ретраев, т.к. фоллбэк теперь в fa_bot.py
+        text = await _chat_completion_async(
             model=mdl,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": msg}],
-            response_format={"type": "text"},
+            system=sys,
+            user=usr,
             max_completion_tokens=120,
         )
-
-    try:
-        resp = await _chat(usr)
-        text = (resp.choices[0].message.content or "").strip()
-        if len(text) < 10:
-            # Мягкий ретрай с явным fallback-текстом
-            usr2 = usr + "\nЕсли влияние минимальное, напиши явно: 'существенного влияния нет'."
-            resp = await _chat(usr2)
-            text = (resp.choices[0].message.content or "").strip()
         return text
     except Exception:
         log.exception("explain_pair_event failed")
