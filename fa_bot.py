@@ -7,7 +7,7 @@ import logging
 import re
 from html import escape as _html_escape
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional, List, Iterable
+from typing import Dict, Tuple, Optional, List
 
 import asyncio
 
@@ -46,23 +46,16 @@ except Exception:
     service_account = None
     _GSHEETS_AVAILABLE = False
 
-# --- HTTP для календаря ---
-try:
-    import requests
-    _REQUESTS_AVAILABLE = True
-except Exception:
-    requests = None
-    _REQUESTS_AVAILABLE = False
-
 # --- LLM-клиент (опционально) ---
 try:
-    from llm_client import generate_digest, llm_ping, explain_pair_event
+    from llm_client import generate_digest, explain_pair_event
+    _LLM_IMPORTED = True
 except Exception:
+    _LLM_IMPORTED = False
     async def generate_digest(*args, **kwargs) -> str:
         return "⚠️ LLM сейчас недоступен (нет llm_client.py)."
-    async def llm_ping() -> bool:
-        return bool(os.getenv("OPENAI_API_KEY"))
-    explain_pair_event = None
+    async def explain_pair_event(*args, **kwargs) -> str:
+        return ""  # Fallback to empty string
 
 
 # -------------------- ЛОГИ --------------------
@@ -89,22 +82,20 @@ else:
     DEFAULT_WEIGHTS = {"JPY": 40, "AUD": 25, "EUR": 20, "GBP": 15}
 
 LLM_MINI = os.getenv("LLM_MINI", "gpt-5-mini").strip()
-LLM_NANO = os.getenv("LLM_NANO", "gpt-5-nano").strip()
-LLM_MAJOR = os.getenv("LLM_MAJOR", "gpt-5").strip()
 LLM_TOKEN_BUDGET_PER_DAY = int(os.getenv("LLM_TOKEN_BUDGET_PER_DAY", "30000") or "30000")
 
 SYMBOLS = ["USDJPY", "AUDUSD", "EURUSD", "GBPUSD"]
 
 # --- Рекомендации по весам (ENV) ---
-RECO_ENABLED             = (os.getenv("RECO_ENABLED","1").lower() in ("1","true","yes","on"))
-RECO_MIN_PERSIST_MIN   = int(os.getenv("RECO_MIN_PERSIST_MIN","120") or "120")
-RECO_COOLDOWN_MIN      = int(os.getenv("RECO_COOLDOWN_MIN","360") or "360")
-RECO_POLL_MIN          = int(os.getenv("RECO_POLL_MIN","10") or "10")
-RECO_MIN_SHIFT_PCT     = float(os.getenv("RECO_MIN_SHIFT_PCT","0.06") or "0.06")
-RECO_MULT_GREEN        = float(os.getenv("RECO_MULT_GREEN","1.0") or "1.0")
-RECO_MULT_AMBER        = float(os.getenv("RECO_MULT_AMBER","0.90") or "0.90")
-RECO_MULT_RED          = float(os.getenv("RECO_MULT_RED","0.75") or "0.75")
-RECO_TRACK_WS          = os.getenv("RECO_TRACK_WS","FA_Reco_Track").strip() or "FA_Reco_Track"
+RECO_ENABLED              = (os.getenv("RECO_ENABLED","1").lower() in ("1","true","yes","on"))
+RECO_MIN_PERSIST_MIN    = int(os.getenv("RECO_MIN_PERSIST_MIN","120") or "120")
+RECO_COOLDOWN_MIN       = int(os.getenv("RECO_COOLDOWN_MIN","360") or "360")
+RECO_POLL_MIN           = int(os.getenv("RECO_POLL_MIN","10") or "10")
+RECO_MIN_SHIFT_PCT      = float(os.getenv("RECO_MIN_SHIFT_PCT","0.06") or "0.06")
+RECO_MULT_GREEN         = float(os.getenv("RECO_MULT_GREEN","1.0") or "1.0")
+RECO_MULT_AMBER         = float(os.getenv("RECO_MULT_AMBER","0.90") or "0.90")
+RECO_MULT_RED           = float(os.getenv("RECO_MULT_RED","0.75") or "0.75")
+RECO_TRACK_WS           = os.getenv("RECO_TRACK_WS","FA_Reco_Track").strip() or "FA_Reco_Track"
 
 ASSET_BY_PAIR = {"USDJPY":"JPY","AUDUSD":"AUD","EURUSD":"EUR","GBPUSD":"GBP"}
 PAIR_BY_ASSET = {"JPY":"USDJPY","AUD":"AUDUSD","EUR":"EURUSD","GBP":"GBPUSD"}
@@ -117,13 +108,6 @@ BMR_SHEETS = {
 }
 
 CAL_WS_OUT = os.getenv("CAL_WS_OUT", "CALENDAR").strip() or "CALENDAR"
-
-PAIR_COUNTRIES = {
-    "USDJPY": {"united states", "japan"},
-    "AUDUSD": {"australia", "united states"},
-    "EURUSD": {"euro area", "united states"},
-    "GBPUSD": {"united kingdom", "united states"},
-}
 
 _PRIMARY_COUNTRY = {
     "USDJPY": "japan",
@@ -153,14 +137,14 @@ def _clean_headline_for_llm(line: str) -> str:
 def _src_country_guess(src: str, title: str = "", fallback: str = "") -> str:
     s = (src or "").upper()
     if s in {"US_FED_PR", "US_TREASURY", "FOMC"}: return "united states"
-    if s in {"ECB_PR", "ECB"}:                     return "euro area"
-    if s in {"BOE_PR", "BOE"}:                     return "united kingdom"
-    if s in {"RBA_MR", "RBA"}:                     return "australia"
-    if s in {"BOJ_PR", "BOJ"}:                     return "japan"
+    if s in {"ECB_PR", "ECB"}:                       return "euro area"
+    if s in {"BOE_PR", "BOE"}:                       return "united kingdom"
+    if s in {"RBA_MR", "RBA"}:                       return "australia"
+    if s in {"BOJ_PR", "BOJ"}:                       return "japan"
     t = (title or "").lower()
-    if "fomc" in t or "federal reserve" in t:      return "united states"
+    if "fomc" in t or "federal reserve" in t:     return "united states"
     if "ecb" in t or "european central bank" in t: return "euro area"
-    if "bank of england" in t or "mpc" in t:       return "united kingdom"
+    if "bank of england" in t or "mpc" in t:        return "united kingdom"
     if "rba" in t or "reserve bank of australia" in t: return "australia"
     if "boj" in t or "bank of japan" in t or "mpm" in t: return "japan"
     return (fallback or "").lower().strip()
@@ -197,6 +181,7 @@ def _pick_top_event(sh, countries: set[str], now_utc: datetime, ttl_min: int = N
             best = {
                 "from": "news", "ts": ts, "title": title, "src": src, "url": str(r.get("url", "")).strip(),
                 "country": (_src_country_guess(src, title) or next(iter(row_cty or []), "")),
+                "consensus": (str(r.get("consensus","")).strip() or str(r.get("exp","")).strip() or ""),
             }
     if best:
         return best
@@ -214,13 +199,13 @@ def _pick_top_event(sh, countries: set[str], now_utc: datetime, ttl_min: int = N
         if dt <= now_utc:
             if cty in countries and (last_past is None or dt > last_past["ts"]):
                 last_past = {"from":"calendar","ts":dt,"title":str(e.get("title","")).strip(), "url": str(e.get("url","")).strip(),
-                             "src":str(e.get("source","")).strip() or "CAL","country":cty}
+                             "src":str(e.get("source","")).strip() or "CAL","country":cty, "consensus": str(e.get("consensus","")).strip()}
             continue
         if cty not in countries:
             continue
         if (soon is None) or (dt < soon["ts"]):
             soon = {"from":"calendar","ts":dt,"title":str(e.get("title","")).strip(), "url": str(e.get("url","")).strip(),
-                    "src":str(e.get("source","")).strip() or "CAL","country":cty}
+                    "src":str(e.get("source","")).strip() or "CAL","country":cty, "consensus": str(e.get("consensus","")).strip()}
     return soon or last_past
 
 # -------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------
@@ -292,7 +277,7 @@ def ensure_worksheet(sh, title: str):
             if ws.title == title:
                 return ws, False
         ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(SHEET_HEADERS)))
-        ws.update("A1", [SHEET_HEADERS])
+        ws.update(range_name="A1", values=[SHEET_HEADERS])
         return ws, True
     except Exception as e:
         raise RuntimeError(f"ensure_worksheet error: {e}")
@@ -321,13 +306,13 @@ def _set_bank_target_in_bmr(sh, symbol: str, amount: float):
 def _fa_icon(risk: str) -> str:
     return {"Green": "🟢", "Amber": "🟡", "Red": "🔴"}.get((risk or "").capitalize(), "⚪️")
 
-def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> tuple[str, Optional[str]]:
+def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> tuple[str, Optional[str], Optional[str]]:
     now_utc = now_utc or datetime.now(timezone.utc)
     primary = _PRIMARY_COUNTRY.get(pair)
     countries = {primary} if primary else set()
     ev = _pick_top_event(sh, countries, now_utc, ttl_min=NEWS_TTL_MIN) if countries else None
     if not ev:
-        return "", None
+        return "", None, None
     ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
     href = ev.get("url","").strip()
     title_text = _h(ev['title'])
@@ -336,7 +321,11 @@ def _top_news_for_pair(sh, pair: str, now_utc: datetime | None = None) -> tuple[
         line = f"{ts_local:%H:%M} — {title_html} ({_h(ev['src'])})"
     else:
         line = f"{ts_local:%Y-%m-%d %H:%M} — {title_html} ({_h(ev['src'])})"
-    return line, (ev.get("country") or None)
+    return line, (ev.get("country") or None), (ev.get("consensus") or None)
+
+def _to_bool(v) -> bool:
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
 
 def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
     try:
@@ -361,7 +350,7 @@ def _read_fa_signals_from_sheet(sh) -> Dict[str, dict]:
             "risk": (str(r.get("risk", "Green")).capitalize()),
             "bias": (str(r.get("bias", "neutral")).lower()),
             "dca_scale": float(r.get("dca_scale") or 1.0),
-            "reserve_off": bool(int(r.get("reserve_off") or 0)),
+            "reserve_off": _to_bool(r.get("reserve_off")),
             "reason": str(r.get("reason", "base")),
             "updated_at": upd_raw,
         }
@@ -426,7 +415,7 @@ def _load_reco_track(sh):
         p = str(r.get("pair","")).upper()
         if p: d[p] = { "risk": str(r.get("risk","")).capitalize(), "started_at": str(r.get("started_at","")).strip(),
                        "last_seen": str(r.get("last_seen","")).strip(), "announced_at": str(r.get("announced_at","")).strip(), }
-    try: ws.update("A1", [headers])
+    try: ws.update(range_name="A1", values=[headers])
     except Exception: pass
     return ws, d
 
@@ -434,7 +423,7 @@ def _save_reco_track(ws, d: Dict[str,dict]):
     order = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
     out = [[p, d.get(p,{}).get("risk",""), d.get(p,{}).get("started_at",""),
             d.get(p,{}).get("last_seen",""), d.get(p,{}).get("announced_at","")] for p in order]
-    ws.update("A2", out)
+    ws.update(range_name="A2", values=out)
 
 async def _maybe_send_reco_message(app, sh, fa_sheet: Dict[str,dict]):
     if not RECO_ENABLED or not MASTER_CHAT_ID: return
@@ -470,15 +459,17 @@ async def _maybe_send_reco_message(app, sh, fa_sheet: Dict[str,dict]):
             except Exception: pass
         if announced_ok: reasons.append((pair, row.get("risk"), int((now - start).total_seconds() // 60)))
     if not reasons: return
-    cur_w, reco_w = STATE["weights"].copy(), compute_recommended_weights(cur_w, fa_sheet)
+    cur_w, reco_w = STATE["weights"].copy(), compute_recommended_weights(STATE["weights"].copy(), fa_sheet)
     if _weights_shift_pct(cur_w, reco_w) < RECO_MIN_SHIFT_PCT: return
     rr = ", ".join([f"{p} — {r} ({_fmt_age(m)})" for p, r, m in reasons])
     cmd = f"/setweights jpy={reco_w['JPY']} aud={reco_w['AUD']} eur={reco_w['EUR']} gbp={reco_w['GBP']}"
-    text = (f"⚖️ Рекомендация по весам (риск>{_fmt_age(min_ok)})\n"
-            f"Текущие: {human_readable_weights(cur_w)}\nРекомендованные: {human_readable_weights(reco_w)}\n"
-            f"Команда, если согласен: {cmd}\nОснование: {rr}")
+    text = (f"⚖️ Рекомендация по весам (риск&gt;{_fmt_age(min_ok)})<br>"
+            f"Текущие: { _h(human_readable_weights(cur_w)) }<br>"
+            f"Рекомендованные: { _h(human_readable_weights(reco_w)) }<br>"
+            f"Команда, если согласен: <code>{_h(cmd)}</code><br>"
+            f"Основание: { _h(rr) }")
     try:
-        await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=text)
+        await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
         now_iso = now.isoformat(timespec="seconds")+"Z"
         for pair, _, _ in reasons: track[pair]["announced_at"] = now_iso
         _save_reco_track(ws, track)
@@ -488,15 +479,6 @@ async def _maybe_send_reco_message(app, sh, fa_sheet: Dict[str,dict]):
 def split_total_by_weights(total: float, weights: Dict[str, int]) -> Dict[str, float]:
     s = max(sum(weights.values()), 1)
     return { sym: round(total * weights.get(ASSET_BY_PAIR[sym], 0) / s, 2) for sym in SYMBOLS }
-
-def _fmt_tdelta_human(dt_to: datetime, now: Optional[datetime]=None) -> str:
-    now = now or datetime.now(timezone.utc)
-    sec, sign = int((dt_to - now).total_seconds()), "через" if dt_to >= now else "назад"
-    sec = abs(sec)
-    h, m = sec // 3600, (sec % 3600) // 60
-    if h and m: return f"{h} ч {m:02d} мин {sign}"
-    if h: return f"{h} ч {sign}"
-    return f"{m} мин {sign}"
 
 def assert_master_chat(update: Update) -> bool:
     return not MASTER_CHAT_ID or (update.effective_chat and update.effective_chat.id == MASTER_CHAT_ID)
@@ -556,7 +538,8 @@ async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_alloc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = float(STATE["total"])
     if total <= 0: return await update.message.reply_text("Сначала задайте общий банк: /settotal 2800")
-    w, alloc = STATE["weights"], split_total_by_weights(total, w)
+    w = STATE["weights"]
+    alloc = split_total_by_weights(total, w)
     lines = [f"Целевые веса: {human_readable_weights(w)}", "\nРаспределение:"]
     lines.extend(f"{sym} → {alloc[sym]} USDT → команда в чат {sym}: /setbank {alloc[sym]}" for sym in SYMBOLS)
     await update.message.reply_text("\n".join(lines))
@@ -662,15 +645,6 @@ def _effect_hint(pair: str, origin: Optional[str]) -> str:
         if o == "united states": return "жёстче ФРС → GBP/USD вниз; мягче → вверх."
     return "ястребиный тон укрепляет валюту эмитента, голубиный — ослабляет."
 
-async def _effect_explain_line(pair: str, headline: str, origin: Optional[str]) -> str:
-    if explain_pair_event:
-        try:
-            txt = await explain_pair_event(pair=pair, headline=headline, origin=(origin or ""), lang="ru")
-            if txt and txt.strip():
-                return txt.strip()
-        except Exception: pass
-    return "⚠️ LLM не дал расшифровку; ориентир по эффекту: " + _effect_hint(pair, origin)
-
 def _symbol_hints(symbol: str) -> tuple[str,str]:
     # Fallback for when no news/event is found at all
     if symbol == "USDJPY": return ("Новостей нет. Ориентир — ближайшее заседание FOMC.", "")
@@ -702,12 +676,18 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
              f"•\tСводка рынка: {'движения ровные, резких скачков не ждём до США.'}",
              f"•\tНаша позиция: {side} (на {'рост' if side=='LONG' else 'падение'}), средняя {avg}; следующее докупление {nxt}.",
              f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve}; dca_scale <b>{dca:.2f}</b>."]
-    top_line, origin = _top_news_for_pair(sh, pair, now_utc=datetime.now(timezone.utc))
+    top_line, origin, consensus = _top_news_for_pair(sh, pair, now_utc=datetime.now(timezone.utc))
     if top_line:
         lines.append(f"•\tТоп-новость: {top_line}.")
-        clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line))
-        expl = await _effect_explain_line(pair, clean_hl, origin)
-        if expl: lines.append(f"•\tЧто это значит для цены: {_h(expl)}")
+        clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line)).strip()
+        two_lines = await explain_pair_event(pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus)
+        if two_lines and two_lines.strip():
+            lns = [ln.strip() for ln in two_lines.splitlines() if ln.strip()]
+            for ln in lns[:2]:
+                lines.append("•\t" + _h(ln))
+        else:
+            # единый фоллбэк в любом случае
+            lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
     else:
         what_means, _ = _symbol_hints(pair)
         lines.append(f"•\tЧто это значит для цены: {what_means}")
@@ -740,7 +720,7 @@ def _largest_plan_fact_delta(sh) -> Optional[tuple[str, float, float, float]]:
 
 def build_main_thought(sh, fa_sheet_data: dict) -> str:
     risks = {p: (fa_sheet_data.get(p, {}) or {}).get("risk", "Green") for p in SYMBOLS}
-    reds   = [p for p, r in risks.items() if r == "Red"]
+    reds    = [p for p, r in risks.items() if r == "Red"]
     ambers = [p for p, r in risks.items() if r == "Amber"]
     parts: list[str] = []
     if reds: parts.append("стоп докупок по " + ", ".join(reds))
@@ -750,7 +730,7 @@ def build_main_thought(sh, fa_sheet_data: dict) -> str:
     if ev:
         ts_local = ev["ts"].astimezone(LOCAL_TZ) if LOCAL_TZ else ev["ts"]
         when = f"{ts_local:%H:%M}" if ev["from"] == "news" else f"{ts_local:%Y-%m-%d %H:%M}"
-        parts.append(f"драйвер: {when} — {ev['title']} ({ev['src']})")
+        parts.append(f"драйвер: {when} — {_h(ev['title'])} ({_h(ev['src'])})")
     worst = _largest_plan_fact_delta(sh)
     if worst and abs(worst[3]) >= 0.05:
         sym, plan, fact, d = worst
@@ -798,8 +778,8 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Диагностика --------------------
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def _llm_selfcheck() -> str:
-        if not explain_pair_event:
-            return "LLM: ⚠️ explain_pair_event не подключён (llm_client.py?)"
+        if not _LLM_IMPORTED:
+            return "LLM: ⚠️ llm_client не импортирован"
         try:
             txt = await explain_pair_event(pair="EURUSD",
                                              headline="ECB monetary policy decision",
@@ -895,7 +875,7 @@ async def morning_digest_scheduler(app: Application):
             if sh:
                 fa_sheet_data = _read_fa_signals_from_sheet(sh)
                 msg = await build_digest_text(sh, fa_sheet_data)
-                for chunk in _split_for_tg_html(msg):
+                for chunk in _split_for_tg_html(msg, 3500):
                     await app.bot.send_message(chat_id=MASTER_CHAT_ID, text=chunk, parse_mode=ParseMode.HTML)
                 await _maybe_send_reco_message(app, sh, fa_sheet_data)
             else:
