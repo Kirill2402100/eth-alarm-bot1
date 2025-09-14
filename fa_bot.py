@@ -57,6 +57,9 @@ except Exception:
     async def explain_pair_event(*args, **kwargs) -> str:
         return ""  # Fallback to empty string
 
+# --- Кэш для LLM ---
+_LLM_CACHE = {}
+_LLM_TTL = 1800  # 30 минут
 
 # -------------------- ЛОГИ --------------------
 logging.basicConfig(
@@ -365,6 +368,18 @@ def _strip_html_tags(s: str) -> str:
 
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
+
+def _tidy(s: str) -> str:
+    s = re.sub(r'\s+([,.!?;:])', r'\1', s)
+    s = re.sub(r'([.!?…]){2,}$', r'.', s)
+    return s
+
+def _ru_consensus(consensus: str) -> str:
+    s = (consensus or '').strip().lower()
+    if not s: return "без изменений"
+    if any(w in s for w in ["unchanged","no change","hold","on hold","keep","maintain"]):
+        return "без изменений"
+    return s.replace("bp"," б.п.")
 
 _CB_NAME = {
     "japan": "Банк Японии",
@@ -696,14 +711,14 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
              f"•\tЧто делаем сейчас: {'тихое окно' if risk!='Green' else 'тихое окно не требуется'}; reserve {reserve}; dca_scale <b>{dca:.2f}</b>."]
     top_line, origin, consensus = _top_news_for_pair(sh, pair, now_utc=datetime.now(timezone.utc))
     if top_line:
-        lines.append(f"•\tТоп-новость: {top_line}.")
+        lines.append("•\t" + _h(top_line))
         clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line)).strip()
         if len(clean_hl) < 12:
             clean_hl = _strip_html_tags(top_line).strip()
         
         ans = ""
         try:
-            ans = (await explain_pair_event(
+            ans = (await _explain_cached(
                 pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus
             )) or ""
         except Exception as e:
@@ -723,12 +738,12 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
         
         if shown == 0:
             cb = _CB_NAME.get((origin or "").lower(), (origin or "центробанк"))
-            exp = (consensus or "").strip() or "без изменений"
-            lines.append("•\t" + _h(f"Событие: заседание {cb}."))
-            lines.append("•\t" + _h(f"Ожидания: {exp}."))
+            exp = _ru_consensus(consensus)
+            lines.append("•\t" + _h(_tidy(f"Событие: заседание {cb}.")))
+            lines.append("•\t" + _h(_tidy(f"Ожидания: {exp}.")))
             lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
             t_clues, l_clues = _clues_for_origin(origin or "")
-            lines.append("•\t" + _h(f"Признаки ужесточения: {t_clues}. Признаки смягчения: {l_clues}."))
+            lines.append("•\t" + _h(_tidy(f"Признаки ужесточения: {t_clues}. Признаки смягчения: {l_clues}.")))
         else:
             if not any("что это значит" in ln.lower() for ln in (ans.splitlines())):
                 lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
@@ -938,6 +953,15 @@ async def reco_watch_scheduler(app: Application):
                 await _maybe_send_reco_message(app, sh, fa)
         except Exception: log.exception("reco_watch iteration failed")
         await asyncio.sleep(max(60, RECO_POLL_MIN*60))
+
+async def _explain_cached(**kw):
+    key = (kw.get("pair"), kw.get("headline"))
+    now = asyncio.get_event_loop().time()
+    if key in _LLM_CACHE and now - _LLM_CACHE[key][0] < _LLM_TTL:
+        return _LLM_CACHE[key][1]
+    ans = (await explain_pair_event(**kw)) or ""
+    _LLM_CACHE[key] = (now, ans)
+    return ans
 
 async def _post_init(app: Application):
     # Команды ставим сразу
