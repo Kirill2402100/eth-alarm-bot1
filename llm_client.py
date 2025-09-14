@@ -39,17 +39,23 @@ def _chat_completion(
 ) -> str:
     """Синхронный вызов Chat Completions."""
     client = _client_singleton()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
+
+    params = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
-        temperature=0.2,
-        # В chat.completions нужен max_tokens, а не max_completion_tokens
-        max_tokens=max_completion_tokens,
-        seed=1,  # Для большей детерминированности
-    )
+        "temperature": 0.2,
+        "seed": 1,
+    }
+    # gpt-5 / gpt-4.1+ требуют max_completion_tokens
+    if str(model).startswith(("gpt-5", "o4", "gpt-4.1")):
+        params["max_completion_tokens"] = max_completion_tokens
+    else:
+        params["max_tokens"] = max_completion_tokens
+
+    resp = client.chat.completions.create(**params)
 
     # Робастное извлечение текста
     text = ""
