@@ -680,13 +680,17 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     if top_line:
         lines.append(f"•\tТоп-новость: {top_line}.")
         clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line)).strip()
+        if len(clean_hl) < 12:
+            # если после чистки заголовок почти пустой — возьмём «как есть»
+            clean_hl = _strip_html_tags(top_line).strip()
+        
         two_lines = ""
         try:
             two_lines = await explain_pair_event(pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus)
         except Exception as e:
             log.warning("explain_pair_event call failed in fa_bot: %s", e)
 
-        if two_lines and two_lines.strip():
+        if two_lines and two_lines.strip() and len(two_lines.strip()) >= 10:
             lns = [ln.strip() for ln in two_lines.splitlines() if ln.strip()]
             for ln in lns[:2]:
                 lines.append("•\t" + _h(ln))
