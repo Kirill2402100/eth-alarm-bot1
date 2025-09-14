@@ -900,15 +900,29 @@ async def reco_watch_scheduler(app: Application):
         except Exception: log.exception("reco_watch iteration failed")
         await asyncio.sleep(max(60, RECO_POLL_MIN*60))
 
-async def _start_bg_tasks(context: ContextTypes.DEFAULT_TYPE):
+async def _kickoff_bg_from_jq(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
-    app.create_task(morning_digest_scheduler(app))
-    app.create_task(reco_watch_scheduler(app))
+    # через asyncio.create_task — без PTBUserWarning
+    import asyncio
+    asyncio.create_task(morning_digest_scheduler(app))
+    asyncio.create_task(reco_watch_scheduler(app))
 
 async def _post_init(app: Application):
     await _set_bot_commands(app)
-    # Запускаем фоновые циклы сразу после старта приложения — без PTBUserWarning
-    app.job_queue.run_once(_start_bg_tasks, when=0)
+    jq = getattr(app, "job_queue", None)
+    if jq is not None:
+        # Если JobQueue есть — стартуем через него
+        jq.run_once(_kickoff_bg_from_jq, when=0)
+    else:
+        # Фоллбэк без JobQueue: стартуем чуть позже через asyncio,
+        # чтобы не создавать таски до запуска приложения
+        async def _delayed_start():
+            import asyncio
+            await asyncio.sleep(0)
+            asyncio.create_task(morning_digest_scheduler(app))
+            asyncio.create_task(reco_watch_scheduler(app))
+        import asyncio
+        asyncio.get_running_loop().create_task(_delayed_start())
 
 def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
