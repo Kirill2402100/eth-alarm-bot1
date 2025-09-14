@@ -684,18 +684,31 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
             # если после чистки заголовок почти пустой — возьмём «как есть»
             clean_hl = _strip_html_tags(top_line).strip()
         
-        two_lines = ""
+        ans = ""
         try:
-            two_lines = await explain_pair_event(pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus)
+            ans = (await explain_pair_event(
+                pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus
+            )) or ""
         except Exception as e:
             log.warning("explain_pair_event call failed in fa_bot: %s", e)
+        
+        ans = ans.strip()
+        log.debug("LLM explain_pair_event(%s): %r", pair, ans)
 
-        if two_lines and two_lines.strip() and len(two_lines.strip()) >= 10:
-            lns = [ln.strip() for ln in two_lines.splitlines() if ln.strip()]
-            for ln in lns[:2]:
+        if ans:
+            # нормализуем и берём до 4 строк
+            lns = [re.sub(r"\s+", " ", ln.strip()) for ln in ans.splitlines() if ln.strip()]
+            shown = 0
+            for ln in lns:
                 lines.append("•\t" + _h(ln))
+                shown += 1
+                if shown >= 4:
+                    break
+            # если модель ничего про «Что это значит» не сказала — добавим краткий вывод сами
+            if not any("что это значит" in ln.lower() for ln in lns):
+                lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
         else:
-            # единый фоллбэк в любом случае
+            # единый фоллбэк
             lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
     else:
         what_means, _ = _symbol_hints(pair)
