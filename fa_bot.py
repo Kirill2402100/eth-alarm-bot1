@@ -366,6 +366,24 @@ def _strip_html_tags(s: str) -> str:
 def human_readable_weights(w: Dict[str, int]) -> str:
     return f"JPY {w.get('JPY', 0)} / AUD {w.get('AUD', 0)} / EUR {w.get('EUR', 0)} / GBP {w.get('GBP', 0)}"
 
+_CB_NAME = {
+    "japan": "Банк Японии",
+    "australia": "РБА",
+    "euro area": "ЕЦБ",
+    "united kingdom": "Банк Англии",
+    "united states": "ФРС",
+}
+
+def _clues_for_origin(origin: str) -> tuple[str, str]:
+    o = (origin or "").lower()
+    if o == "japan":
+        tight = "поднимут ставку, ужесточат/сузят YCC, сократят покупки JGB"
+        loose = "намёк на паузу/снижение, ослабят YCC, увеличат покупки JGB"
+    else:
+        tight = "поднимут ставку, ускорят QT/сократят QE, жёсткая риторика"
+        loose = "намёк на паузу/снижение, расширят QE/замедлят QT, мягкая риторика"
+    return tight, loose
+
 # ---- helpers: рекомендации по весам ----
 def _normalize_int_weights(weight_floats: Dict[str, float], keep_total: int) -> Dict[str, int]:
     floors = {k: int(v) for k, v in weight_floats.items()}
@@ -681,7 +699,6 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
         lines.append(f"•\tТоп-новость: {top_line}.")
         clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line)).strip()
         if len(clean_hl) < 12:
-            # если после чистки заголовок почти пустой — возьмём «как есть»
             clean_hl = _strip_html_tags(top_line).strip()
         
         ans = ""
@@ -695,21 +712,26 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
         ans = ans.strip()
         log.debug("LLM explain_pair_event(%s): %r", pair, ans)
 
+        shown = 0
         if ans:
-            # нормализуем и берём до 4 строк
             lns = [re.sub(r"\s+", " ", ln.strip()) for ln in ans.splitlines() if ln.strip()]
-            shown = 0
             for ln in lns:
                 lines.append("•\t" + _h(ln))
                 shown += 1
                 if shown >= 4:
                     break
-            # если модель ничего про «Что это значит» не сказала — добавим краткий вывод сами
-            if not any("что это значит" in ln.lower() for ln in lns):
-                lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
-        else:
-            # единый фоллбэк
+        
+        if shown == 0:
+            cb = _CB_NAME.get((origin or "").lower(), (origin or "центробанк"))
+            exp = (consensus or "").strip() or "без изменений"
+            lines.append("•\t" + _h(f"Событие: заседание {cb}."))
+            lines.append("•\t" + _h(f"Ожидания: {exp}."))
             lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
+            t_clues, l_clues = _clues_for_origin(origin or "")
+            lines.append("•\t" + _h(f"Признаки ужесточения: {t_clues}. Признаки смягчения: {l_clues}."))
+        else:
+            if not any("что это значит" in ln.lower() for ln in (ans.splitlines())):
+                lines.append("•\t" + _h("Что это значит: " + _effect_hint(pair, origin)))
     else:
         what_means, _ = _symbol_hints(pair)
         lines.append(f"•\tЧто это значит для цены: {what_means}")
