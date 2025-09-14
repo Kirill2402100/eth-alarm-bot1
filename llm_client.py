@@ -186,35 +186,63 @@ async def generate_digest(
 
 # ----------------- FX event explainer -----------------
 
-def _effect_hint(pair: str, origin: str) -> str:
-    p = pair.upper().strip()
-    o = (origin or "").lower().strip()
-    if p == "USDJPY":
-        if o in ("united states", "us", "usa", "fomc", "federal reserve"):
-            return "Жёстче ФРС → доллар сильнее → USD/JPY вверх; мягче ФРС → USD/JPY вниз."
-        if o in ("japan", "boj", "bank of japan"):
-            return "Жёстче BoJ → иена сильнее → USD/JPY вниз; мягче BoJ → USD/JPY вверх."
-    if p == "AUDUSD":
-        if o in ("australia", "rba", "reserve bank of australia"):
-            return "Жёстче РБА → AUD/USD вверх; мягче РБА → AUD/USD вниз."
-        if o in ("united states", "us", "usa", "fomc", "federal reserve"):
-            return "Жёстче ФРС → доллар сильнее → AUD/USD вниз; мягче ФРС → AUD/USD вверх."
-    if p == "EURUSD":
-        if o in ("euro area", "eurozone", "ecb", "european central bank"):
-            return "Жёстче ЕЦБ → EUR/USD вверх; мягче ЕЦБ → EUR/USD вниз."
-        if o in ("united states", "us", "usa", "fomc", "federal reserve"):
-            return "Жёстче ФРС → EUR/USD вниз; мягче ФРС → EUR/USD вверх."
-    if p == "GBPUSD":
-        if o in ("united kingdom", "uk", "boe", "bank of england"):
-            return "Жёстче Банк Англии → GBP/USD вверх; мягче → GBP/USD вниз."
-        if o in ("united states", "us", "usa", "fomc", "federal reserve"):
-            return "Жёстче ФРС → GBP/USD вниз; мягче ФРС → GBP/USD вверх."
-    return "Ястребиный исход укрепляет валюту источника; голубиный — ослабляет, пара двигается соответственно."
+def _origin_profile(origin: str) -> dict:
+    o = (origin or "").lower()
+    if "japan" in o or "boj" in o:
+        return {
+            "ccy": "JPY",
+            "consensus": "ставку оставят как есть",
+            "hawk": "поднимут ставку или усилят ограничения по доходности облигаций; сократят покупки госбумаг",
+            "dove": "дадут понять о паузе или снижении ставки; ослабят ограничения; увеличат покупки госбумаг",
+        }
+    if "australia" in o or "rba" in o:
+        return {
+            "ccy": "AUD",
+            "consensus": "ставку оставят как есть",
+            "hawk": "скажут, что бороться с инфляцией будут жёстче или поднимут ставку",
+            "dove": "намекнут на паузу или снижение ставки; мягкий тон",
+        }
+    if "ecb" in o or "euro" in o:
+        return {
+            "ccy": "EUR",
+            "consensus": "ставку без изменений",
+            "hawk": "поднимут ставку или дадут жёсткие сигналы; быстрее сократят покупки облигаций",
+            "dove": "дадут мягкие сигналы или намёк на снижение; медленнее будут сворачивать стимулы",
+        }
+    if "boe" in o or "england" in o or "uk" in o:
+        return {
+            "ccy": "GBP",
+            "consensus": "ставку без изменений",
+            "hawk": "поднимут ставку или результаты голосования будут за ужесточение",
+            "dove": "намёк на снижение или паузу; мягкий тон",
+        }
+    return {
+        "ccy": "USD",
+        "consensus": "ставку без изменений",
+        "hawk": "поднимут ставку или ужесточат риторику; быстрее сократят стимулы",
+        "dove": "намекнут на паузу или снижение; смягчат риторику",
+    }
 
-def _two_line_fallback(pair: str, origin: str, headline: str) -> str:
-    event = (headline or "Ключевое событие по регулятору").strip()
-    impact = _effect_hint(pair, origin)
-    return f"Событие: {event}\nВлияние: {impact}"
+def _pair_dir_phrase(pair: str, ccy: str, *, stronger: bool) -> str:
+    pretty = {"USDJPY": "USD/JPY", "AUDUSD": "AUD/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
+    pair_disp = pretty.get(pair, f"{pair[:3]}/{pair[3:]}")
+    if ccy == pair[:3]:  # базовая валюта
+        direction = "вверх" if stronger else "вниз"
+    else:  # котируемая валюта
+        direction = "вниз" if stronger else "вверх"
+    return f"{pair_disp} {direction}"
+
+def _two_line_fallback(pair: str, origin: str, headline: str, consensus: Optional[str] = None) -> str:
+    prof = _origin_profile(origin)
+    cons = (consensus or prof["consensus"]).strip().rstrip(".")
+    hawk_dir = _pair_dir_phrase(pair, prof["ccy"], stronger=True)
+    dove_dir = _pair_dir_phrase(pair, prof["ccy"], stronger=False)
+    line1 = f"Событие: {headline.strip()}. Ожидания: {cons}."
+    line2 = (
+        f"Что это значит: если ужесточат политику — {hawk_dir}; если смягчат — {dove_dir}. "
+        f"Признаки ужесточения: {prof['hawk']}. Признаки смягчения: {prof['dove']}."
+    )
+    return line1 + "\n" + line2
 
 async def explain_pair_event(
     pair: str,
@@ -222,48 +250,57 @@ async def explain_pair_event(
     origin: str = "",
     lang: str = "ru",
     model: Optional[str] = None,
+    consensus: Optional[str] = None,
 ) -> str:
     mdl = (model or LLM_MINI).strip()
     pair = (pair or "").upper().strip()
+    prof = _origin_profile(origin)
+    cons = (consensus or prof["consensus"]).strip().rstrip(".")
+
+    # Подсказки для LLM
+    hawk_dir = _pair_dir_phrase(pair, prof["ccy"], stronger=True)
+    dove_dir = _pair_dir_phrase(pair, prof["ccy"], stronger=False)
     pretty = {"USDJPY": "USD/JPY", "AUDUSD": "AUD/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
     pair_disp = pretty.get(pair, f"{pair[:3]}/{pair[3:]}")
 
     system = (
-        "Ты валютный аналитик. Ответ строго в две строки на русском:\n"
-        "1) 'Событие: <очень кратко>'\n"
-        "2) 'Влияние: <как ястребиный и голубиный исход сдвинут пару>'\n"
-        "Без цен, эмодзи и вероятностей."
+        "Ты финансовый комментатор для начинающих инвесторов. Пиши очень простыми словами, без жаргона и аббревиатур. "
+        "Если термин неизбежен, дай короткое пояснение в скобках: например, 'ставка (цена кредита)'. "
+        "Вывод строго в ДВЕ строки:\n"
+        "1) 'Событие: <что это>; Ожидания: <на что рынок рассчитывает>.'\n"
+        "2) 'Что это значит: если сигналы про ужесточение — <направление пары>; если про смягчение — <направление пары>. "
+        "Признаки: <2–3 простых примера для каждого случая>.'\n"
+        "Никаких цен, процентов вероятности, эмодзи и дисклеймеров."
     )
     user = (
         f"Пара: {pair_disp}\n"
         f"Источник: {origin or 'unknown'}\n"
-        f"Событие/заголовок: {headline.strip()}\n\n"
-        f"Помни: усиление валюты стороны события влияет на {pair_disp} с учётом того, базовая она или котируемая."
+        f"Заголовок события: {headline.strip()}\n"
+        f"Консенсус-ожидание: {cons}\n"
+        f"Признаки ужесточения (простыми словами): {prof['hawk']}\n"
+        f"Признаки смягчения (простыми словами): {prof['dove']}\n"
+        f"Направления для пары: при ужесточении → {hawk_dir}; при смягчении → {dove_dir}."
     )
 
     try:
         text = await _chat_completion_async(
-            model=mdl, system=system, user=user, max_completion_tokens=140
+            model=mdl, system=system, user=user, max_completion_tokens=200
         )
-        text = (text or "").strip()
-        if not text:
-            # Никакой паники в логах — используем умный фоллбэк
-            log.warning("explain_pair_event: empty model output; using fallback (pair=%s, origin=%s, headline=%s)",
-                        pair, origin, headline)
-            return _two_line_fallback(pair, origin, headline)
-
-        # Нормализуем под 2 строки, усекая слишком длинные
-        lines = [ln.strip()[:300] for ln in text.splitlines() if ln.strip()]
-        if len(lines) == 1:
-            return _two_line_fallback(pair, origin, headline)
+        # Нормализация + ограничение длины каждой строки
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if len(lines) < 2:
+            raise RuntimeError("empty/short model output")
         if not lines[0].lower().startswith("событие:"):
             lines[0] = "Событие: " + lines[0]
-        if not lines[1].lower().startswith("влияние:"):
-            lines[1] = "Влияние: " + lines[1]
+        if "Ожидания:" not in lines[0]:
+            lines[0] += f" Ожидания: {cons}."
+        if not (lines[1].lower().startswith("что это значит:") or lines[1].lower().startswith("импульс:")):
+            lines[1] = "Что это значит: " + lines[1]
+        lines = [lines[0][:220], lines[1][:240]]
         return lines[0] + "\n" + lines[1]
     except Exception as e:
         log.warning("explain_pair_event: %s; using fallback (pair=%s, origin=%s)", e, pair, origin)
-        return _two_line_fallback(pair, origin, headline)
+        return _two_line_fallback(pair, origin, headline, consensus=cons)
 
 
 __all__ = [
