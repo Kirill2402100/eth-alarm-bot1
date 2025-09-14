@@ -37,10 +37,7 @@ def _chat_completion(
     user: str,
     max_completion_tokens: int = DEFAULT_MAX_OUT_TOKENS,
 ) -> str:
-    """
-    Синхронный вызов Chat Completions.
-    Важно: НЕ передаём temperature/max_tokens и т.п. — многие модели gpt-5 их игнорируют.
-    """
+    """Синхронный вызов Chat Completions."""
     client = _client_singleton()
     resp = client.chat.completions.create(
         model=model,
@@ -48,14 +45,29 @@ def _chat_completion(
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
-        # только поддерживаемый параметр:
-        max_completion_tokens=max_completion_tokens,
+        temperature=0.2,
+        # В chat.completions нужен max_tokens, а не max_completion_tokens
+        max_tokens=max_completion_tokens,
+        seed=1,  # Для большей детерминированности
     )
+
+    # Робастное извлечение текста
+    text = ""
     try:
-        text = (resp.choices[0].message.content or "").strip()
+        choice = resp.choices[0]
+        msg = getattr(choice, "message", None)
+        if getattr(msg, "tool_calls", None):  # если модель решила вызвать tool
+            return ""  # заставим сработать fallback в вызывающем коде
+        if msg is not None:
+            c = getattr(msg, "content", None)
+            if isinstance(c, str):
+                text = c
+            elif isinstance(c, list):  # на всякий случай, если SDK вернёт списком частей
+                text = "".join([getattr(part, "text", "") or "" for part in c]).strip()
     except Exception:
         text = ""
-    return text
+    # Усекаем слишком длинные ответы
+    return (text or "").strip()[:1200]
 
 
 async def _chat_completion_async(
@@ -199,6 +211,11 @@ def _effect_hint(pair: str, origin: str) -> str:
             return "Жёстче ФРС → GBP/USD вниз; мягче ФРС → GBP/USD вверх."
     return "Ястребиный исход укрепляет валюту источника; голубиный — ослабляет, пара двигается соответственно."
 
+def _two_line_fallback(pair: str, origin: str, headline: str) -> str:
+    event = (headline or "Ключевое событие по регулятору").strip()
+    impact = _effect_hint(pair, origin)
+    return f"Событие: {event}\nВлияние: {impact}"
+
 async def explain_pair_event(
     pair: str,
     headline: str,
@@ -206,43 +223,47 @@ async def explain_pair_event(
     lang: str = "ru",
     model: Optional[str] = None,
 ) -> str:
-    """
-    Коротко объясняет, что означает событие для FX-пары.
-    Возвращает 1–2 фразы (без эмодзи, цен, вероятностей).
-    """
     mdl = (model or LLM_MINI).strip()
     pair = (pair or "").upper().strip()
     pretty = {"USDJPY": "USD/JPY", "AUDUSD": "AUD/USD", "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD"}
     pair_disp = pretty.get(pair, f"{pair[:3]}/{pair[3:]}")
 
     system = (
-        "Ты валютный аналитик. Пиши кратко и по делу, на русском. "
-        "Цель — объяснить направление пары от новости. Никаких цен, эмодзи, вероятностей и дисклеймеров. 1–2 короткие фразы."
+        "Ты валютный аналитик. Ответ строго в две строки на русском:\n"
+        "1) 'Событие: <очень кратко>'\n"
+        "2) 'Влияние: <как ястребиный и голубиный исход сдвинут пару>'\n"
+        "Без цен, эмодзи и вероятностей."
     )
-    lang_note = "на русском" if (lang or "ru").lower().startswith("ru") else "in concise English"
     user = (
         f"Пара: {pair_disp}\n"
-        f"Источник (страна/регулятор): {origin or 'unknown'}\n"
+        f"Источник: {origin or 'unknown'}\n"
         f"Событие/заголовок: {headline.strip()}\n\n"
-        f"Требование ({lang_note}):\n"
-        f"- Объясни, как ястребиный (жёстче ожиданий) и голубиный (мягче ожиданий) исход влияет на {pair_disp}.\n"
-        f"- Учитывай, что усиление валюты стороны события поднимает/опускает пару, "
-        f"в зависимости от того, базовая или котируемая она в {pair_disp}.\n"
-        f"- Формат: одна-две фразы, без списков."
+        f"Помни: усиление валюты стороны события влияет на {pair_disp} с учётом того, базовая она или котируемая."
     )
 
     try:
         text = await _chat_completion_async(
             model=mdl, system=system, user=user, max_completion_tokens=140
         )
-        text = " ".join((text or "").split())
+        text = (text or "").strip()
         if not text:
-            raise RuntimeError("empty model output")
-        return text[:400] if len(text) > 400 else text
+            # Никакой паники в логах — используем умный фоллбэк
+            log.warning("explain_pair_event: empty model output; using fallback (pair=%s, origin=%s, headline=%s)",
+                        pair, origin, headline)
+            return _two_line_fallback(pair, origin, headline)
+
+        # Нормализуем под 2 строки, усекая слишком длинные
+        lines = [ln.strip()[:300] for ln in text.splitlines() if ln.strip()]
+        if len(lines) == 1:
+            return _two_line_fallback(pair, origin, headline)
+        if not lines[0].lower().startswith("событие:"):
+            lines[0] = "Событие: " + lines[0]
+        if not lines[1].lower().startswith("влияние:"):
+            lines[1] = "Влияние: " + lines[1]
+        return lines[0] + "\n" + lines[1]
     except Exception as e:
-        # Детальный лог + умный локальный фолбэк
-        log.error("explain_pair_event error: %s (pair=%s, origin=%s, headline=%s)", e, pair, origin, headline)
-        return _effect_hint(pair, origin)
+        log.warning("explain_pair_event: %s; using fallback (pair=%s, origin=%s)", e, pair, origin)
+        return _two_line_fallback(pair, origin, headline)
 
 
 __all__ = [
