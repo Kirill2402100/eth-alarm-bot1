@@ -680,7 +680,12 @@ async def render_morning_pair_block(sh, pair, row: dict, fa_data: dict) -> str:
     if top_line:
         lines.append(f"•\tТоп-новость: {top_line}.")
         clean_hl = _clean_headline_for_llm(_strip_html_tags(top_line)).strip()
-        two_lines = await explain_pair_event(pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus)
+        two_lines = ""
+        try:
+            two_lines = await explain_pair_event(pair=pair, headline=clean_hl, origin=(origin or ""), lang="ru", consensus=consensus)
+        except Exception as e:
+            log.warning("explain_pair_event call failed in fa_bot: %s", e)
+
         if two_lines and two_lines.strip():
             lns = [ln.strip() for ln in two_lines.splitlines() if ln.strip()]
             for ln in lns[:2]:
@@ -895,10 +900,15 @@ async def reco_watch_scheduler(app: Application):
         except Exception: log.exception("reco_watch iteration failed")
         await asyncio.sleep(max(60, RECO_POLL_MIN*60))
 
-async def _post_init(app: Application):
-    await _set_bot_commands(app)
+async def _start_bg_tasks(context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
     app.create_task(morning_digest_scheduler(app))
     app.create_task(reco_watch_scheduler(app))
+
+async def _post_init(app: Application):
+    await _set_bot_commands(app)
+    # Запускаем фоновые циклы сразу после старта приложения — без PTBUserWarning
+    app.job_queue.run_once(_start_bg_tasks, when=0)
 
 def build_application() -> Application:
     if not BOT_TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
