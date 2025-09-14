@@ -46,15 +46,9 @@ def _chat_completion(
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
-        "temperature": 0.2,
-        "seed": 1,
+        "max_completion_tokens": max_completion_tokens,
     }
-    # gpt-5 / gpt-4.1+ требуют max_completion_tokens
-    if str(model).startswith(("gpt-5", "o4", "gpt-4.1")):
-        params["max_completion_tokens"] = max_completion_tokens
-    else:
-        params["max_tokens"] = max_completion_tokens
-
+    
     resp = client.chat.completions.create(**params)
 
     # Робастное извлечение текста
@@ -62,17 +56,17 @@ def _chat_completion(
     try:
         choice = resp.choices[0]
         msg = getattr(choice, "message", None)
-        if getattr(msg, "tool_calls", None):  # если модель решила вызвать tool
-            return ""  # заставим сработать fallback в вызывающем коде
+        if getattr(msg, "tool_calls", None):
+            return ""
         if msg is not None:
             c = getattr(msg, "content", None)
             if isinstance(c, str):
                 text = c
-            elif isinstance(c, list):  # на всякий случай, если SDK вернёт списком частей
+            elif isinstance(c, list):
                 text = "".join([getattr(part, "text", "") or "" for part in c]).strip()
     except Exception:
         text = ""
-    # Усекаем слишком длинные ответы
+    
     return (text or "").strip()[:1200]
 
 
@@ -313,7 +307,6 @@ __all__ = [
     "quick_classify",
     "fx_digest_ru",
     "deep_analysis",
-    "generate_digest",
     "llm_ping",
     "explain_pair_event",
 ]
