@@ -11,12 +11,14 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы в переменных окружения")
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы в переменных окружения"
+    )
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-# ------------ хранилище сигналов (в памяти) ------------
 
+# ------------ хранилище сигналов (в памяти) ------------
 
 class SignalStore:
     """
@@ -54,24 +56,18 @@ class SignalStore:
 
 store = SignalStore()
 
+
 # ------------ утилиты ------------
 
-
 def send_telegram(text: str):
-    """
-    Отправка сообщения в Telegram.
-    Временно без parse_mode, чтобы исключить ошибки форматирования.
-    Печатаем ответ Telegram в логи Railway.
-    """
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        # После отладки можно снова включить Markdown:
-        # "parse_mode": "Markdown",
+        "parse_mode": "Markdown",
     }
     try:
         resp = requests.post(TELEGRAM_API_URL, json=data, timeout=5)
-        print("Telegram response:", resp.status_code, resp.text)
+        print("Telegram response status:", resp.status_code, resp.text)
     except Exception as e:
         print("Error sending telegram:", e)
 
@@ -85,8 +81,8 @@ def format_group_message(payload: dict) -> str:
 
     arrow = "🔼" if direction == "BUY" else "🔻"
     header = (
-        f"ГРУППА {group_id} — {direction} {arrow}\n"
-        f"Пара: {pair}  Цена: {price}\n\n"
+        f"*ГРУППА {group_id} — {direction}* {arrow}\n"
+        f"Пара: `{pair}`  Цена: *{price}*\n\n"
     )
     return header + text_extra
 
@@ -102,12 +98,12 @@ def format_main_message(time_key: str, buy_groups, sell_groups, price, pair):
         groups_str = ", ".join(str(g) for g in sell_groups)
 
     header = (
-        f"MAIN SIGNAL — {direction} {arrow}\n"
-        f"Пара: {pair}  Цена: {price}\n"
-        f"Время бара: {time_key}\n\n"
+        f"*MAIN SIGNAL — {direction}* {arrow}\n"
+        f"Пара: `{pair}`  Цена: *{price}*\n"
+        f"Время бара: `{time_key}`\n\n"
     )
     body = (
-        f"Совпали сигналы групп: {groups_str} (минимум 2 из 4).\n"
+        f"Совпали сигналы групп: *{groups_str}* (минимум 2 из 4).\n"
         f"Это сильная точка возможного разворота."
     )
     return header + body
@@ -127,14 +123,22 @@ def try_emit_main_signal(time_key: str, last_payload: dict):
 
     if len(buy_groups) >= 2 and len(sell_groups) == 0:
         msg = format_main_message(
-            time_key, buy_groups, [], last_payload.get("price"), last_payload.get("pair")
+            time_key,
+            buy_groups,
+            [],
+            last_payload.get("price"),
+            last_payload.get("pair"),
         )
         send_telegram(msg)
         store.mark_main_sent(time_key)
 
     elif len(sell_groups) >= 2 and len(buy_groups) == 0:
         msg = format_main_message(
-            time_key, [], sell_groups, last_payload.get("price"), last_payload.get("pair")
+            time_key,
+            [],
+            sell_groups,
+            last_payload.get("price"),
+            last_payload.get("pair"),
         )
         send_telegram(msg)
         store.mark_main_sent(time_key)
@@ -153,10 +157,9 @@ def index():
 @app.route("/test-telegram", methods=["GET"])
 def test_telegram():
     """
-    Простой тест: дергаешь этот URL в браузере,
-    бот должен отправить тестовое сообщение в Telegram.
+    Простой тест связи с Telegram.
     """
-    send_telegram("Тестовое сообщение из Railway: всё подключено ✅")
+    send_telegram("Тест от TradingView-бота: связь с Telegram работает ✅")
     return "ok", 200
 
 
@@ -226,6 +229,35 @@ def tradingview_webhook():
 
     # если тип неизвестен
     return jsonify({"status": "ignored"}), 200
+
+
+@app.route("/debug-group-test", methods=["GET"])
+def debug_group_test():
+    """
+    Простой тест: имитируем сигнал ГРУППА 1 BUY и шлём в Telegram.
+    Используется только для отладки, без TradingView.
+    """
+    payload = {
+        "type": "group",
+        "group_id": 1,
+        "direction": "BUY",
+        "pair": "EURUSD",
+        "price": "1.2345",
+        "time": "TEST-DEBUG",
+        "text": (
+            "ГРУППА 1 — BUY (debug)\n"
+            "Цена: 1.2345\n\n"
+            "Направление: 🔼 Возможный разворот ВВЕРХ\n\n"
+            "Условия сработки:\n"
+            "• Тестовое сообщение с сервера\n"
+            "• Если ты это видишь, значит webhook → Telegram работает ✅"
+        ),
+    }
+
+    text = format_group_message(payload)
+    send_telegram(text)
+
+    return "debug ok", 200
 
 
 if __name__ == "__main__":
