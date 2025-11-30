@@ -1,2 +1,1 @@
-worker: python -u fa_bot.py
-
+web: gunicorn app:app --bind 0.0.0.0:8080
