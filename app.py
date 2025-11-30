@@ -11,12 +11,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы в переменных окружения"
-    )
+    raise RuntimeError("TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы в переменных окружения")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
 
 # ------------ хранилище сигналов (в памяти) ------------
 
@@ -56,18 +53,21 @@ class SignalStore:
 
 store = SignalStore()
 
-
 # ------------ утилиты ------------
 
 def send_telegram(text: str):
+    """
+    Отправка сообщения в Telegram.
+    Упрощённый вариант без Markdown, чтобы исключить ошибки форматирования.
+    """
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        # "parse_mode": "Markdown",  # пока выключено
     }
     try:
-        resp = requests.post(TELEGRAM_API_URL, json=data, timeout=5)
-        print("Telegram response status:", resp.status_code, resp.text)
+        resp = requests.post(TELEGRAM_API_URL, data=data, timeout=5)
+        print("Telegram response:", resp.status_code, resp.text)
     except Exception as e:
         print("Error sending telegram:", e)
 
@@ -80,10 +80,7 @@ def format_group_message(payload: dict) -> str:
     text_extra = payload.get("text", "")
 
     arrow = "🔼" if direction == "BUY" else "🔻"
-    header = (
-        f"*ГРУППА {group_id} — {direction}* {arrow}\n"
-        f"Пара: `{pair}`  Цена: *{price}*\n\n"
-    )
+    header = f"ГРУППА {group_id} — {direction} {arrow}\nПара: {pair}  Цена: {price}\n\n"
     return header + text_extra
 
 
@@ -98,14 +95,11 @@ def format_main_message(time_key: str, buy_groups, sell_groups, price, pair):
         groups_str = ", ".join(str(g) for g in sell_groups)
 
     header = (
-        f"*MAIN SIGNAL — {direction}* {arrow}\n"
-        f"Пара: `{pair}`  Цена: *{price}*\n"
-        f"Время бара: `{time_key}`\n\n"
+        f"MAIN SIGNAL — {direction} {arrow}\n"
+        f"Пара: {pair}  Цена: {price}\n"
+        f"Время бара: {time_key}\n\n"
     )
-    body = (
-        f"Совпали сигналы групп: *{groups_str}* (минимум 2 из 4).\n"
-        f"Это сильная точка возможного разворота."
-    )
+    body = f"Совпали сигналы групп: {groups_str} (минимум 2 из 4).\nЭто сильная точка возможного разворота."
     return header + body
 
 
@@ -154,20 +148,85 @@ def index():
     return "TradingView webhook bot is running", 200
 
 
+# --- отладочные ручки ---
+
 @app.route("/test-telegram", methods=["GET"])
 def test_telegram():
     """
-    Простой тест связи с Telegram.
+    Простейший тест отправки сообщения через нашу send_telegram.
     """
-    send_telegram("Тест от TradingView-бота: связь с Telegram работает ✅")
+    send_telegram("Тестовое сообщение из /test-telegram ✅")
     return "ok", 200
 
+
+@app.route("/debug-group-test", methods=["GET"])
+def debug_group_test():
+    """
+    Тестируем полный проход логики group-сигнала (группа 1 BUY).
+    """
+    payload = {
+        "type": "group",
+        "group_id": 1,
+        "direction": "BUY",
+        "pair": "EURUSD",
+        "price": "1.1000",
+        "time": "2025-11-30T15:00",
+        "text": "ГРУППА 1 — BUY (тест через /debug-group-test)",
+    }
+
+    time_key = str(payload["time"])
+    store.add_group_signal(time_key, payload["group_id"], payload["direction"], payload)
+    text = format_group_message(payload)
+    send_telegram(text)
+    try_emit_main_signal(time_key, payload)
+
+    return jsonify({"status": "DEBUG OK"}), 200
+
+
+@app.route("/telegram-api-debug", methods=["GET"])
+def telegram_api_debug():
+    """
+    Проверяем, жив ли бот-токен Telegram (getMe).
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+    try:
+        r = requests.get(url, timeout=5)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return jsonify({"status_code": r.status_code, "body": body})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/telegram-send-plain", methods=["GET"])
+def telegram_send_plain():
+    """
+    Прямой тест отправки сообщения в Telegram без участия send_telegram.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": "Plain test message from Railway bot 👋",
+    }
+    try:
+        r = requests.post(url, data=data, timeout=5)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return jsonify({"status_code": r.status_code, "body": body})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- основной вебхук для TradingView ---
 
 @app.route("/tradingview-webhook", methods=["POST"])
 def tradingview_webhook():
     try:
         raw = request.data.decode("utf-8")
-        # TradingView шлёт строку = наш JSON из Message
         payload = json.loads(raw)
     except Exception as e:
         print("Bad payload:", e, "raw:", request.data)
@@ -181,7 +240,7 @@ def tradingview_webhook():
     time_key = str(payload.get("time"))
     pair = payload.get("pair", "EURUSD")
 
-    # ---------- type = "group" (группы 1,2,4 и позже 3) ----------
+    # ---------- type = "group" (группы 1,2,4 и потом виртуальная 3) ----------
     if p_type == "group":
         store.add_group_signal(time_key, group_id, direction, payload)
 
@@ -199,9 +258,8 @@ def tradingview_webhook():
         indicator = payload.get("indicator")
         store.add_micro_g3(time_key, direction, indicator)
 
-        # когда все три индикатора в одну сторону — считаем это signal group 3
+        # когда все три индикатора в одну сторону — считаем это сигналом группы 3
         if store.has_full_g3(time_key, direction):
-            # формируем виртуальный group_3 сигнал
             g3_payload = {
                 "type": "group",
                 "group_id": 3,
@@ -217,49 +275,17 @@ def tradingview_webhook():
 
             store.add_group_signal(time_key, 3, direction, g3_payload)
 
-            # отправляем сообщение по группе 3
             text = format_group_message(g3_payload)
             send_telegram(text)
 
-            # пробуем собрать MAIN
             try_emit_main_signal(time_key, g3_payload)
 
-        # по самим micro-сигналам можно в телегу пока ничего не слать
         return jsonify({"status": "ok", "kind": "micro"})
 
-    # если тип неизвестен
+    # неизвестный тип
     return jsonify({"status": "ignored"}), 200
-
-
-@app.route("/debug-group-test", methods=["GET"])
-def debug_group_test():
-    """
-    Простой тест: имитируем сигнал ГРУППА 1 BUY и шлём в Telegram.
-    Используется только для отладки, без TradingView.
-    """
-    payload = {
-        "type": "group",
-        "group_id": 1,
-        "direction": "BUY",
-        "pair": "EURUSD",
-        "price": "1.2345",
-        "time": "TEST-DEBUG",
-        "text": (
-            "ГРУППА 1 — BUY (debug)\n"
-            "Цена: 1.2345\n\n"
-            "Направление: 🔼 Возможный разворот ВВЕРХ\n\n"
-            "Условия сработки:\n"
-            "• Тестовое сообщение с сервера\n"
-            "• Если ты это видишь, значит webhook → Telegram работает ✅"
-        ),
-    }
-
-    text = format_group_message(payload)
-    send_telegram(text)
-
-    return "debug ok", 200
 
 
 if __name__ == "__main__":
     # локальный запуск: python app.py
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=True)
