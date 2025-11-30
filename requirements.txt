@@ -1,10 +1,3 @@
-python-telegram-bot[rate-limiter]==20.7
-openai>=1.40.0
-gspread>=6.0.0
-google-auth>=2.25.0
-python-dotenv>=1.0.1
-# scraping
-requests>=2.32.3
-beautifulsoup4>=4.12.3
-# парсер для bs4; можно не ставить lxml, встроенного html.parser хватит
-html5lib>=1.1
+flask==3.0.0
+requests==2.31.0
+gunicorn==21.2.0
