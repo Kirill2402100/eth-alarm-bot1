@@ -17,6 +17,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessag
 
 # ------------ хранилище сигналов (в памяти) ------------
 
+
 class SignalStore:
     """
     Простое in-memory хранилище:
@@ -55,14 +56,22 @@ store = SignalStore()
 
 # ------------ утилиты ------------
 
+
 def send_telegram(text: str):
+    """
+    Отправка сообщения в Telegram.
+    Временно без parse_mode, чтобы исключить ошибки форматирования.
+    Печатаем ответ Telegram в логи Railway.
+    """
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        # После отладки можно снова включить Markdown:
+        # "parse_mode": "Markdown",
     }
     try:
-        requests.post(TELEGRAM_API_URL, json=data, timeout=5)
+        resp = requests.post(TELEGRAM_API_URL, json=data, timeout=5)
+        print("Telegram response:", resp.status_code, resp.text)
     except Exception as e:
         print("Error sending telegram:", e)
 
@@ -75,7 +84,10 @@ def format_group_message(payload: dict) -> str:
     text_extra = payload.get("text", "")
 
     arrow = "🔼" if direction == "BUY" else "🔻"
-    header = f"*ГРУППА {group_id} — {direction}* {arrow}\nПара: `{pair}`  Цена: *{price}*\n\n"
+    header = (
+        f"ГРУППА {group_id} — {direction} {arrow}\n"
+        f"Пара: {pair}  Цена: {price}\n\n"
+    )
     return header + text_extra
 
 
@@ -89,8 +101,15 @@ def format_main_message(time_key: str, buy_groups, sell_groups, price, pair):
         arrow = "🔻"
         groups_str = ", ".join(str(g) for g in sell_groups)
 
-    header = f"*MAIN SIGNAL — {direction}* {arrow}\nПара: `{pair}`  Цена: *{price}*\nВремя бара: `{time_key}`\n\n"
-    body = f"Совпали сигналы групп: *{groups_str}* (минимум 2 из 4).\nЭто сильная точка возможного разворота."
+    header = (
+        f"MAIN SIGNAL — {direction} {arrow}\n"
+        f"Пара: {pair}  Цена: {price}\n"
+        f"Время бара: {time_key}\n\n"
+    )
+    body = (
+        f"Совпали сигналы групп: {groups_str} (минимум 2 из 4).\n"
+        f"Это сильная точка возможного разворота."
+    )
     return header + body
 
 
@@ -107,14 +126,19 @@ def try_emit_main_signal(time_key: str, last_payload: dict):
     sell_groups = [gid for gid, info in groups.items() if info["direction"] == "SELL"]
 
     if len(buy_groups) >= 2 and len(sell_groups) == 0:
-        msg = format_main_message(time_key, buy_groups, [], last_payload.get("price"), last_payload.get("pair"))
+        msg = format_main_message(
+            time_key, buy_groups, [], last_payload.get("price"), last_payload.get("pair")
+        )
         send_telegram(msg)
         store.mark_main_sent(time_key)
 
     elif len(sell_groups) >= 2 and len(buy_groups) == 0:
-        msg = format_main_message(time_key, [], sell_groups, last_payload.get("price"), last_payload.get("pair"))
+        msg = format_main_message(
+            time_key, [], sell_groups, last_payload.get("price"), last_payload.get("pair")
+        )
         send_telegram(msg)
         store.mark_main_sent(time_key)
+
 
 # ------------ Flask app ------------
 
@@ -124,6 +148,16 @@ app = Flask(__name__)
 @app.route("/", methods=["GET"])
 def index():
     return "TradingView webhook bot is running", 200
+
+
+@app.route("/test-telegram", methods=["GET"])
+def test_telegram():
+    """
+    Простой тест: дергаешь этот URL в браузере,
+    бот должен отправить тестовое сообщение в Telegram.
+    """
+    send_telegram("Тестовое сообщение из Railway: всё подключено ✅")
+    return "ok", 200
 
 
 @app.route("/tradingview-webhook", methods=["POST"])
@@ -172,7 +206,10 @@ def tradingview_webhook():
                 "pair": pair,
                 "price": payload.get("price"),
                 "time": time_key,
-                "text": payload.get("text", "ГРУППА 3 — сигнал по LuxAlgo (trendline + S/R + Reversal).")
+                "text": payload.get(
+                    "text",
+                    "ГРУППА 3 — сигнал по LuxAlgo (trendline + S/R + Reversal).",
+                ),
             }
 
             store.add_group_signal(time_key, 3, direction, g3_payload)
