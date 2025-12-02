@@ -1,7 +1,7 @@
 import json
 import os
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, request, jsonify
@@ -28,40 +28,75 @@ GROUP_NAMES = {
 }
 
 # Нормальные «человеческие» названия индикаторов
+# Ключи ДОЛЖНЫ совпадать с полем "indicator" в JSON от TradingView
 INDICATOR_TITLES = {
-    "rsi14": "RSI(14)",
-    "stoch": "Stochastic (14, 3, 3)",
-    "macd": "MACD (12, 26, 9)",
-    "mfi": "MFI (Money Flow Index)",
-    "bb": "Bollinger Bands",
-    "kc": "Keltner Channels",
-    "rsi7": "RSI(7)",
-    "lux_trendline": "LuxAlgo Trendlines with Breaks",
-    "lux_sr": "LuxAlgo S/R with Breaks",
-    "frvp": "Fixed Range Volume Profile (FRVP)",
-    "lux_reversal": "Lux Reversal Signals",
-    "alligator": "Alligator",
-    "ao": "Awesome Oscillator",
-    "fractals": "Fractals",
-    "atr14": "ATR(14)",
-}
+    "RSI14": "RSI(14)",
+    "Stoch": "Stochastic (14, 3, 3)",
+    "MACD": "MACD (12, 26, 9)",
+    "MFI": "MFI (Money Flow Index)",
 
+    "BB": "Bollinger Bands",
+    "KC": "Keltner Channels",
+    "RSI7": "RSI(7)",
+
+    "trendline": "Trendlines with Breaks",
+    "SR": "Support/Resistance with Breaks",
+    "FRVP": "Fixed Range Volume Profile (FRVP)",
+    "reversal": "Reversal Signals",
+
+    "Alligator": "Alligator",
+    "AO": "Awesome Oscillator",
+    "Fractals": "Fractals",
+    "ATR14": "ATR(14)",
+}
 
 # ------------ утилиты ------------
 
-def parse_time(ts_str: str):
-    """Пытаемся разобрать ISO-дату из TradingView. Если не получилось — берём текущее UTC."""
-    if not ts_str:
-        return datetime.utcnow()
+
+def parse_time(ts_str: str) -> datetime:
+    """
+    Разбираем время из TradingView и ВСЕГДА возвращаем naïve UTC (без tzinfo),
+    чтобы потом не было конфликтов offset-aware / offset-naive.
+    """
     try:
-        # TradingView часто отдаёт что-то типа "2025-11-30T15:00:00Z"
-        s = ts_str.replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
+        if not ts_str:
+            return datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # если вдруг пришёл timestamp числом
+        if isinstance(ts_str, (int, float)) or str(ts_str).isdigit():
+            dt = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+            return dt.replace(tzinfo=None)
+
+        # обычный формат TV: "2025-12-02T20:15:00Z"
+        s = str(ts_str).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=None)
     except Exception:
-        return datetime.utcnow()
+        # fallback — просто сейчас (UTC)
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# простейший анти-дубликатор: не шлём одинаковый текст чаще, чем раз в 3 сек
+_last_telegram_messages = []  # список (text, datetime)
 
 
 def send_telegram(text: str):
+    global _last_telegram_messages
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # вычищаем старые записи (старше 10 секунд – просто чтобы не разрасталось)
+    _last_telegram_messages = [
+        (t, ts) for (t, ts) in _last_telegram_messages if (now - ts).total_seconds() < 10
+    ]
+
+    # если точно такой же текст уже отправляли за последние 3 секунды — пропускаем
+    for t, ts in _last_telegram_messages:
+        if t == text and (now - ts).total_seconds() < 3:
+            print("Skip duplicate telegram message")
+            return
+
     data = {
         "text": text,
         "parse_mode": "Markdown",
@@ -75,6 +110,8 @@ def send_telegram(text: str):
         except Exception as e:
             print("Error sending telegram:", e)
 
+    _last_telegram_messages.append((text, now))
+
 
 def format_direction(direction: str) -> str:
     if direction == "BUY":
@@ -84,39 +121,63 @@ def format_direction(direction: str) -> str:
     return direction or "N/A"
 
 
+def _extract_price(payload: dict) -> str:
+    """Берём цену из разных возможных полей."""
+    return str(payload.get("price") or payload.get("value") or "")
+
+
 def format_indicator_message(payload: dict) -> str:
     group_id = int(payload.get("group_id", 0))
     indicator_code = payload.get("indicator", "unknown")
     direction = payload.get("direction")
     pair = payload.get("pair", "EURUSD")
-    price = payload.get("price", "")
+    price = _extract_price(payload)
     time_str = str(payload.get("time", ""))
     extra = payload.get("text", "")
 
     indicator_name = INDICATOR_TITLES.get(indicator_code, indicator_code)
     group_title = GROUP_NAMES.get(group_id, f"Группа {group_id}")
 
-    header = f"*{group_title}*\nИндикатор: *{indicator_name}*\nСигнал: *{format_direction(direction)}*\n"
-    body = f"Пара: `{pair}`  Цена: *{price}*\nВремя бара: `{time_str}`\n\n{extra}"
+    header = (
+        f"*{group_title}*\n"
+        f"Индикатор: *{indicator_name}*\n"
+        f"Сигнал: *{format_direction(direction)}*\n"
+    )
+    body = (
+        f"Пара: `{pair}`  Цена: *{price}*\n"
+        f"Время бара: `{time_str}`\n\n"
+        f"{extra}"
+    )
     return header + body
 
 
-def format_group_summary(group_id: int, direction: str, indicators: set, pair: str, price: str, time_str: str) -> str:
+def format_group_summary(group_id: int, direction: str, indicators: set,
+                         pair: str, price: str, time_str: str) -> str:
     group_title = GROUP_NAMES.get(group_id, f"Группа {group_id}")
     arrow = "🔼" if direction == "BUY" else "🔻"
     indicators_pretty = ", ".join(INDICATOR_TITLES.get(i, i) for i in sorted(indicators))
 
     header = f"*Сработала {group_title}* {arrow}\n"
-    meta = f"Пара: `{pair}`  Цена: *{price}*\nВремя окна: `последние ~2 бара`\n\n"
-    body = f"В этой группе *минимум два индикатора* дают сигнал в сторону {direction}:\n- {indicators_pretty}"
+    meta = (
+        f"Пара: `{pair}`  Цена: *{price}*\n"
+        f"Время окна: `последние ~2 бара`\n\n"
+    )
+    body = (
+        f"В этой группе *минимум два индикатора* дают сигнал в сторону {direction}:\n"
+        f"- {indicators_pretty}"
+    )
     return header + meta + body
 
 
-def format_main_summary(direction: str, group_ids: list[int], pair: str, price: str, time_str: str) -> str:
+def format_main_summary(direction: str, group_ids: list[int],
+                        pair: str, price: str, time_str: str) -> str:
     arrow = "🚀" if direction == "BUY" else "📉"
     groups_list = ", ".join(str(g) for g in sorted(group_ids))
     header = f"*МОЩНЫЙ СИГНАЛ НА РАЗВОРОТ* {arrow}\n"
-    meta = f"Пара: `{pair}`  Цена: *{price}*\nВремя окна: `последние ~2 бара`\n\n"
+    meta = (
+        f"Пара: `{pair}`  Цена: *{price}*\n"
+        f"Время окна: `последние ~2 бара`\n\n"
+    )
     body = (
         f"Сработали *минимум две группы* в одну сторону ({direction}).\n"
         f"Группы: *{groups_list}*.\n"
@@ -127,19 +188,20 @@ def format_main_summary(direction: str, group_ids: list[int], pair: str, price: 
 
 # ------------ хранилище сигналов ------------
 
+
 class SignalStore:
     """
-    Храним список событий (индивидуальных индикаторов) за последний час и считаем групповые сигналы.
+    Храним список событий (индивидуальных индикаторов) и считаем групповые сигналы.
 
     Каждое событие:
     {
-        "ts": datetime,
+        "ts": datetime (UTC, naive),
         "group_id": int,
         "indicator": str,
         "direction": "BUY"/"SELL",
         "pair": str,
         "price": str,
-        "time_raw": str,  # как пришло из TV
+        "time_raw": str,
     }
 
     Логика:
@@ -147,7 +209,7 @@ class SignalStore:
     - по этому окну считаем:
         direction -> group_id -> set(indicators)
     - если в группе >=2 индикаторов в одну сторону -> групповой сигнал
-    - если групп с >=2 индикаторами в одну сторону >=2 -> MAIN сигнал
+    - если таких групп (>=2 индикаторов) в одну сторону >=2 -> основной сигнал
     """
 
     def __init__(self):
@@ -160,10 +222,11 @@ class SignalStore:
 
     def _prune_old(self, now: datetime):
         cutoff = now - timedelta(minutes=self.max_age_minutes)
+        # now и e["ts"] оба naive UTC => проблем с сравнением нет
         self.events = [e for e in self.events if e["ts"] >= cutoff]
 
     def add_event(self, time_raw: str, group_id: int, indicator: str,
-                  direction: str, pair: str, price: str):
+                  direction: str, pair: str, price: str) -> datetime:
         ts = parse_time(time_raw)
         event = {
             "ts": ts,
@@ -201,7 +264,7 @@ class SignalStore:
         indicator = payload.get("indicator", "unknown")
         direction = payload.get("direction")
         pair = payload.get("pair", "EURUSD")
-        price = str(payload.get("price", ""))
+        price = _extract_price(payload)
         time_raw = str(payload.get("time", ""))
 
         ts = self.add_event(time_raw, group_id, indicator, direction, pair, price)
@@ -269,71 +332,24 @@ def telegram_send_plain():
 
 @app.route("/tradingview-webhook", methods=["POST"])
 def tradingview_webhook():
-    """
-    Поддерживает два варианта:
+    try:
+        raw = request.data.decode("utf-8")
+        payload = json.loads(raw)
+    except Exception as e:
+        print("Bad payload:", e, "raw:", request.data)
+        return jsonify({"status": "error", "detail": "invalid json"}), 400
 
-    1) Твой старый curl / тесты:
-       POST { "type": "indicator", ... }
-
-    2) Реальный TradingView:
-       POST {
-         "time": "...",
-         "ticker": "EURUSD",
-         "exchange": "...",
-         "message": "{\"type\":\"indicator\", ... }"
-       }
-    """
-    # Пытаемся прочитать JSON "умно"
-    raw_json = request.get_json(silent=True)
-
-    # Fallback на старый способ (raw text), если вдруг get_json не сработал
-    if raw_json is None:
-        try:
-            raw_text = request.data.decode("utf-8")
-            raw_json = json.loads(raw_text)
-        except Exception as e:
-            print("Bad payload:", e, "raw:", request.data)
-            return jsonify({"status": "error", "detail": "invalid json"}), 400
-
-    print("RAW JSON FROM TV:", raw_json)
-
-    # Если это TradingView-обёртка с полем message
-    if isinstance(raw_json, dict) and "message" in raw_json:
-        msg = raw_json["message"]
-
-        # message может быть строкой с JSON или уже dict’ом
-        if isinstance(msg, str):
-            try:
-                payload = json.loads(msg)
-            except Exception as e:
-                print("Failed to parse inner message JSON:", e, "msg:", msg)
-                # если не смогли распарсить — завернём как raw
-                payload = {"type": "raw", "raw_message": msg}
-        elif isinstance(msg, dict):
-            payload = msg
-        else:
-            payload = {"type": "raw", "raw_message": msg}
-
-        # докидываем полезные поля из внешней обёртки, если их нет внутри
-        if "time" in raw_json and "time" not in payload:
-            payload["time"] = raw_json["time"]
-        if "ticker" in raw_json and "pair" not in payload:
-            payload["pair"] = raw_json["ticker"]
-    else:
-        # Старый вариант: тело запроса уже == нужный payload
-        payload = raw_json
-
-    print("PARSED PAYLOAD:", payload)
+    print("Got payload:", payload)
 
     p_type = payload.get("type", "indicator")
+    if p_type != "indicator":
+        return jsonify({"status": "ignored", "detail": "unknown type"}), 200
+
     group_id = int(payload.get("group_id", 0))
     indicator = payload.get("indicator")
     direction = payload.get("direction")
 
-    if p_type != "indicator":
-        # на будущее — можно будет добавить поддержку других типов
-        return jsonify({"status": "ignored", "detail": f"unsupported type {p_type}"}), 200
-
+    # без этих полей нам нечего считать
     if not group_id or not indicator or direction not in ("BUY", "SELL"):
         return jsonify({"status": "ignored", "detail": "missing group_id/indicator/direction"}), 200
 
@@ -345,7 +361,7 @@ def tradingview_webhook():
     new_groups, main_trigger, dir_stats = store.process_event(payload)
 
     pair = payload.get("pair", "EURUSD")
-    price = str(payload.get("price", ""))
+    price = _extract_price(payload)
     time_raw = str(payload.get("time", ""))
 
     # 2а) новые сработавшие группы
