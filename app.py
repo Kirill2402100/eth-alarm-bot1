@@ -1,6 +1,7 @@
 import json
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import requests
 from flask import Flask, request, jsonify
@@ -8,140 +9,229 @@ from flask import Flask, request, jsonify
 # ------------ конфиг ------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID_RAW = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы в переменных окружения"
-    )
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID_RAW:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы в переменных окружения")
+
+# поддержка нескольких чатов через запятую
+TELEGRAM_CHAT_IDS = [cid.strip() for cid in TELEGRAM_CHAT_ID_RAW.split(",") if cid.strip()]
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
+# Имя групп для сообщений
+GROUP_NAMES = {
+    1: "Группа 1 — Перекупленность / перепроданность",
+    2: "Группа 2 — Волатильность и зоны перегрева",
+    3: "Группа 3 — Трендовые уровни и объём",
+    4: "Группа 4 — Тренд и импульс",
+}
 
-# ------------ хранилище сигналов (в памяти) ------------
-
-class SignalStore:
-    """
-    Простое in-memory хранилище:
-    - group_signals[time][group_id] = {'direction': 'BUY/SELL', 'payload': {...}}
-    - micro_g3[time][direction] = set(['trendline', 'sr', 'reversal'])
-    - main_sent[time] = True/False
-    """
-
-    def __init__(self):
-        self.group_signals = defaultdict(dict)
-        self.micro_g3 = defaultdict(lambda: defaultdict(set))
-        self.main_sent = {}
-
-    def add_group_signal(self, time_key, group_id, direction, payload):
-        self.group_signals[time_key][group_id] = {
-            "direction": direction,
-            "payload": payload,
-        }
-
-    def add_micro_g3(self, time_key, direction, indicator):
-        self.micro_g3[time_key][direction].add(indicator)
-
-    def has_full_g3(self, time_key, direction):
-        # для группы 3 нужны ВСЕ три индикатора
-        needed = {"trendline", "sr", "reversal"}
-        return self.micro_g3[time_key][direction] >= needed
-
-    def mark_main_sent(self, time_key):
-        self.main_sent[time_key] = True
-
-    def is_main_sent(self, time_key):
-        return self.main_sent.get(time_key, False)
-
-
-store = SignalStore()
+# Нормальные «человеческие» названия индикаторов
+INDICATOR_TITLES = {
+    "rsi14": "RSI(14)",
+    "stoch": "Stochastic (14, 3, 3)",
+    "macd": "MACD (12, 26, 9)",
+    "mfi": "MFI (Money Flow Index)",
+    "bb": "Bollinger Bands",
+    "kc": "Keltner Channels",
+    "rsi7": "RSI(7)",
+    "lux_trendline": "LuxAlgo Trendlines with Breaks",
+    "lux_sr": "LuxAlgo S/R with Breaks",
+    "frvp": "Fixed Range Volume Profile (FRVP)",
+    "lux_reversal": "Lux Reversal Signals",
+    "alligator": "Alligator",
+    "ao": "Awesome Oscillator",
+    "fractals": "Fractals",
+    "atr14": "ATR(14)",
+}
 
 
 # ------------ утилиты ------------
 
-def send_telegram(text: str):
-    """Отправка обычного (НЕ markdown) текста в Телеграм + лог ответа."""
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        # без parse_mode, чтобы ничего не ломалось
-    }
+def parse_time(ts_str: str):
+    """Пытаемся разобрать ISO-дату из TradingView. Если не получилось — берём текущее UTC."""
+    if not ts_str:
+        return datetime.utcnow()
     try:
-        resp = requests.post(TELEGRAM_API_URL, json=data, timeout=5)
-        print("TELEGRAM_SEND_STATUS", resp.status_code)
+        # TradingView часто отдаёт что-то типа "2025-11-30T15:00:00Z"
+        s = ts_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        return datetime.utcnow()
+
+
+def send_telegram(text: str):
+    data = {
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+    for chat_id in TELEGRAM_CHAT_IDS:
+        data["chat_id"] = chat_id
         try:
-            print("TELEGRAM_SEND_BODY", resp.json())
-        except Exception:
-            print("TELEGRAM_SEND_TEXT", resp.text)
-        return resp
-    except Exception as e:
-        print("Error sending telegram:", e)
-        return None
+            r = requests.post(TELEGRAM_API_URL, json=data, timeout=5)
+            if r.status_code != 200:
+                print("Telegram error:", r.status_code, r.text)
+        except Exception as e:
+            print("Error sending telegram:", e)
 
 
-def format_group_message(payload: dict) -> str:
-    group_id = payload.get("group_id")
+def format_direction(direction: str) -> str:
+    if direction == "BUY":
+        return "BUY 🔼"
+    elif direction == "SELL":
+        return "SELL 🔻"
+    return direction or "N/A"
+
+
+def format_indicator_message(payload: dict) -> str:
+    group_id = int(payload.get("group_id", 0))
+    indicator_code = payload.get("indicator", "unknown")
     direction = payload.get("direction")
     pair = payload.get("pair", "EURUSD")
     price = payload.get("price", "")
-    text_extra = payload.get("text", "")
+    time_str = str(payload.get("time", ""))
+    extra = payload.get("text", "")
 
-    arrow = "🔼" if direction == "BUY" else "🔻"
-    header = (
-        f"ГРУППА {group_id} — {direction} {arrow}\n"
-        f"Пара: {pair}  Цена: {price}\n\n"
-    )
-    return header + text_extra
+    indicator_name = INDICATOR_TITLES.get(indicator_code, indicator_code)
+    group_title = GROUP_NAMES.get(group_id, f"Группа {group_id}")
 
-
-def format_main_message(time_key: str, buy_groups, sell_groups, price, pair):
-    if buy_groups:
-        direction = "BUY"
-        arrow = "🔼"
-        groups_str = ", ".join(str(g) for g in buy_groups)
-    else:
-        direction = "SELL"
-        arrow = "🔻"
-        groups_str = ", ".join(str(g) for g in sell_groups)
-
-    header = (
-        f"MAIN SIGNAL — {direction} {arrow}\n"
-        f"Пара: {pair}  Цена: {price}\n"
-        f"Время бара: {time_key}\n\n"
-    )
-    body = (
-        f"Совпали сигналы групп: {groups_str} (минимум 2 из 4).\n"
-        f"Это сильная точка возможного разворота."
-    )
+    header = f"*{group_title}*\nИндикатор: *{indicator_name}*\nСигнал: *{format_direction(direction)}*\n"
+    body = f"Пара: `{pair}`  Цена: *{price}*\nВремя бара: `{time_str}`\n\n{extra}"
     return header + body
 
 
-def try_emit_main_signal(time_key: str, last_payload: dict):
+def format_group_summary(group_id: int, direction: str, indicators: set, pair: str, price: str, time_str: str) -> str:
+    group_title = GROUP_NAMES.get(group_id, f"Группа {group_id}")
+    arrow = "🔼" if direction == "BUY" else "🔻"
+    indicators_pretty = ", ".join(INDICATOR_TITLES.get(i, i) for i in sorted(indicators))
+
+    header = f"*Сработала {group_title}* {arrow}\n"
+    meta = f"Пара: `{pair}`  Цена: *{price}*\nВремя окна: `последние ~2 бара`\n\n"
+    body = f"В этой группе *минимум два индикатора* дают сигнал в сторону {direction}:\n- {indicators_pretty}"
+    return header + meta + body
+
+
+def format_main_summary(direction: str, group_ids: list[int], pair: str, price: str, time_str: str) -> str:
+    arrow = "🚀" if direction == "BUY" else "📉"
+    groups_list = ", ".join(str(g) for g in sorted(group_ids))
+    header = f"*МОЩНЫЙ СИГНАЛ НА РАЗВОРОТ* {arrow}\n"
+    meta = f"Пара: `{pair}`  Цена: *{price}*\nВремя окна: `последние ~2 бара`\n\n"
+    body = (
+        f"Сработали *минимум две группы* в одну сторону ({direction}).\n"
+        f"Группы: *{groups_list}*.\n"
+        f"Это сильная точка возможного разворота тренда."
+    )
+    return header + meta + body
+
+
+# ------------ хранилище сигналов ------------
+
+class SignalStore:
     """
-    Проверяем, есть ли на этом time >=2 групп в одну сторону.
-    last_payload нужен, чтобы взять из него price/pair.
+    Храним список событий (индивидуальных индикаторов) за последний час и считаем групповые сигналы.
+
+    Каждое событие:
+    {
+        "ts": datetime,
+        "group_id": int,
+        "indicator": str,
+        "direction": "BUY"/"SELL",
+        "pair": str,
+        "price": str,
+        "time_raw": str,  # как пришло из TV
+    }
+
+    Логика:
+    - окно 30 минут назад от текущего события (≈ 2 бара по 15м);
+    - по этому окну считаем:
+        direction -> group_id -> set(indicators)
+    - если в группе >=2 индикаторов в одну сторону -> групповой сигнал
+    - если групп с >=2 индикаторами в одну сторону >=2 -> MAIN сигнал
     """
-    if store.is_main_sent(time_key):
-        return
 
-    groups = store.group_signals[time_key]
-    buy_groups = [gid for gid, info in groups.items() if info["direction"] == "BUY"]
-    sell_groups = [gid for gid, info in groups.items() if info["direction"] == "SELL"]
+    def __init__(self):
+        self.events = []
+        self.max_age_minutes = 60
 
-    if len(buy_groups) >= 2 and len(sell_groups) == 0:
-        msg = format_main_message(
-            time_key, buy_groups, [], last_payload.get("price"), last_payload.get("pair")
-        )
-        send_telegram(msg)
-        store.mark_main_sent(time_key)
+        # чтобы не спамить одинаковыми сообщениями
+        self.sent_group = set()  # (direction, group_id, bucket_id)
+        self.sent_main = set()   # (direction, bucket_id)
 
-    elif len(sell_groups) >= 2 and len(buy_groups) == 0:
-        msg = format_main_message(
-            time_key, [], sell_groups, last_payload.get("price"), last_payload.get("pair")
-        )
-        send_telegram(msg)
-        store.mark_main_sent(time_key)
+    def _prune_old(self, now: datetime):
+        cutoff = now - timedelta(minutes=self.max_age_minutes)
+        self.events = [e for e in self.events if e["ts"] >= cutoff]
 
+    def add_event(self, time_raw: str, group_id: int, indicator: str,
+                  direction: str, pair: str, price: str):
+        ts = parse_time(time_raw)
+        event = {
+            "ts": ts,
+            "time_raw": time_raw,
+            "group_id": group_id,
+            "indicator": indicator,
+            "direction": direction,
+            "pair": pair,
+            "price": price,
+        }
+        self.events.append(event)
+        self._prune_old(ts)
+        return ts
+
+    def analyze_window(self, ts: datetime, window_minutes: int = 30):
+        window_start = ts - timedelta(minutes=window_minutes)
+        # direction -> group_id -> set(indicators)
+        stats = defaultdict(lambda: defaultdict(set))
+
+        for e in self.events:
+            if window_start <= e["ts"] <= ts:
+                stats[e["direction"]][e["group_id"]].add(e["indicator"])
+
+        return stats
+
+    def process_event(self, payload: dict):
+        """
+        Основной метод:
+        - добавляет событие;
+        - считает окно 30 минут;
+        - возвращает:
+            (new_group_triggers, main_trigger, dir_stats)
+        """
+        group_id = int(payload.get("group_id", 0))
+        indicator = payload.get("indicator", "unknown")
+        direction = payload.get("direction")
+        pair = payload.get("pair", "EURUSD")
+        price = str(payload.get("price", ""))
+        time_raw = str(payload.get("time", ""))
+
+        ts = self.add_event(time_raw, group_id, indicator, direction, pair, price)
+        stats = self.analyze_window(ts, window_minutes=30)
+        dir_stats = stats.get(direction, {})
+
+        # какие группы уже «сильные» в этом окне
+        strong_groups = [gid for gid, inds in dir_stats.items() if len(inds) >= 2]
+
+        # используем "bucket" = время текущего бара, округлённое до минут
+        bucket_id = ts.replace(second=0, microsecond=0).isoformat(timespec="minutes")
+
+        new_group_triggers = []
+        for gid in strong_groups:
+            key = (direction, gid, bucket_id)
+            if key not in self.sent_group:
+                self.sent_group.add(key)
+                new_group_triggers.append(gid)
+
+        main_trigger = None
+        if len(strong_groups) >= 2:
+            main_key = (direction, bucket_id)
+            if main_key not in self.sent_main:
+                self.sent_main.add(main_key)
+                main_trigger = sorted(strong_groups)
+
+        return new_group_triggers, main_trigger, dir_stats
+
+
+store = SignalStore()
 
 # ------------ Flask app ------------
 
@@ -153,9 +243,6 @@ def index():
     return "TradingView webhook bot is running", 200
 
 
-# --- сервисные debug-роуты ---
-
-
 @app.route("/test-telegram", methods=["GET"])
 def test_telegram():
     send_telegram("Test message from Railway bot (plain text)")
@@ -164,48 +251,20 @@ def test_telegram():
 
 @app.route("/telegram-api-debug", methods=["GET"])
 def telegram_api_debug():
-    """Пробуем getMe у Telegram, чтобы убедиться, что токен валидный."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
-    try:
-        resp = requests.get(url, timeout=5)
-        return jsonify({"status_code": resp.status_code, "body": resp.json()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    r = requests.get(url, timeout=5)
+    return jsonify({"status_code": r.status_code, "body": r.json()})
 
 
 @app.route("/telegram-send-plain", methods=["GET"])
 def telegram_send_plain():
-    """Явный тест отправки простого текста."""
-    resp = send_telegram("Plain test message from Railway bot")
-    if resp is None:
-        return jsonify({"status": "error", "detail": "exception while sending"}), 500
-    return jsonify({"status_code": resp.status_code, "body": resp.json()})
-
-
-@app.route("/telegram-debug-group", methods=["GET"])
-def telegram_debug_group():
-    """Тестируем format_group_message + send_telegram."""
-    sample_payload = {
-        "type": "group",
-        "group_id": 1,
-        "direction": "BUY",
-        "pair": "EURUSD",
-        "price": "1.1000",
-        "time": "2025-11-30T15:00",
-        "text": "ГРУППА 1 — BUY (debug из /telegram-debug-group)",
+    text = "Plain test message from Railway bot"
+    data = {
+        "chat_id": TELEGRAM_CHAT_IDS[0],
+        "text": text,
     }
-    text = format_group_message(sample_payload)
-    resp = send_telegram(text)
-    if resp is None:
-        return jsonify({"status": "error", "detail": "exception while sending"}), 500
-    return jsonify({
-        "status": "ok",
-        "telegram_status_code": resp.status_code,
-        "telegram_body": resp.json(),
-    })
-
-
-# --- основной webhook от TradingView ---
+    r = requests.post(TELEGRAM_API_URL, json=data, timeout=5)
+    return jsonify({"status_code": r.status_code, "body": r.json()})
 
 
 @app.route("/tradingview-webhook", methods=["POST"])
@@ -219,59 +278,42 @@ def tradingview_webhook():
 
     print("Got payload:", payload)
 
-    p_type = payload.get("type")
+    p_type = payload.get("type", "indicator")
     group_id = int(payload.get("group_id", 0))
+    indicator = payload.get("indicator")
     direction = payload.get("direction")
-    time_key = str(payload.get("time"))
+
+    if not group_id or not indicator or direction not in ("BUY", "SELL"):
+        return jsonify({"status": "ignored", "detail": "missing group_id/indicator/direction"}), 200
+
+    # 1) всегда шлём индивидуальное сообщение по индикатору
+    text = format_indicator_message(payload)
+    send_telegram(text)
+
+    # 2) считаем внутри окна 30 минут групповые и основной сигнал
+    new_groups, main_trigger, dir_stats = store.process_event(payload)
+
     pair = payload.get("pair", "EURUSD")
+    price = str(payload.get("price", ""))
+    time_raw = str(payload.get("time", ""))
 
-    # ---------- type = "group" (группы 1,2,4 и (виртуально) 3) ----------
-    if p_type == "group":
-        store.add_group_signal(time_key, group_id, direction, payload)
+    # 2а) новые сработавшие группы
+    for gid in new_groups:
+        indicators = dir_stats.get(gid, set())
+        g_text = format_group_summary(gid, direction, indicators, pair, price, time_raw)
+        send_telegram(g_text)
 
-        # сообщение по группе
-        text = format_group_message(payload)
-        send_telegram(text)
+    # 2б) мощный сигнал
+    if main_trigger:
+        m_text = format_main_summary(direction, main_trigger, pair, price, time_raw)
+        send_telegram(m_text)
 
-        # пробуем собрать MAIN сигнал
-        try_emit_main_signal(time_key, payload)
-
-        return jsonify({"status": "ok", "kind": "group"})
-
-    # ---------- type = "micro" (группа 3 по LuxAlgo) ----------
-    if p_type == "micro" and group_id == 3:
-        indicator = payload.get("indicator")
-        store.add_micro_g3(time_key, direction, indicator)
-
-        # когда все три индикатора в одну сторону — считаем это signal group 3
-        if store.has_full_g3(time_key, direction):
-            g3_payload = {
-                "type": "group",
-                "group_id": 3,
-                "direction": direction,
-                "pair": pair,
-                "price": payload.get("price"),
-                "time": time_key,
-                "text": payload.get(
-                    "text",
-                    "ГРУППА 3 — сигнал по LuxAlgo (trendline + S/R + Reversal).",
-                ),
-            }
-
-            store.add_group_signal(time_key, 3, direction, g3_payload)
-
-            # отправляем сообщение по группе 3
-            text = format_group_message(g3_payload)
-            send_telegram(text)
-
-            # пробуем собрать MAIN
-            try_emit_main_signal(time_key, g3_payload)
-
-        # по самим micro-сигналам в телеграм пока ничего не шлём
-        return jsonify({"status": "ok", "kind": "micro"})
-
-    # если тип неизвестен
-    return jsonify({"status": "ignored"}), 200
+    return jsonify({
+        "status": "ok",
+        "kind": "indicator",
+        "new_groups": new_groups,
+        "main_trigger": main_trigger or [],
+    })
 
 
 if __name__ == "__main__":
