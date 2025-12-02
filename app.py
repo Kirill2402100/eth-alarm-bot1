@@ -67,14 +67,13 @@ def parse_time(ts_str: str) -> datetime:
             dt = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
             return dt.replace(tzinfo=None)
 
-        # обычный формат TV: "2025-12-02T20:15:00Z"
+        # формат TV: "2025-12-02T20:15:00Z"
         s = str(ts_str).replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is not None:
             dt = dt.astimezone(timezone.utc)
         return dt.replace(tzinfo=None)
     except Exception:
-        # fallback — просто сейчас (UTC)
         return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
@@ -86,12 +85,12 @@ def send_telegram(text: str):
     global _last_telegram_messages
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    # вычищаем старые записи (старше 10 секунд – просто чтобы не разрасталось)
+    # подчистка старых записей (старше 10с)
     _last_telegram_messages = [
         (t, ts) for (t, ts) in _last_telegram_messages if (now - ts).total_seconds() < 10
     ]
 
-    # если точно такой же текст уже отправляли за последние 3 секунды — пропускаем
+    # если такой же текст уже был за последние 3с — пропускаем
     for t, ts in _last_telegram_messages:
         if t == text and (now - ts).total_seconds() < 3:
             print("Skip duplicate telegram message")
@@ -209,21 +208,29 @@ class SignalStore:
     - по этому окну считаем:
         direction -> group_id -> set(indicators)
     - если в группе >=2 индикаторов в одну сторону -> групповой сигнал
-    - если таких групп (>=2 индикаторов) в одну сторону >=2 -> основной сигнал
+    - если таких групп в одну сторону >=2 -> основной сигнал
     """
 
     def __init__(self):
         self.events = []
         self.max_age_minutes = 60
 
-        # чтобы не спамить одинаковыми сообщениями
-        self.sent_group = set()  # (direction, group_id, bucket_id)
-        self.sent_main = set()   # (direction, bucket_id)
+        # когда последний раз слали групповой / основной сигнал
+        self.sent_group_last = {}  # (direction, group_id) -> datetime
+        self.sent_main_last = {}   # direction -> datetime
 
     def _prune_old(self, now: datetime):
         cutoff = now - timedelta(minutes=self.max_age_minutes)
-        # now и e["ts"] оба naive UTC => проблем с сравнением нет
         self.events = [e for e in self.events if e["ts"] >= cutoff]
+
+        # параллельно чистим историю триггеров (здесь достаточно 30 минут)
+        cutoff_group = now - timedelta(minutes=30)
+        self.sent_group_last = {
+            k: t for k, t in self.sent_group_last.items() if t >= cutoff_group
+        }
+        self.sent_main_last = {
+            k: t for k, t in self.sent_main_last.items() if t >= cutoff_group
+        }
 
     def add_event(self, time_raw: str, group_id: int, indicator: str,
                   direction: str, pair: str, price: str) -> datetime:
@@ -274,21 +281,20 @@ class SignalStore:
         # какие группы уже «сильные» в этом окне
         strong_groups = [gid for gid, inds in dir_stats.items() if len(inds) >= 2]
 
-        # используем "bucket" = время текущего бара, округлённое до минут
-        bucket_id = ts.replace(second=0, microsecond=0).isoformat(timespec="minutes")
-
         new_group_triggers = []
         for gid in strong_groups:
-            key = (direction, gid, bucket_id)
-            if key not in self.sent_group:
-                self.sent_group.add(key)
+            key = (direction, gid)
+            last_ts = self.sent_group_last.get(key)
+            # триггерим не чаще, чем раз в 30 минут
+            if (last_ts is None) or ((ts - last_ts) >= timedelta(minutes=30)):
+                self.sent_group_last[key] = ts
                 new_group_triggers.append(gid)
 
         main_trigger = None
         if len(strong_groups) >= 2:
-            main_key = (direction, bucket_id)
-            if main_key not in self.sent_main:
-                self.sent_main.add(main_key)
+            last_main_ts = self.sent_main_last.get(direction)
+            if (last_main_ts is None) or ((ts - last_main_ts) >= timedelta(minutes=30)):
+                self.sent_main_last[direction] = ts
                 main_trigger = sorted(strong_groups)
 
         return new_group_triggers, main_trigger, dir_stats
