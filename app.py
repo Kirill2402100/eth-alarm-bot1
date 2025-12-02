@@ -269,19 +269,70 @@ def telegram_send_plain():
 
 @app.route("/tradingview-webhook", methods=["POST"])
 def tradingview_webhook():
-    try:
-        raw = request.data.decode("utf-8")
-        payload = json.loads(raw)
-    except Exception as e:
-        print("Bad payload:", e, "raw:", request.data)
-        return jsonify({"status": "error", "detail": "invalid json"}), 400
+    """
+    Поддерживает два варианта:
 
-    print("Got payload:", payload)
+    1) Твой старый curl / тесты:
+       POST { "type": "indicator", ... }
+
+    2) Реальный TradingView:
+       POST {
+         "time": "...",
+         "ticker": "EURUSD",
+         "exchange": "...",
+         "message": "{\"type\":\"indicator\", ... }"
+       }
+    """
+    # Пытаемся прочитать JSON "умно"
+    raw_json = request.get_json(silent=True)
+
+    # Fallback на старый способ (raw text), если вдруг get_json не сработал
+    if raw_json is None:
+        try:
+            raw_text = request.data.decode("utf-8")
+            raw_json = json.loads(raw_text)
+        except Exception as e:
+            print("Bad payload:", e, "raw:", request.data)
+            return jsonify({"status": "error", "detail": "invalid json"}), 400
+
+    print("RAW JSON FROM TV:", raw_json)
+
+    # Если это TradingView-обёртка с полем message
+    if isinstance(raw_json, dict) and "message" in raw_json:
+        msg = raw_json["message"]
+
+        # message может быть строкой с JSON или уже dict’ом
+        if isinstance(msg, str):
+            try:
+                payload = json.loads(msg)
+            except Exception as e:
+                print("Failed to parse inner message JSON:", e, "msg:", msg)
+                # если не смогли распарсить — завернём как raw
+                payload = {"type": "raw", "raw_message": msg}
+        elif isinstance(msg, dict):
+            payload = msg
+        else:
+            payload = {"type": "raw", "raw_message": msg}
+
+        # докидываем полезные поля из внешней обёртки, если их нет внутри
+        if "time" in raw_json and "time" not in payload:
+            payload["time"] = raw_json["time"]
+        if "ticker" in raw_json and "pair" not in payload:
+            payload["pair"] = raw_json["ticker"]
+    else:
+        # Старый вариант: тело запроса уже == нужный payload
+        payload = raw_json
+
+    print("PARSED PAYLOAD:", payload)
 
     p_type = payload.get("type", "indicator")
     group_id = int(payload.get("group_id", 0))
     indicator = payload.get("indicator")
     direction = payload.get("direction")
+
+    if p_type != "indicator":
+        # на будущее — можно будет добавить поддержку других типов
+        return jsonify({"status": "ignored", "detail": f"unsupported type {p_type}"}), 200
 
     if not group_id or not indicator or direction not in ("BUY", "SELL"):
         return jsonify({"status": "ignored", "detail": "missing group_id/indicator/direction"}), 200
