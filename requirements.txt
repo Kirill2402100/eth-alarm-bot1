@@ -4,4 +4,4 @@ pyarrow==17.0.0
 pyyaml==6.0.2
 requests==2.32.3
 tqdm==4.67.1
-pandas-ta==0.4.71b0
+pandas-ta==0.4.67b0
