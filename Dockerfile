@@ -2,22 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости (если надо для pandas/parquet)
+# Системные зависимости (если надо для pandas/parquet/сборки колес)
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем Python-зависимости
+# Python зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# Код
 COPY . .
 
-# Создаём папку под volume (иначе Railway пишет "missing dir")
-RUN mkdir -p /data /data/out
-
-# Запускаем напрямую
-CMD ["python", "-u", "-m", "scripts.run_grid", "--config", "configs/base.yaml"]
+# Важно: /data создаём НА СТАРТЕ, чтобы это было внутри смонтированного volume
+CMD ["sh", "-lc", "mkdir -p /data /data/out && exec python -u -m scripts.run_grid --config configs/base.yaml"]
