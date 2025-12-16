@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "-m", "scripts.run_grid", "--config", "configs/base.yaml"]
+CMD ["sh","-lc","${START_COMMAND}"]
