@@ -50,6 +50,12 @@ def load_yaml(path: str) -> Dict[str, Any]:
 
 
 def list_data_dir(data_dir: Path) -> None:
+    # ✅ на всякий: создаём /data перед листингом
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
     print("=== DEBUG ===", flush=True)
     print(f"cwd: {os.getcwd()}", flush=True)
     print(f"APP_ROOT: {APP_ROOT}", flush=True)
@@ -146,42 +152,58 @@ def call_run_strategy_compat(
     params: Dict[str, Any],
 ) -> Any:
     """
-    Поддерживает как минимум твою текущую сигнатуру из sim/engine.py:
-        run_strategy(symbol, df5, df1h, broker, params)
-
-    И ещё несколько вариантов (на будущее), если поменяешь имена аргументов.
+    Максимально совместимый вызов run_strategy под разные сигнатуры:
+      1) run_strategy(symbol, df_entry, df_range, broker, params_dict)
+      2) run_strategy(symbol, df_entry, df_range, broker, **params)
+      3) run_strategy(symbol=symbol, df5=..., df1h=..., broker=..., params=...)
+      4) любые комбинации имён аргументов
     """
     sig = inspect.signature(run_strategy)
-    names = list(sig.parameters.keys())
+    p = sig.parameters
 
-    # Самый частый случай под твой engine.py:
-    if len(names) >= 5 and ("params" in sig.parameters):
-        # пробуем понять имена датафреймов
-        df5_name_candidates = {"df5", "df_5m", "bars_5m", "df_entry", "entry_df"}
-        df1h_name_candidates = {"df1h", "df_1h", "bars_1h", "df_range", "range_df"}
+    # есть ли **kwargs
+    has_varkw = any(pp.kind == inspect.Parameter.VAR_KEYWORD for pp in p.values())
 
+    # Кандидаты имён для датафреймов
+    df5_names = {"df5", "df_5m", "bars_5m", "df_entry", "entry_df"}
+    df1h_names = {"df1h", "df_1h", "bars_1h", "df_range", "range_df"}
+
+    # 1) Если есть параметр "params" — отдаём dict
+    if "params" in p:
         kwargs: Dict[str, Any] = {}
-        for pname in sig.parameters.keys():
-            if pname in {"symbol", "sym", "pair"}:
-                kwargs[pname] = symbol
-            elif pname in df5_name_candidates:
-                kwargs[pname] = df_entry
-            elif pname in df1h_name_candidates:
-                kwargs[pname] = df_range
-            elif pname in {"broker", "brk"}:
-                kwargs[pname] = broker
-            elif pname == "params":
-                kwargs[pname] = params
-
-        # если получилось собрать всё нужное — вызываем
+        for name in p.keys():
+            if name in {"symbol", "sym", "pair"}:
+                kwargs[name] = symbol
+            elif name in df5_names:
+                kwargs[name] = df_entry
+            elif name in df1h_names:
+                kwargs[name] = df_range
+            elif name in {"broker", "brk"}:
+                kwargs[name] = broker
+            elif name == "params":
+                kwargs[name] = params
         try:
             return run_strategy(**kwargs)
         except TypeError:
-            # fallback позиционно именно под: (symbol, df5, df1h, broker, params)
+            # fallback на классическое позиционное
             return run_strategy(symbol, df_entry, df_range, broker, params)
 
-    # fallback: очень старые/другие сигнатуры
-    return run_strategy(symbol, df_entry, df_range, broker, params)
+    # 2) Если есть **kwargs — пробуем передать params как kwargs
+    if has_varkw:
+        try:
+            return run_strategy(symbol, df_entry, df_range, broker, **params)
+        except TypeError:
+            # иногда порядок другой/меньше аргументов
+            try:
+                return run_strategy(symbol, df_entry, df_range, **params)
+            except TypeError:
+                return run_strategy(symbol, df_entry, df_range, broker)
+
+    # 3) Без params и без **kwargs — пробуем позиционно (5 args), потом (4 args)
+    try:
+        return run_strategy(symbol, df_entry, df_range, broker, params)
+    except TypeError:
+        return run_strategy(symbol, df_entry, df_range, broker)
 
 
 def main() -> None:
