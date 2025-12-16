@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 import pandas as pd
 import requests
@@ -22,8 +22,8 @@ def load_yaml(path: str) -> Dict[str, Any]:
 
 def normalize_fx_symbol(sym: str) -> str:
     """
-    TwelveData по FX часто любит формат 'EUR/USD'.
-    Если дали 'EURUSD' (6 букв) — превратим в 'EUR/USD'.
+    Для TwelveData Forex часто нужен формат 'EUR/USD'.
+    'EURUSD' -> 'EUR/USD'
     """
     s = (sym or "").strip()
     if "/" in s:
@@ -33,22 +33,39 @@ def normalize_fx_symbol(sym: str) -> str:
     return s
 
 
+def normalize_interval(tf: str) -> str:
+    """
+    Приводим к интервалам TwelveData:
+      5m -> 5min
+      1h -> 1h
+    """
+    s = (tf or "").strip().lower()
+    mapping = {
+        "5m": "5min",
+        "5min": "5min",
+        "1h": "1h",
+        "60min": "1h",
+    }
+    return mapping.get(s, s)
+
+
 @dataclass
 class TDConfig:
     api_key: str
     base_url: str = "https://api.twelvedata.com/time_series"
+    search_url: str = "https://api.twelvedata.com/symbol_search"
 
 
-def td_request(cfg: TDConfig, params: Dict[str, Any], max_retries: int = 8) -> Dict[str, Any]:
+def td_request_json(url: str, params: Dict[str, Any], max_retries: int = 8) -> Dict[str, Any]:
     backoff = 2
     last_err: Optional[Exception] = None
 
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(cfg.base_url, params=params, timeout=30)
+            r = requests.get(url, params=params, timeout=30)
             data = r.json()
 
-            # TwelveData ошибки часто кладёт в {"status":"error","message":...}
+            # TwelveData ошибки часто в {"status":"error","message":...}
             if isinstance(data, dict) and data.get("status") == "error":
                 raise RuntimeError(f"TwelveData error: {data.get('message')}")
 
@@ -61,43 +78,64 @@ def td_request(cfg: TDConfig, params: Dict[str, Any], max_retries: int = 8) -> D
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-    raise RuntimeError(f"TwelveData request failed after retries: {last_err}") from last_err
+    raise RuntimeError(f"[TD] failed after retries: {last_err}") from last_err
 
 
-def td_fetch_timeseries(
-    cfg: TDConfig,
-    symbol: str,
-    interval: str,
-    start_dt: datetime,
-    end_dt: datetime,
-    outputsize: int = 5000,
-) -> pd.DataFrame:
+def td_symbol_search(cfg: TDConfig, query: str) -> Optional[str]:
     """
-    Качаем кусками (по времени), чтобы не упираться в лимиты outputsize.
+    Если прямой symbol не проходит — попробуем symbol_search.
+    Возвращаем строку symbol вида 'EUR/USD' если нашли.
     """
+    params = {
+        "symbol": query,
+        "apikey": cfg.api_key,
+        "outputsize": 10,
+    }
+    try:
+        data = td_request_json(cfg.search_url, params, max_retries=3)
+        items = data.get("data") or []
+        # Ищем forex-похожее
+        for it in items:
+            sym = (it.get("symbol") or "").strip()
+            exch = (it.get("exchange") or "").lower()
+            if sym and ("/" in sym) and ("forex" in exch or "fx" in exch):
+                return sym
+        # fallback: просто первый с "/"
+        for it in items:
+            sym = (it.get("symbol") or "").strip()
+            if sym and "/" in sym:
+                return sym
+    except Exception:
+        return None
+    return None
+
+
+def td_fetch_timeseries(cfg: TDConfig, symbol: str, interval: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
     params = {
         "symbol": symbol,
         "interval": interval,
         "apikey": cfg.api_key,
         "format": "JSON",
-        "outputsize": outputsize,
-        "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "outputsize": 5000,
         "timezone": "UTC",
         "order": "ASC",
+        "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    data = td_request(cfg, params=params)
+    data = td_request_json(cfg.base_url, params=params)
 
     values = data.get("values") or []
     if not values:
         return pd.DataFrame()
 
     df = pd.DataFrame(values)
-    # TwelveData отдаёт datetime строкой
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+
     for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     if "volume" in df.columns:
         df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
@@ -105,14 +143,8 @@ def td_fetch_timeseries(
     return df
 
 
-def fetch_range_in_windows(
-    cfg: TDConfig,
-    symbol: str,
-    interval: str,
-    years: int,
-    window_days: int,
-) -> pd.DataFrame:
-    end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+def fetch_range_in_windows(cfg: TDConfig, symbol: str, interval: str, years: int, window_days: int) -> pd.DataFrame:
+    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=int(years * 365))
 
     windows: List[Tuple[datetime, datetime]] = []
@@ -122,17 +154,16 @@ def fetch_range_in_windows(
         windows.append((cur, nxt))
         cur = nxt
 
-    all_parts: List[pd.DataFrame] = []
-    desc = f"TD {symbol} {interval}"
-    for (a, b) in tqdm(windows, desc=desc):
+    parts: List[pd.DataFrame] = []
+    for a, b in tqdm(windows, desc=f"TD {symbol} {interval}"):
         part = td_fetch_timeseries(cfg, symbol, interval, a, b)
         if not part.empty:
-            all_parts.append(part)
+            parts.append(part)
 
-    if not all_parts:
+    if not parts:
         return pd.DataFrame()
 
-    df = pd.concat(all_parts, ignore_index=True)
+    df = pd.concat(parts, ignore_index=True)
     df = df.sort_values("datetime").drop_duplicates("datetime")
     return df
 
@@ -155,7 +186,6 @@ def main() -> None:
     if not symbol_raw:
         raise RuntimeError("config missing: symbol")
 
-    # provider
     provider = cfg.get("provider") or {}
     api_env = str(provider.get("api_key_env") or "TWELVEDATA_API_KEY")
     api_key = os.getenv(api_env, "").strip()
@@ -164,13 +194,10 @@ def main() -> None:
 
     td_cfg = TDConfig(api_key=api_key)
 
-    # data
     data_cfg = cfg.get("data") or {}
     years = int(data_cfg.get("years", 5))
     data_dir = Path(str(data_cfg.get("data_dir") or "/data"))
     data_dir.mkdir(parents=True, exist_ok=True)
-
-    symbol_td = normalize_fx_symbol(symbol_raw)
 
     bars_5m = str(data_cfg.get("bars_5m") or f"{symbol_raw}_5m.parquet")
     bars_1h = str(data_cfg.get("bars_1h") or f"{symbol_raw}_1h.parquet")
@@ -185,20 +212,43 @@ def main() -> None:
         print(f" {p1}", flush=True)
         return
 
-    # 5m — окно помельче, 1h — можно крупнее
-    df5 = fetch_range_in_windows(td_cfg, symbol_td, "5min", years=years, window_days=30)
-    if df5.empty:
-        raise RuntimeError("Downloaded 5min dataframe is empty (check symbol / API key / limits)")
-    save_parquet(df5, p5)
+    # нормализация параметров для TwelveData
+    symbol_td = normalize_fx_symbol(symbol_raw)
+    interval_5m = normalize_interval("5m")
+    interval_1h = normalize_interval("1h")
 
-    df1 = fetch_range_in_windows(td_cfg, symbol_td, "1h", years=years, window_days=180)
-    if df1.empty:
-        raise RuntimeError("Downloaded 1h dataframe is empty (check symbol / API key / limits)")
-    save_parquet(df1, p1)
+    print(f"[TD] symbol_raw={symbol_raw} -> symbol_td={symbol_td}", flush=True)
+    print(f"[TD] intervals: 5m -> {interval_5m}, 1h -> {interval_1h}", flush=True)
 
-    print("[DATA] Built:", flush=True)
-    print(f"  {p5}", flush=True)
-    print(f"  {p1}", flush=True)
+    # если даже так не проходит — попробуем symbol_search
+    # (это сильно снижает шанс “invalid symbol”)
+    try_symbols = [symbol_td, symbol_raw]
+    found = td_symbol_search(td_cfg, symbol_raw)
+    if found and found not in try_symbols:
+        try_symbols.insert(0, found)
+
+    last_err = None
+    for sym in try_symbols:
+        try:
+            df5 = fetch_range_in_windows(td_cfg, sym, interval_5m, years=years, window_days=30)
+            if df5.empty:
+                raise RuntimeError("downloaded 5min dataframe is empty")
+            save_parquet(df5, p5)
+
+            df1 = fetch_range_in_windows(td_cfg, sym, interval_1h, years=years, window_days=180)
+            if df1.empty:
+                raise RuntimeError("downloaded 1h dataframe is empty")
+            save_parquet(df1, p1)
+
+            print("[DATA] Built:", flush=True)
+            print(f"  {p5}", flush=True)
+            print(f"  {p1}", flush=True)
+            return
+        except Exception as e:
+            last_err = e
+            print(f"[TD] symbol variant '{sym}' failed: {e}", flush=True)
+
+    raise RuntimeError(f"All symbol variants failed. Last error: {last_err}") from last_err
 
 
 if __name__ == "__main__":
