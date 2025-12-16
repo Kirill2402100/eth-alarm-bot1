@@ -49,30 +49,22 @@ def normalize_interval(tf: str) -> str:
     return mapping.get(s, s)
 
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-
-def sleep_to_next_minute(buffer_sec: int = 2) -> None:
-    """
-    TwelveData лимитится "на минуту". Спим до следующей минуты + буфер.
-    """
-    t = time.time()
-    # следующий "круглый" переход минуты
-    next_min = int(t // 60 + 1) * 60
-    sleep_for = max(1, next_min - int(t) + buffer_sec)
-    print(f"[TD] minute limit hit -> sleeping {sleep_for}s to next minute...", flush=True)
-    time.sleep(sleep_for)
-
-
-def is_minute_limit_error(msg: str) -> bool:
+def _is_daily_limit(msg: str) -> bool:
     m = (msg or "").lower()
-    return (
-        "run out of api credits for the current minute" in m
-        or "current limit" in m and "minute" in m
-        or "minute limit" in m
-        or "credits" in m and "minute" in m
-    )
+    return "run out of api credits for the day" in m or "current limit being" in m and "day" in m
+
+
+def _is_minute_limit(msg: str) -> bool:
+    m = (msg or "").lower()
+    return "current minute" in m or "limit for the current minute" in m
+
+
+def _sleep_to_next_minute() -> None:
+    now = datetime.now(timezone.utc)
+    nxt = (now + timedelta(minutes=1)).replace(second=2, microsecond=0)
+    sec = max(2, int((nxt - now).total_seconds()))
+    print(f"[TD] minute limit hit -> sleeping {sec}s to next minute...", flush=True)
+    time.sleep(sec)
 
 
 @dataclass
@@ -91,25 +83,28 @@ def td_request_json(url: str, params: Dict[str, Any], max_retries: int = 8) -> D
             r = requests.get(url, params=params, timeout=30)
             data = r.json()
 
-            # TwelveData ошибки часто в {"status":"error","message":...}
             if isinstance(data, dict) and data.get("status") == "error":
                 msg = str(data.get("message") or "")
-                if is_minute_limit_error(msg):
-                    sleep_to_next_minute(buffer_sec=2)
-                    # не тратим попытки на лимит минутный — продолжаем тем же attempt
-                    continue
+                # ВАЖНО: daily-limit нельзя “переждать” ретраями — только жжём кредиты
+                if _is_daily_limit(msg):
+                    raise RuntimeError(f"TwelveData DAILY limit: {msg}")
+                # minute-limit можно переждать до следующей минуты
+                if _is_minute_limit(msg):
+                    _sleep_to_next_minute()
+                    raise RuntimeError(f"TwelveData MINUTE limit: {msg}")
                 raise RuntimeError(f"TwelveData error: {msg}")
 
             return data
         except Exception as e:
             last_err = e
-            msg = str(e)
-            if is_minute_limit_error(msg):
-                sleep_to_next_minute(buffer_sec=2)
-                continue
+
+            # Если это daily limit — НЕ ретраим
+            if "DAILY limit" in str(e):
+                raise
 
             if attempt == max_retries:
                 break
+
             print(f"[TD] attempt {attempt}/{max_retries} failed: {e}. sleep {backoff}s", flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
@@ -158,7 +153,6 @@ def td_fetch_timeseries(cfg: TDConfig, symbol: str, interval: str, start_dt: dat
     }
 
     data = td_request_json(cfg.base_url, params=params)
-
     values = data.get("values") or []
     if not values:
         return pd.DataFrame()
@@ -177,27 +171,16 @@ def td_fetch_timeseries(cfg: TDConfig, symbol: str, interval: str, start_dt: dat
     return df
 
 
-def atomic_to_parquet(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_parquet(tmp, index=False)
-    tmp.replace(path)  # atomic rename на одном FS
-    print(f"Saved: {path}", flush=True)
-
-
-def load_partial(partial_path: Path) -> pd.DataFrame:
+def _load_partial(partial_path: Path) -> pd.DataFrame:
     try:
-        if partial_path.exists():
+        if partial_path.exists() and partial_path.stat().st_size > 0:
             df = pd.read_parquet(partial_path)
             if "datetime" in df.columns:
-                df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-            df = df.dropna(subset=["datetime"]).sort_values("datetime").drop_duplicates("datetime")
-            if not df.empty:
-                print(f"[RESUME] loaded partial: {partial_path} rows={len(df)} "
-                      f"from={df['datetime'].min()} to={df['datetime'].max()}", flush=True)
-            return df
-    except Exception as e:
-        print(f"[RESUME] failed to load partial {partial_path}: {e}", flush=True)
+                df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+                df = df.sort_values("datetime").drop_duplicates("datetime")
+                return df
+    except Exception:
+        pass
     return pd.DataFrame()
 
 
@@ -207,18 +190,19 @@ def fetch_range_in_windows(
     interval: str,
     years: int,
     window_days: int,
-    partial_path: Path,
+    partial_path: Optional[Path] = None,
 ) -> pd.DataFrame:
-    end_dt = now_utc()
+    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=int(years * 365))
 
-    # RESUME: если есть partial — продолжаем с последнего datetime
-    df_partial = load_partial(partial_path)
-    parts: List[pd.DataFrame] = []
-    if not df_partial.empty:
-        parts.append(df_partial)
-        last_dt = pd.to_datetime(df_partial["datetime"].max(), utc=True)
-        start_dt = max(start_dt, (last_dt.to_pydatetime() + timedelta(minutes=1)))
+    existing = pd.DataFrame()
+    if partial_path is not None:
+        existing = _load_partial(partial_path)
+        if not existing.empty:
+            last_dt = existing["datetime"].max()
+            # продолжаем чуть дальше последней точки, чтобы не дублировать окно
+            start_dt = max(start_dt, (last_dt + timedelta(minutes=1)).replace(second=0, microsecond=0))
+            print(f"[DATA] resume from partial: {partial_path} (last_dt={last_dt})", flush=True)
 
     windows: List[Tuple[datetime, datetime]] = []
     cur = start_dt
@@ -227,24 +211,39 @@ def fetch_range_in_windows(
         windows.append((cur, nxt))
         cur = nxt
 
+    parts: List[pd.DataFrame] = []
+    if not existing.empty:
+        parts.append(existing)
+
     for a, b in tqdm(windows, desc=f"TD {symbol} {interval}"):
         part = td_fetch_timeseries(cfg, symbol, interval, a, b)
         if not part.empty:
             parts.append(part)
-            df_all = pd.concat(parts, ignore_index=True).sort_values("datetime").drop_duplicates("datetime")
-            atomic_to_parquet(df_all, partial_path)
+
+        # сохраняем прогресс после каждого окна
+        if partial_path is not None and parts:
+            df_tmp = pd.concat(parts, ignore_index=True).sort_values("datetime").drop_duplicates("datetime")
+            partial_path.parent.mkdir(parents=True, exist_ok=True)
+            df_tmp.to_parquet(partial_path, index=False)
+            print(f"Saved: {partial_path}", flush=True)
 
     if not parts:
         return pd.DataFrame()
 
-    df = pd.concat(parts, ignore_index=True).sort_values("datetime").drop_duplicates("datetime")
+    df = pd.concat(parts, ignore_index=True)
+    df = df.sort_values("datetime").drop_duplicates("datetime")
     return df
+
+
+def save_parquet(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    print(f"Saved: {path}", flush=True)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--force", action="store_true", help="force re-download even if files exist")
     args = ap.parse_args()
 
     cfg_path = Path(args.config).resolve()
@@ -264,7 +263,7 @@ def main() -> None:
 
     data_cfg = cfg.get("data") or {}
     years = int(data_cfg.get("years", 5))
-    data_dir = Path(str(data_cfg.get("data_dir") or "/data"))
+    data_dir = Path(str(data_cfg.get("data_dir") or "./data"))
     data_dir.mkdir(parents=True, exist_ok=True)
 
     bars_5m = str(data_cfg.get("bars_5m") or f"{symbol_raw}_5m.parquet")
@@ -273,7 +272,8 @@ def main() -> None:
     p5 = data_dir / bars_5m
     p1 = data_dir / bars_1h
 
-    if not args.force and p5.exists() and p1.exists():
+    # если уже есть — не качаем
+    if p5.exists() and p1.exists():
         print("[DATA] Already exists, skip download:", flush=True)
         print(f" {p5}", flush=True)
         print(f" {p1}", flush=True)
@@ -294,28 +294,25 @@ def main() -> None:
     last_err = None
     for sym in try_symbols:
         try:
-            # 5m
-            partial_5m = data_dir / f".partial_{symbol_raw}_5m.parquet"
-            df5 = fetch_range_in_windows(td_cfg, sym, interval_5m, years=years, window_days=30, partial_path=partial_5m)
+            partial5 = data_dir / f".partial_{bars_5m}"
+            partial1 = data_dir / f".partial_{bars_1h}"
+
+            df5 = fetch_range_in_windows(td_cfg, sym, interval_5m, years=years, window_days=30, partial_path=partial5)
             if df5.empty:
                 raise RuntimeError("downloaded 5min dataframe is empty")
-            atomic_to_parquet(df5, p5)
-            # cleanup partial
-            try:
-                if partial_5m.exists():
-                    partial_5m.unlink()
-            except Exception:
-                pass
+            save_parquet(df5, p5)
 
-            # 1h
-            partial_1h = data_dir / f".partial_{symbol_raw}_1h.parquet"
-            df1 = fetch_range_in_windows(td_cfg, sym, interval_1h, years=years, window_days=180, partial_path=partial_1h)
+            df1 = fetch_range_in_windows(td_cfg, sym, interval_1h, years=years, window_days=180, partial_path=partial1)
             if df1.empty:
                 raise RuntimeError("downloaded 1h dataframe is empty")
-            atomic_to_parquet(df1, p1)
+            save_parquet(df1, p1)
+
+            # можно подчистить partial
             try:
-                if partial_1h.exists():
-                    partial_1h.unlink()
+                if partial5.exists():
+                    partial5.unlink()
+                if partial1.exists():
+                    partial1.unlink()
             except Exception:
                 pass
 
