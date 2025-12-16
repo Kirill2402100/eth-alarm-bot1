@@ -2,46 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import inspect
 import os
-import sys
-import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-
-def ensure_repo_on_syspath() -> Path:
-    """
-    ВАЖНО: это должно выполняться ДО любых `from sim...`
-    """
-    app_root = Path(__file__).resolve().parents[1]
-    os.chdir(app_root)
-    if str(app_root) not in sys.path:
-        sys.path.insert(0, str(app_root))
-    return app_root
-
-
-APP_ROOT = ensure_repo_on_syspath()
-
-import pandas as pd  # noqa: E402
-import yaml  # noqa: E402
-
-from sim.broker_fx import BrokerFX  # noqa: E402
-from sim.engine import run_strategy  # noqa: E402
-
-
-SWEEP_KEYS = {
-    "strategic_lookback_days",
-    "tactical_lookback_days",
-    "q_lower",
-    "q_upper",
-    "range_min_atr_mult",
-    "dca_levels",
-    "dca_growth",
-    "bank_usd",
-    "cum_deposit_frac_at_full",
-    "tp_pct",
-}
+import pandas as pd
+import requests
+import yaml
+from tqdm import tqdm
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -49,139 +20,127 @@ def load_yaml(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def list_data_dir(data_dir: Path) -> None:
-    print("=== DEBUG ===", flush=True)
-    print(f"cwd: {os.getcwd()}", flush=True)
-    print(f"APP_ROOT: {APP_ROOT}", flush=True)
-    print(f"data_dir: {data_dir}", flush=True)
-    print("ls -lah /data:", flush=True)
-
-    try:
-        if data_dir.exists():
-            items = sorted(list(data_dir.iterdir()))
-            if not items:
-                print(" (empty)", flush=True)
-            for x in items:
-                if x.is_dir():
-                    print(f" {x.name}/", flush=True)
-                else:
-                    mb = x.stat().st_size / (1024 * 1024)
-                    print(f" {x.name:30s} {mb:6.2f} MB", flush=True)
-        else:
-            print(" (missing dir)", flush=True)
-    except Exception as e:
-        print(f" (list failed: {e})", flush=True)
-
-    print("=============", flush=True)
-
-
-def ensure_data(cfg_path: Path, cfg: Dict[str, Any]) -> Tuple[Path, Path]:
-    data_cfg = cfg.get("data") or {}
-    symbol = str(cfg.get("symbol") or "").strip()
-    if not symbol:
-        raise RuntimeError("config missing: symbol")
-
-    data_dir = Path(str(data_cfg.get("data_dir") or "/data"))
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    bars_5m = str(data_cfg.get("bars_5m") or f"{symbol}_5m.parquet")
-    bars_1h = str(data_cfg.get("bars_1h") or f"{symbol}_1h.parquet")
-
-    p5 = data_dir / bars_5m
-    p1 = data_dir / bars_1h
-
-    list_data_dir(data_dir)
-
-    if p5.exists() and p1.exists():
-        print("[DATA] Using cached files:", flush=True)
-        print(f" {p5}", flush=True)
-        print(f" {p1}", flush=True)
-        return p5, p1
-
-    print("[DATA] Missing parquet(s), building dataset now...", flush=True)
-    subprocess.check_call([sys.executable, "-u", "-m", "scripts.build_dataset", "--config", str(cfg_path)])
-
-    list_data_dir(data_dir)
-
-    if not (p5.exists() and p1.exists()):
-        raise RuntimeError(f"[DATA] build_dataset finished but files still missing: {p5}, {p1}")
-
-    print("[DATA] Built:", flush=True)
-    print(f" {p5}", flush=True)
-    print(f" {p1}", flush=True)
-    return p5, p1
-
-
-def build_grid(strategy_cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Tuple[str, List[Any]]]]:
-    base: Dict[str, Any] = {}
-    sweeps: List[Tuple[str, List[Any]]] = []
-    for k, v in (strategy_cfg or {}).items():
-        if k in SWEEP_KEYS and isinstance(v, list):
-            sweeps.append((k, v))
-        else:
-            base[k] = v
-    return base, sweeps
-
-
-def iter_product(sweeps: List[Tuple[str, List[Any]]]) -> List[Dict[str, Any]]:
-    if not sweeps:
-        return [{}]
-    out = [{}]
-    for (k, vals) in sweeps:
-        new_out = []
-        for cur in out:
-            for x in vals:
-                d = dict(cur)
-                d[k] = x
-                new_out.append(d)
-        out = new_out
-    return out
-
-
-def call_run_strategy_compat(
-    symbol: str,
-    df_entry: pd.DataFrame,
-    df_range: pd.DataFrame,
-    broker: BrokerFX,
-    params: Dict[str, Any],
-) -> Any:
+def normalize_fx_symbol(sym: str) -> str:
     """
-    Поддерживает как минимум твою текущую сигнатуру из sim/engine.py:
-        run_strategy(symbol, df5, df1h, broker, params)
-
-    И ещё несколько вариантов (на будущее), если поменяешь имена аргументов.
+    TwelveData по FX часто любит формат 'EUR/USD'.
+    Если дали 'EURUSD' (6 букв) — превратим в 'EUR/USD'.
     """
-    sig = inspect.signature(run_strategy)
-    names = list(sig.parameters.keys())
+    s = (sym or "").strip()
+    if "/" in s:
+        return s
+    if len(s) == 6 and s.isalpha():
+        return f"{s[:3]}/{s[3:]}"
+    return s
 
-    # Самый частый случай под твой engine.py:
-    if len(names) >= 5 and ("params" in sig.parameters):
-        # пробуем понять имена датафреймов
-        df5_name_candidates = {"df5", "df_5m", "bars_5m", "df_entry", "entry_df"}
-        df1h_name_candidates = {"df1h", "df_1h", "bars_1h", "df_range", "range_df"}
 
-        kwargs: Dict[str, Any] = {}
-        for pname in sig.parameters.keys():
-            if pname in {"symbol", "sym", "pair"}:
-                kwargs[pname] = symbol
-            elif pname in df5_name_candidates:
-                kwargs[pname] = df_entry
-            elif pname in df1h_name_candidates:
-                kwargs[pname] = df_range
-            elif pname in {"broker", "brk"}:
-                kwargs[pname] = broker
-            elif pname == "params":
-                kwargs[pname] = params
+@dataclass
+class TDConfig:
+    api_key: str
+    base_url: str = "https://api.twelvedata.com/time_series"
 
-        # если получилось собрать всё нужное — вызываем
+
+def td_request(cfg: TDConfig, params: Dict[str, Any], max_retries: int = 8) -> Dict[str, Any]:
+    backoff = 2
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
         try:
-            return run_strategy(**kwargs)
-        except TypeError:
-            # fallback позиционно именно под: (symbol, df5, df1h, broker, params)
-            return run_strategy(symbol, df_entry, df_range, broker, params)
+            r = requests.get(cfg.base_url, params=params, timeout=30)
+            data = r.json()
 
-    # fallback: очень старые/другие сигнатуры
-    return run_strategy(symbol, df_entry, df_range, broker, params)
+            # TwelveData ошибки часто кладёт в {"status":"error","message":...}
+            if isinstance(data, dict) and data.get("status") == "error":
+                raise RuntimeError(f"TwelveData error: {data.get('message')}")
+
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt == max_retries:
+                break
+            print(f"[TD] attempt {attempt}/{max_retries} failed: {e}. sleep {backoff}s", flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    raise RuntimeError(f"TwelveData request failed after retries: {last_err}") from last_err
+
+
+def td_fetch_timeseries(
+    cfg: TDConfig,
+    symbol: str,
+    interval: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    outputsize: int = 5000,
+) -> pd.DataFrame:
+    """
+    Качаем кусками (по времени), чтобы не упираться в лимиты outputsize.
+    """
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "apikey": cfg.api_key,
+        "format": "JSON",
+        "outputsize": outputsize,
+        "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "timezone": "UTC",
+        "order": "ASC",
+    }
+
+    data = td_request(cfg, params=params)
+
+    values = data.get("values") or []
+    if not values:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(values)
+    # TwelveData отдаёт datetime строкой
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    df = df.sort_values("datetime").drop_duplicates("datetime")
+    return df
+
+
+def fetch_range_in_windows(
+    cfg: TDConfig,
+    symbol: str,
+    interval: str,
+    years: int,
+    window_days: int,
+) -> pd.DataFrame:
+    end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(days=int(years * 365))
+
+    windows: List[Tuple[datetime, datetime]] = []
+    cur = start_dt
+    while cur < end_dt:
+        nxt = min(cur + timedelta(days=window_days), end_dt)
+        windows.append((cur, nxt))
+        cur = nxt
+
+    all_parts: List[pd.DataFrame] = []
+    desc = f"TD {symbol} {interval}"
+    for (a, b) in tqdm(windows, desc=desc):
+        part = td_fetch_timeseries(cfg, symbol, interval, a, b)
+        if not part.empty:
+            all_parts.append(part)
+
+    if not all_parts:
+        return pd.DataFrame()
+
+    df = pd.concat(all_parts, ignore_index=True)
+    df = df.sort_values("datetime").drop_duplicates("datetime")
+    return df
+
+
+def save_parquet(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    print(f"Saved: {path}", flush=True)
 
 
 def main() -> None:
@@ -192,66 +151,54 @@ def main() -> None:
     cfg_path = Path(args.config).resolve()
     cfg = load_yaml(str(cfg_path))
 
-    symbol = str(cfg.get("symbol") or "").strip()
-    if not symbol:
+    symbol_raw = str(cfg.get("symbol") or "").strip()
+    if not symbol_raw:
         raise RuntimeError("config missing: symbol")
 
-    # ensure data
-    p5, p1 = ensure_data(cfg_path, cfg)
+    # provider
+    provider = cfg.get("provider") or {}
+    api_env = str(provider.get("api_key_env") or "TWELVEDATA_API_KEY")
+    api_key = os.getenv(api_env, "").strip()
+    if not api_key:
+        raise RuntimeError(f"Missing env var {api_env} (TwelveData API key)")
 
-    # load data
-    df_entry = pd.read_parquet(p5)
-    df_range = pd.read_parquet(p1)
+    td_cfg = TDConfig(api_key=api_key)
 
-    # broker
-    bcfg = cfg.get("broker") or {}
-    broker = BrokerFX(
-        leverage=float(bcfg.get("leverage", 200)),
-        spread_points=float(bcfg.get("spread_points", 8)),
-        tick=float(bcfg.get("tick", 0.00001)),
-        margin_call_level=float(bcfg.get("margin_call_level", 0.20)),
-        stop_out_level=float(bcfg.get("stop_out_level", 0.00)),
-    )
+    # data
+    data_cfg = cfg.get("data") or {}
+    years = int(data_cfg.get("years", 5))
+    data_dir = Path(str(data_cfg.get("data_dir") or "/data"))
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    # strategy config
-    strat = cfg.get("strategy") or {}
-    base_params, sweeps = build_grid(strat)
-    combos = iter_product(sweeps)
+    symbol_td = normalize_fx_symbol(symbol_raw)
 
-    report_cfg = cfg.get("report") or {}
-    out_dir = Path(str(report_cfg.get("out_dir") or "/data/out"))
-    out_dir.mkdir(parents=True, exist_ok=True)
+    bars_5m = str(data_cfg.get("bars_5m") or f"{symbol_raw}_5m.parquet")
+    bars_1h = str(data_cfg.get("bars_1h") or f"{symbol_raw}_1h.parquet")
 
-    total = len(combos)
-    print(f"[GRID] total combinations: {total}", flush=True)
+    p5 = data_dir / bars_5m
+    p1 = data_dir / bars_1h
 
-    results: List[Dict[str, Any]] = []
+    # если уже есть — не качаем
+    if p5.exists() and p1.exists():
+        print("[DATA] Already exists, skip download:", flush=True)
+        print(f" {p5}", flush=True)
+        print(f" {p1}", flush=True)
+        return
 
-    for i, combo in enumerate(combos, 1):
-        params = dict(base_params)
-        params.update(combo)
+    # 5m — окно помельче, 1h — можно крупнее
+    df5 = fetch_range_in_windows(td_cfg, symbol_td, "5min", years=years, window_days=30)
+    if df5.empty:
+        raise RuntimeError("Downloaded 5min dataframe is empty (check symbol / API key / limits)")
+    save_parquet(df5, p5)
 
-        print(f"[GRID] {i}/{total} params={params}", flush=True)
+    df1 = fetch_range_in_windows(td_cfg, symbol_td, "1h", years=years, window_days=180)
+    if df1.empty:
+        raise RuntimeError("Downloaded 1h dataframe is empty (check symbol / API key / limits)")
+    save_parquet(df1, p1)
 
-        res = call_run_strategy_compat(
-            symbol=symbol,
-            df_entry=df_entry,
-            df_range=df_range,
-            broker=broker,
-            params=params,
-        )
-
-        row = dict(params)
-        row["_i"] = i
-        row["_ok"] = True
-        row["_result_type"] = type(res).__name__
-        results.append(row)
-
-        if i % 50 == 0:
-            pd.DataFrame(results).to_csv(out_dir / "grid_progress.csv", index=False)
-
-    pd.DataFrame(results).to_csv(out_dir / "grid_results.csv", index=False)
-    print(f"[GRID] done. saved: {out_dir / 'grid_results.csv'}", flush=True)
+    print("[DATA] Built:", flush=True)
+    print(f"  {p5}", flush=True)
+    print(f"  {p1}", flush=True)
 
 
 if __name__ == "__main__":
