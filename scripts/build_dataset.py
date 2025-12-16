@@ -1,12 +1,15 @@
 # scripts/build_dataset.py
 from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
 import requests
 import pandas as pd
 from tqdm import tqdm
 
+# TwelveData интервалы
 TD_INTERVALS = {
     "5m": "5min",
     "15m": "15min",
@@ -14,6 +17,22 @@ TD_INTERVALS = {
     "4h": "4h",
     "1d": "1day",
 }
+
+def normalize_twelvedata_symbol(sym: str) -> str:
+    """
+    TwelveData для FX обычно ожидает формат "EUR/USD", "GBP/JPY", "XAU/USD" и т.п.
+    У тебя в конфиге удобнее держать "EURUSD", поэтому нормализуем на лету.
+    """
+    s = (sym or "").strip().upper()
+    if "/" in s:
+        return s
+    # EURUSD -> EUR/USD
+    if len(s) == 6 and s.isalpha():
+        return f"{s[:3]}/{s[3:]}"
+    # XAUUSD / XAGUSD -> XAU/USD (3+3)
+    if len(s) == 6 and s[:3].isalpha() and s[3:].isalpha():
+        return f"{s[:3]}/{s[3:]}"
+    return s
 
 @dataclass
 class TDConfig:
@@ -35,55 +54,67 @@ def td_fetch_chunk(cfg: TDConfig, start: datetime, end: datetime) -> pd.DataFram
         "format": "JSON",
         "apikey": cfg.api_key,
     }
+
     r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
+
     data = r.json()
     if isinstance(data, dict) and data.get("status") == "error":
         raise RuntimeError(f"TwelveData error: {data.get('message')}")
+
     rows = (data or {}).get("values", [])
     if not rows:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
     df = pd.DataFrame(rows)
-    # TwelveData uses "datetime"
+
+    # TwelveData обычно отдаёт "datetime"
     if "datetime" not in df.columns:
-        raise RuntimeError("Unexpected TwelveData response: no datetime")
+        raise RuntimeError("Unexpected TwelveData response: no datetime column")
+
     df["time"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
 
-    for c in ["open","high","low","close","volume"]:
+    # Приводим OHLCV
+    for c in ["open", "high", "low", "close", "volume"]:
         if c not in df.columns:
             df[c] = 0.0
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df[["open","high","low","close","volume"]].dropna(how="any")
+    df = df[["open", "high", "low", "close", "volume"]].dropna(how="any")
     return df
 
 def choose_chunk_days(interval: str) -> int:
-    # чтобы не вылетать за 5000 точек/запрос (ограничение TwelveData)  [oai_citation:2‡support.twelvedata.com](https://support.twelvedata.com/en/articles/5214728-getting-historical-data?utm_source=chatgpt.com)
+    """
+    TwelveData лимитирует количество точек на запрос (часто 5000).
+    Выбираем размер чанка так, чтобы примерно не превышать лимит.
+    """
     if interval == "5m":
-        return 14   # 14*288 = 4032
+        return 14    # 14*288 = 4032
     if interval == "15m":
-        return 60   # 60*96 = 5760 (чуть больше, можно уменьшить до 50 если будут ошибки)
+        return 45    # 45*96 = 4320 (безопаснее, чем 60)
     if interval == "1h":
-        return 180  # 180*24 = 4320
+        return 180   # 180*24 = 4320
     if interval == "4h":
-        return 700  # 700*6 = 4200
+        return 700   # 700*6 = 4200
     return 365
 
-def fetch_twelvedata_to_parquet(api_key: str, symbol: str, interval: str, years: int, out_path: str) -> str:
+def fetch_twelvedata_to_parquet(api_key: str, symbol_raw: str, interval: str, years: int, out_path: str) -> str:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start = end - timedelta(days=365*years)
+    start = end - timedelta(days=365 * years)
 
-    cfg = TDConfig(api_key=api_key, symbol=symbol, interval=interval, start=start, end=end)
+    symbol_td = normalize_twelvedata_symbol(symbol_raw)
+    cfg = TDConfig(api_key=api_key, symbol=symbol_td, interval=interval, start=start, end=end)
 
     chunk_days = choose_chunk_days(interval)
     cur = start
-    frames = []
+    frames: list[pd.DataFrame] = []
 
-    pbar = tqdm(total=((end - start).days // chunk_days) + 1, desc=f"TD {symbol} {interval}")
+    steps = max(1, ((end - start).days // chunk_days) + 1)
+    pbar = tqdm(total=steps, desc=f"TD {symbol_raw} ({symbol_td}) {interval}")
+
     while cur < end:
         nxt = min(end, cur + timedelta(days=chunk_days))
         df = td_fetch_chunk(cfg, cur, nxt)
@@ -91,6 +122,7 @@ def fetch_twelvedata_to_parquet(api_key: str, symbol: str, interval: str, years:
             frames.append(df)
         cur = nxt
         pbar.update(1)
+
     pbar.close()
 
     if not frames:
@@ -102,15 +134,18 @@ def fetch_twelvedata_to_parquet(api_key: str, symbol: str, interval: str, years:
     return out_path
 
 def main():
-    import argparse, yaml
+    import argparse
+    import yaml
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
-    api_key = os.getenv(cfg["provider"]["api_key_env"], "").strip()
+    api_key_env = cfg["provider"]["api_key_env"]
+    api_key = os.getenv(api_key_env, "").strip()
     if not api_key:
-        raise RuntimeError(f"Missing API key env: {cfg['provider']['api_key_env']}")
+        raise RuntimeError(f"Missing API key env: {api_key_env}")
 
     symbol = cfg["symbol"]
     years = int(cfg["data"]["years"])
