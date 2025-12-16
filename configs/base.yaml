@@ -2,7 +2,8 @@ symbol: EURUSD
 
 data:
   years: 5
-  data_dir: /data
+  # локально на ноут (внутри репо)
+  data_dir: ./data
   bars_5m: EURUSD_5m.parquet
   bars_1h: EURUSD_1h.parquet
 
@@ -17,7 +18,7 @@ broker:
   margin_call_level: 0.20
   stop_out_level: 0.00
 
-# --- параметры стратегии (по умолчанию как у тебя) ---
+# --- параметры стратегии ---
 strategy:
   tf_entry: 5m
   tf_range: 1h
@@ -39,11 +40,11 @@ strategy:
   bank_usd: [1500.0]
   cum_deposit_frac_at_full: [0.66]
 
-  # цели усреднений (как в твоём коде)
+  # цели усреднений
   tactical_pcts: [0.40, 0.80]
   strategic_pcts: [0.10, 0.45, 0.90]
 
-  # TP + трейлинг (как у тебя)
+  # TP + трейлинг
   tp_pct: [0.003, 0.005, 0.008, 0.010]
   trailing_stages:
     - [0.35, 0.25]
@@ -56,5 +57,6 @@ strategy:
   vol_win: 50
 
 report:
-  out_dir: /data/out
+  # тоже локально в ./data/out
+  out_dir: ./data/out
   save_trades: true
