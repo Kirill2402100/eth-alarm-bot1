@@ -1,0 +1,60 @@
+symbol: EURUSD
+
+data:
+  years: 5
+  data_dir: /data
+  bars_5m: EURUSD_5m.parquet
+  bars_1h: EURUSD_1h.parquet
+
+provider:
+  name: twelvedata
+  api_key_env: TWELVEDATA_API_KEY
+
+broker:
+  leverage: 200
+  spread_points: 8
+  tick: 0.00001
+  margin_call_level: 0.20
+  stop_out_level: 0.00
+
+# --- параметры стратегии (по умолчанию как у тебя) ---
+strategy:
+  tf_entry: 5m
+  tf_range: 1h
+  strategic_lookback_days: [30, 60, 90]
+  tactical_lookback_days: [3]
+  q_lower: [0.02, 0.025, 0.05]
+  q_upper: [0.98, 0.975, 0.95]
+  range_min_atr_mult: [1.0, 1.5, 2.0]
+
+  # вход/коридор
+  entry_long_thr: 0.30
+  entry_short_thr: 0.70
+  break_eps: 0.0025
+  reentry_band: 0.003
+
+  # DCA
+  dca_levels: [4, 6, 8, 10]
+  dca_growth: [1.4, 1.6, 1.8, 2.0, 2.2]
+  bank_usd: [1500.0]
+  cum_deposit_frac_at_full: [0.66]
+
+  # цели усреднений (как в твоём коде)
+  tactical_pcts: [0.40, 0.80]
+  strategic_pcts: [0.10, 0.45, 0.90]
+
+  # TP + трейлинг (как у тебя)
+  tp_pct: [0.003, 0.005, 0.008, 0.010]
+  trailing_stages:
+    - [0.35, 0.25]
+    - [0.60, 0.50]
+    - [0.85, 0.75]
+
+  # индикаторы
+  rsi_len: 14
+  adx_len: 14
+  vol_win: 50
+
+report:
+  out_dir: /data/out
+  save_trades: true
