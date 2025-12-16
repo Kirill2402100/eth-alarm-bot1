@@ -1,249 +1,248 @@
-# scripts/build_dataset.py
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+import argparse
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, List
 
-import requests
 import pandas as pd
+import requests
+import yaml
 from tqdm import tqdm
 
 
-# TwelveData intervals
-TD_INTERVALS = {
-    "5m": "5min",
-    "15m": "15min",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1day",
-}
+# ----------------------------
+# Config helpers
+# ----------------------------
+
+def load_yaml(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-def normalize_twelvedata_symbol(sym: str) -> str:
-    """
-    TwelveData FX expects format like 'EUR/USD'. In config we keep 'EURUSD'.
-    """
-    s = (sym or "").strip().upper()
-    if "/" in s:
-        return s
-    if len(s) == 6 and s.isalpha():
-        return f"{s[:3]}/{s[3:]}"
-    return s
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
+
+def atomic_write_parquet(df: pd.DataFrame, out_path: Path) -> None:
+    ensure_dir(out_path.parent)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(out_path)
+
+
+def file_ok(path: Path, min_bytes: int = 1024) -> bool:
+    # простая проверка "файл не пустой"
+    return path.exists() and path.is_file() and path.stat().st_size >= min_bytes
+
+
+# ----------------------------
+# TwelveData client
+# ----------------------------
 
 @dataclass
 class TDConfig:
     api_key: str
     symbol: str
     interval: str
+    start: str  # YYYY-MM-DD
+    end: str    # YYYY-MM-DD
+    outputsize: int = 5000
+    timezone: str = "UTC"
+    retries: int = 8
 
 
-def _is_rate_limit_err(msg: str) -> bool:
-    m = (msg or "").lower()
-    return ("run out of api credits" in m) or ("rate limit" in m) or ("too many requests" in m)
+TD_URL = "https://api.twelvedata.com/time_series"
 
 
-def td_fetch_chunk(cfg: TDConfig, start: datetime, end: datetime) -> pd.DataFrame:
-    url = "https://api.twelvedata.com/time_series"
+def _td_sleep_for_rate_limit(msg: str) -> int:
+    """
+    TwelveData пишет:
+    'You have run out of API credits for the current minute...'
+    Спим до следующей минуты + небольшой буфер.
+    """
+    if "current minute" in (msg or "").lower() or "credits" in (msg or "").lower():
+        now = datetime.now(timezone.utc)
+        # до следующей минуты + 2 сек
+        nxt = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
+        return max(5, int((nxt - now).total_seconds()) + 2)
+    return 0
+
+
+def td_fetch_chunk(cfg: TDConfig) -> pd.DataFrame:
     params = {
         "symbol": cfg.symbol,
-        "interval": TD_INTERVALS[cfg.interval],
-        "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
-        "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
-        "timezone": "UTC",
-        "order": "ASC",
-        "format": "JSON",
+        "interval": cfg.interval,
         "apikey": cfg.api_key,
+        "start_date": cfg.start,
+        "end_date": cfg.end,
+        "outputsize": cfg.outputsize,
+        "timezone": cfg.timezone,
+        "format": "JSON",
+        "order": "ASC",
     }
 
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
+    last_err = None
+    for attempt in range(1, cfg.retries + 1):
+        try:
+            r = requests.get(TD_URL, params=params, timeout=40)
+            data = r.json()
 
-    data = r.json()
-    if isinstance(data, dict) and data.get("status") == "error":
-        raise RuntimeError(str(data.get("message", "unknown TwelveData error")))
+            if isinstance(data, dict) and data.get("status") == "error":
+                msg = str(data.get("message") or data)
+                # rate limit
+                slp = _td_sleep_for_rate_limit(msg)
+                if slp > 0:
+                    print(f"[TD] Rate limit: sleep {slp}s. msg={msg}", flush=True)
+                    time.sleep(slp)
+                    continue
+                raise RuntimeError(f"TwelveData error: {msg}")
 
-    rows = (data or {}).get("values", [])
-    if not rows:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+            values = (data or {}).get("values") or []
+            if not values:
+                # иногда бывают пустые окна — просто возвращаем пустой DF
+                return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
 
-    df = pd.DataFrame(rows)
-    if "datetime" not in df.columns:
-        raise RuntimeError("Unexpected TwelveData response: no datetime column")
+            df = pd.DataFrame(values)
+            # TwelveData отдаёт строки
+            df.rename(columns={"datetime": "datetime"}, inplace=True)
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+            df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return df
 
-    df["time"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-    df = df.dropna(subset=["time"]).set_index("time").sort_index()
+        except Exception as e:
+            last_err = e
+            backoff = min(60, 2 ** attempt)
+            print(f"[TD] attempt {attempt}/{cfg.retries} failed: {e}. sleep {backoff}s", flush=True)
+            time.sleep(backoff)
 
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c not in df.columns:
-            df[c] = 0.0
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df[["open", "high", "low", "close", "volume"]].dropna(how="any")
-    df = df[~df.index.duplicated(keep="last")]
-    return df
+    raise RuntimeError(f"[TD] failed after retries: {last_err}")
 
 
-def choose_chunk_days(interval: str) -> int:
+def year_windows(years: int) -> List[Tuple[datetime, datetime]]:
     """
-    Keep under typical 5000 points/request.
+    Делаем окна по ~30 дней (чтобы не упираться в лимиты outputsize/объёмы).
     """
-    if interval == "5m":
-        return 17   # 17*288=4896 (чуть эффективнее, чем 14д)
-    if interval == "15m":
-        return 45   # 45*96=4320
-    if interval == "1h":
-        return 180  # 180*24=4320
-    if interval == "4h":
-        return 700  # 700*6=4200
-    return 365
-
-
-class MinuteRateLimiter:
-    """
-    Простая защита от лимита credits/min.
-    Мы делаем паузу между запросами так, чтобы не превышать лимит.
-    """
-    def __init__(self, credits_per_minute: int = 8, safety: float = 0.85):
-        self.credits_per_minute = max(1, int(credits_per_minute))
-        # safety<1 => чуть реже, чем лимит
-        self.min_interval = (60.0 / self.credits_per_minute) / max(safety, 0.1)
-        self._last_ts = 0.0
-
-    def wait(self):
-        now = time.time()
-        if self._last_ts <= 0:
-            self._last_ts = now
-            return
-        elapsed = now - self._last_ts
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last_ts = time.time()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(years * 365.25))
+    cur = start
+    out = []
+    step = timedelta(days=30)
+    while cur < end:
+        nxt = min(end, cur + step)
+        out.append((cur, nxt))
+        cur = nxt
+    return out
 
 
 def fetch_twelvedata_to_parquet(
     api_key: str,
-    symbol_raw: str,
+    symbol: str,
     interval: str,
     years: int,
-    out_path: str,
-    credits_per_minute: int = 8,
-) -> str:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_path: Path,
+    force: bool = False,
+) -> Path:
+    if file_ok(out_path) and not force:
+        print(f"[DATA] Cached exists, skip: {out_path}", flush=True)
+        return out_path
 
-    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start = end - timedelta(days=365 * years)
+    ensure_dir(out_path.parent)
 
-    symbol_td = normalize_twelvedata_symbol(symbol_raw)
-    cfg = TDConfig(api_key=api_key, symbol=symbol_td, interval=interval)
+    windows = year_windows(years)
+    dfs = []
 
-    # Resume: if file exists, continue from last index
-    if os.path.exists(out_path):
-        try:
-            existing = pd.read_parquet(out_path).sort_index()
-            if not existing.empty and isinstance(existing.index, pd.DatetimeIndex):
-                last_ts = existing.index.max()
-                # чуть сдвинем вперед, чтобы не дублировать последнюю свечу
-                start = max(start, (last_ts + pd.Timedelta(minutes=1)).to_pydatetime())
-        except Exception:
-            # если parquet битый/не читается — начнём заново
-            pass
-
-    chunk_days = choose_chunk_days(interval)
-    limiter = MinuteRateLimiter(credits_per_minute=credits_per_minute, safety=0.80)
-
-    cur = start
-    frames: list[pd.DataFrame] = []
-
-    # если есть существующие данные — подтянем их в начало
-    if os.path.exists(out_path):
-        try:
-            existing = pd.read_parquet(out_path).sort_index()
-            if not existing.empty:
-                frames.append(existing)
-        except Exception:
-            pass
-
-    # оценка шагов только для tqdm (не критично)
-    steps = max(1, ((end - cur).days // chunk_days) + 1)
-    pbar = tqdm(total=steps, desc=f"TD {symbol_raw} ({symbol_td}) {interval}")
-
-    while cur < end:
-        nxt = min(end, cur + timedelta(days=chunk_days))
-
-        # ВАЖНО: соблюдаем темп
-        limiter.wait()
-
-        # Retry на лимиты/временные ошибки
-        attempt = 0
-        while True:
-            try:
-                df = td_fetch_chunk(cfg, cur, nxt)
-                break
-            except Exception as e:
-                attempt += 1
-                msg = str(e)
-                if _is_rate_limit_err(msg):
-                    # подождём до следующего “окна”
-                    time.sleep(65)
-                    continue
-                # сетевые/прочее — несколько попыток
-                if attempt <= 3:
-                    time.sleep(2.0 * attempt)
-                    continue
-                raise
-
+    label = f"TD {symbol} {interval}"
+    for (a, b) in tqdm(windows, desc=label):
+        cfg = TDConfig(
+            api_key=api_key,
+            symbol=symbol,
+            interval=interval,
+            start=a.date().isoformat(),
+            end=b.date().isoformat(),
+            outputsize=5000,
+        )
+        df = td_fetch_chunk(cfg)
         if not df.empty:
-            frames.append(df)
+            dfs.append(df)
 
-        cur = nxt
-        pbar.update(1)
+    if not dfs:
+        raise RuntimeError(f"[DATA] No data downloaded for {symbol} {interval}")
 
-    pbar.close()
+    df_all = pd.concat(dfs, ignore_index=True)
+    df_all = df_all.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
 
-    if not frames:
-        raise RuntimeError("No data received from TwelveData")
-
-    out = pd.concat(frames).sort_index()
-    out = out[~out.index.duplicated(keep="last")]
-    out.to_parquet(out_path, index=True)
+    atomic_write_parquet(df_all, out_path)
+    print(f"Saved: {out_path}", flush=True)
     return out_path
 
 
-def main():
-    import argparse
-    import yaml
+# ----------------------------
+# Main
+# ----------------------------
 
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
+    ap.add_argument("--force", action="store_true", help="rebuild even if cached files exist")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
+    cfg_path = Path(args.config).resolve()
+    cfg = load_yaml(str(cfg_path))
 
-    api_key_env = cfg["provider"]["api_key_env"]
+    symbol = str(cfg.get("symbol") or "").strip()
+    if not symbol:
+        raise RuntimeError("config missing: symbol")
+
+    data_cfg = cfg.get("data") or {}
+    years = int(data_cfg.get("years") or 5)
+    data_dir = Path(str(data_cfg.get("data_dir") or "/data"))
+
+    bars_5m = str(data_cfg.get("bars_5m") or f"{symbol}_5m.parquet")
+    bars_1h = str(data_cfg.get("bars_1h") or f"{symbol}_1h.parquet")
+
+    provider = cfg.get("provider") or {}
+    api_key_env = str(provider.get("api_key_env") or "TWELVEDATA_API_KEY")
     api_key = os.getenv(api_key_env, "").strip()
     if not api_key:
-        raise RuntimeError(f"Missing API key env: {api_key_env}")
+        raise RuntimeError(f"Missing env var {api_key_env} with TwelveData api key")
 
-    symbol = cfg["symbol"]
-    years = int(cfg["data"]["years"])
-    data_dir = cfg["data"]["data_dir"]
+    p5 = data_dir / bars_5m
+    p1 = data_dir / bars_1h
 
-    p5 = os.path.join(data_dir, cfg["data"]["bars_5m"])
-    p1 = os.path.join(data_dir, cfg["data"]["bars_1h"])
+    print("=== DEBUG ===", flush=True)
+    print(f"cwd: {os.getcwd()}", flush=True)
+    print(f"APP_ROOT: {Path(__file__).resolve().parents[1]}", flush=True)
+    print(f"data_dir: {data_dir}", flush=True)
+    try:
+        if data_dir.exists():
+            print("ls -lah /data:", flush=True)
+            for x in sorted(data_dir.iterdir()):
+                if x.is_dir():
+                    print(f"  {x.name}/", flush=True)
+                else:
+                    mb = x.stat().st_size / (1024 * 1024)
+                    print(f"  {x.name:30s} {mb:6.2f} MB", flush=True)
+    except Exception as e:
+        print(f"[WARN] list data_dir failed: {e}", flush=True)
+    print("=============", flush=True)
 
-    # Можно переопределить лимит через env, если вдруг план другой
-    credits_per_minute = int(os.getenv("TWELVEDATA_CREDITS_PER_MIN", "8"))
+    fetch_twelvedata_to_parquet(api_key, symbol, "5m", years, p5, force=args.force)
+    fetch_twelvedata_to_parquet(api_key, symbol, "1h", years, p1, force=args.force)
 
-    # 5m
-    fetch_twelvedata_to_parquet(api_key, symbol, "5m", years, p5, credits_per_minute=credits_per_minute)
-    print("Saved:", p5)
-
-    # 1h
-    fetch_twelvedata_to_parquet(api_key, symbol, "1h", years, p1, credits_per_minute=credits_per_minute)
-    print("Saved:", p1)
+    print("=============", flush=True)
+    print("[DATA] Built:", flush=True)
+    print(f"  {p5}", flush=True)
+    print(f"  {p1}", flush=True)
 
 
 if __name__ == "__main__":
