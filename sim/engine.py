@@ -1,8 +1,7 @@
 # sim/engine.py
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional, Any
-import time as _time
 
 import numpy as np
 import pandas as pd
@@ -11,7 +10,7 @@ import pandas_ta as ta
 from sim.broker_fx import BrokerFX
 
 
-# -------------------- helpers (как в твоём коде) --------------------
+# -------------------- helpers --------------------
 
 def plan_margins_bank_first(bank: float, levels: int, growth: float, frac: float) -> list[float]:
     total = bank * frac
@@ -35,7 +34,6 @@ def chandelier_stop(side: str, price: float, atr: float, mult: float = 3.0) -> f
 
 def compute_pct_targets(entry: float, side: str, lower: float, upper: float, atr1h: float, tick: float,
                         pcts: list[float], break_eps: float) -> list[float]:
-    # как у тебя: цели в сторону капа коридора, но не за линию пробоя (с буфером)
     if side == "SHORT":
         cap = upper
         path = max(0.0, cap - entry)
@@ -53,7 +51,6 @@ def compute_pct_targets(entry: float, side: str, lower: float, upper: float, atr
         capped = [max(x, brk_dn + buf) for x in raw]
         out = sorted(set(round(x / tick) * tick for x in capped), reverse=True)
 
-    # убрать слишком близкие дубликаты по тикам
     dedup = []
     for x in out:
         if not dedup:
@@ -88,7 +85,6 @@ def compute_mixed_targets(entry: float, side: str,
     else:
         targets = sorted(targets, key=lambda x: x["price"], reverse=True)
 
-    # dedup по тикам
     out = []
     for t in targets:
         if not out:
@@ -108,13 +104,7 @@ def trend_reversal_confirmed(side: str, supertrend_state: str) -> bool:
            (side == "LONG"  and supertrend_state in ("down_to_up_near", "up"))
 
 
-def compute_supertrend_state(df5: pd.DataFrame) -> str:
-    st = ta.supertrend(df5["high"], df5["low"], df5["close"], length=10, multiplier=3.0)
-    d_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
-    if d_col is None or len(st) < 2:
-        return "flat"
-    dir_now  = int(st[d_col].iloc[-1])
-    dir_prev = int(st[d_col].iloc[-2])
+def supertrend_state_from_dirs(dir_prev: int, dir_now: int) -> str:
     if dir_prev == -1 and dir_now == 1:
         return "down_to_up_near"
     if dir_prev == 1 and dir_now == -1:
@@ -131,7 +121,6 @@ def build_ranges_1h(df1h: pd.DataFrame,
                     range_min_atr_mult: float) -> pd.DataFrame:
     closes = df1h["close"].astype(float)
 
-    # EMA50 + ATR14
     ema50 = ta.ema(closes, length=50)
     atr14 = ta.atr(df1h["high"], df1h["low"], df1h["close"], length=14)
 
@@ -146,7 +135,6 @@ def build_ranges_1h(df1h: pd.DataFrame,
     tac_lo   = roll_quantile(tac_win,   q_lower)
     tac_hi   = roll_quantile(tac_win,   q_upper)
 
-    # корректировка ATR-минимумом
     def adjust(lo: pd.Series, hi: pd.Series) -> tuple[pd.Series, pd.Series]:
         mid = ema50
         a = atr14.fillna(0.0)
@@ -171,7 +159,6 @@ def build_ranges_1h(df1h: pd.DataFrame,
     out["strat_width"] = out["strat_upper"] - out["strat_lower"]
     out["tac_width"]   = out["tac_upper"] - out["tac_lower"]
 
-    # анти-lookahead: используем только ЗАКРЫТЫЕ 1h бары до текущего момента
     return out.shift(1)
 
 
@@ -251,7 +238,6 @@ def run_strategy(
     params: dict[str, Any],
 ) -> tuple[RunSummary, pd.DataFrame, pd.Series]:
 
-    # unpack
     tf_entry = params["tf_entry"]
     tf_range = params["tf_range"]
 
@@ -276,7 +262,6 @@ def run_strategy(
     strategic_pcts = list(map(float, params["strategic_pcts"]))
     trailing_stages = [(float(a), float(b)) for a, b in params["trailing_stages"]]
 
-    # build ranges on 1h and map to 5m
     rng1h = build_ranges_1h(
         df1h,
         strategic_lookback_days=strategic_lookback_days,
@@ -289,14 +274,17 @@ def run_strategy(
     df5 = df5.loc[valid]
     rng5 = rng5.loc[valid]
 
-    # 5m indicators for trailing/retest confirm
+    # --- индикаторы считаем 1 раз ---
     atr5 = ta.atr(df5["high"], df5["low"], df5["close"], length=14)
-    rsi  = ta.rsi(df5["close"], length=int(params.get("rsi_len", 14)))
-    adx_df = ta.adx(df5["high"], df5["low"], df5["close"], length=int(params.get("adx_len", 14)))
-    adx_col = next((c for c in adx_df.columns if c.startswith("ADX_")), None)
-    adx = adx_df[adx_col] if adx_col else pd.Series(index=df5.index, data=np.nan)
 
-    # equity tracking
+    # supertrend direction series (1 раз!)
+    st_state_default = "flat"
+    st_dir = None
+    st = ta.supertrend(df5["high"], df5["low"], df5["close"], length=10, multiplier=3.0)
+    d_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
+    if d_col is not None and len(st) > 1:
+        st_dir = st[d_col].astype("Int64")
+
     equity = bank_usd
     equity_curve = []
     times = []
@@ -320,14 +308,13 @@ def run_strategy(
         return (bid_c - avg) * qty if side == "LONG" else (avg - ask_c) * qty
 
     for i, (ts, row) in enumerate(df5.iterrows()):
-        mid_o = float(row.open); mid_h = float(row.high); mid_l = float(row.low); mid_c = float(row.close)
+        mid_h = float(row.high); mid_l = float(row.low); mid_c = float(row.close)
+
         bid_c, ask_c = broker.bid_ask_from_mid(mid_c)
 
-        # worst intrabar for stop-out check (консервативно)
-        low_bid,  low_ask  = broker.bid_ask_from_mid(mid_l)[0], broker.bid_ask_from_mid(mid_l)[1]
-        high_bid, high_ask = broker.bid_ask_from_mid(mid_h)[0], broker.bid_ask_from_mid(mid_h)[1]
+        low_bid, low_ask = broker.bid_ask_from_mid(mid_l)
+        high_bid, high_ask = broker.bid_ask_from_mid(mid_h)
 
-        # ranges for this bar
         strat = {
             "lower": float(rng5.loc[ts, "strat_lower"]),
             "upper": float(rng5.loc[ts, "strat_upper"]),
@@ -344,11 +331,16 @@ def run_strategy(
         }
         tac["width"] = max(1e-12, tac["upper"] - tac["lower"])
 
-        # supertrend state for retest confirm
-        # чтобы не считать супертренд на каждом баре "в лоб", берём срез последних ~50 баров
-        st_state = "flat"
-        if i >= 20:
-            st_state = compute_supertrend_state(df5.iloc[max(0, i-60):i+1])
+        # supertrend state from precomputed dirs
+        st_state = st_state_default
+        if st_dir is not None:
+            d_now = st_dir.loc[ts]
+            if pd.notna(d_now):
+                d_prev = st_dir.shift(1).loc[ts]
+                if pd.notna(d_prev):
+                    st_state = supertrend_state_from_dirs(int(d_prev), int(d_now))
+                else:
+                    st_state = "up" if int(d_now) == 1 else "down"
 
         # equity now
         if pos:
@@ -362,11 +354,10 @@ def run_strategy(
         ml = broker.margin_level(equity_now, used_margin)
         min_ml = min(min_ml, ml)
 
-        # margin call event (только логируем)
         if pos and ml <= broker.margin_call_level:
             margin_call_events += 1
 
-        # stop out check intrabar worst
+        # stop out intrabar worst
         if pos:
             worst_float = mark_to_market(
                 pos.side, pos.avg, pos.qty,
@@ -376,7 +367,6 @@ def run_strategy(
             worst_equity = equity + worst_float
             worst_ml = broker.margin_level(worst_equity, pos.used_margin)
             if worst_ml <= broker.stop_out_level:
-                # закрываем по худшей цене
                 exit_px = low_bid if pos.side == "LONG" else high_ask
                 pnl = (exit_px - pos.avg) * pos.qty if pos.side == "LONG" else (pos.avg - exit_px) * pos.qty
                 equity += pnl
@@ -411,14 +401,12 @@ def run_strategy(
                     max_steps=dca_levels,
                 )
                 pos.tp_pct = tp_pct
-                # targets from entry (mid), but execution uses bid/ask
                 pos.ordinary_targets = compute_mixed_targets(
                     entry=mid_c, side=pos.side, strat=strat, tac=tac,
                     tick=broker.tick, tactical_pcts=tactical_pcts, strategic_pcts=strategic_pcts,
                     break_eps=break_eps
                 )
 
-                # first step executed at close (ask/bid)
                 entry_exec = ask_c if pos.side == "LONG" else bid_c
                 pos.add_step(entry_exec)
 
@@ -426,23 +414,19 @@ def run_strategy(
         if pos:
             brk_up, brk_dn = break_levels(strat["lower"], strat["upper"], break_eps)
 
-            # пробой стратегического коридора -> freeze + 1 retest reserve
             if not pos.reserved_one and (mid_c >= brk_up or mid_c <= brk_dn):
                 pos.max_steps = min(pos.steps_filled + 1, dca_levels)
                 pos.reserved_one = True
 
-            # DCA logic
             if pos.steps_filled < pos.max_steps:
-                # reserve retest mode
                 if pos.reserved_one:
                     need_retest = (pos.side == "SHORT" and mid_c <= strat["upper"] * (1 - reentry_band)) or \
                                   (pos.side == "LONG"  and mid_c >= strat["lower"] * (1 + reentry_band))
                     if need_retest and trend_reversal_confirmed(pos.side, st_state):
                         exec_px = ask_c if pos.side == "LONG" else bid_c
                         pos.add_step(exec_px)
-                        pos.max_steps = pos.steps_filled  # закрываем резерв
+                        pos.max_steps = pos.steps_filled
                 else:
-                    # ordinary target based on steps_filled-1 index
                     idx = pos.steps_filled - 1
                     nxt = pos.ordinary_targets[idx] if (pos.ordinary_targets and 0 <= idx < len(pos.ordinary_targets)) else None
                     if nxt:
@@ -452,7 +436,6 @@ def run_strategy(
                             exec_px = ask_c if pos.side == "LONG" else bid_c
                             pos.add_step(exec_px)
 
-            # trailing SL stages
             atr_now = float(atr5.loc[ts]) if pd.notna(atr5.loc[ts]) else 0.0
             if pos.side == "LONG":
                 gain_to_tp = max(0.0, (bid_c / max(pos.avg, 1e-12) - 1.0) / max(tp_pct, 1e-12))
@@ -468,7 +451,6 @@ def run_strategy(
                 locked = pos.avg * (1 + lock_pct) if pos.side == "LONG" else pos.avg * (1 - lock_pct)
                 chand = chandelier_stop(pos.side, mid_c, atr_now, mult=3.0)
                 new_sl = max(locked, chand) if pos.side == "LONG" else min(locked, chand)
-                # тик
                 new_sl = round(new_sl / broker.tick) * broker.tick
 
                 improves = (pos.sl_price is None) or (pos.side == "LONG" and new_sl > pos.sl_price) or (pos.side == "SHORT" and new_sl < pos.sl_price)
@@ -476,7 +458,6 @@ def run_strategy(
                     pos.sl_price = new_sl
                     pos.trail_stage = stage_idx
 
-            # exits (TP/SL intrabar with bid/ask)
             tp = pos.tp_price
             sl = pos.sl_price
 
@@ -507,8 +488,6 @@ def run_strategy(
                 trades_n += 1
                 pos = None
 
-        # equity curve update
-        # (если позиция есть — учитываем mark-to-market на close)
         if pos:
             floating = mark_to_market(pos.side, pos.avg, pos.qty, bid_c, ask_c)
             eq_c = equity + floating
@@ -525,7 +504,6 @@ def run_strategy(
         equity_curve.append(eq_c)
 
     eq_series = pd.Series(index=pd.Index(times, name="time"), data=equity_curve, name="equity")
-
     trades_df = pd.DataFrame(trades)
     net_profit = float(eq_series.iloc[-1] - eq_series.iloc[0]) if len(eq_series) else 0.0
 
