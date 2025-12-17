@@ -1,3 +1,5 @@
+cd ~/eth-alarm-bot1
+cat > scripts/run_grid.py <<'EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -12,6 +14,9 @@ from typing import Any, Dict, List, Tuple, Optional
 
 
 def ensure_repo_on_syspath() -> Path:
+    """
+    ВАЖНО: это должно выполняться ДО любых `from sim...`
+    """
     app_root = Path(__file__).resolve().parents[1]
     os.chdir(app_root)
     if str(app_root) not in sys.path:
@@ -79,12 +84,17 @@ def list_data_dir(data_dir: Path) -> None:
 
 
 def ensure_data(cfg_path: Path, cfg: Dict[str, Any]) -> Tuple[Path, Path]:
+    """
+    Гарантирует наличие parquet-файлов.
+    ВАЖНО: если DISABLE_DATASET_DOWNLOAD=1 или data.disable_download=true — НЕ качаем.
+    """
     data_cfg = cfg.get("data") or {}
     symbol = str(cfg.get("symbol") or "").strip()
     if not symbol:
         raise RuntimeError("config missing: symbol")
 
-    data_dir = Path(str(data_cfg.get("data_dir") or "data"))
+    data_dir_raw = str(data_cfg.get("data_dir") or "data")
+    data_dir = (APP_ROOT / data_dir_raw).resolve() if data_dir_raw.startswith(".") else Path(data_dir_raw)
     data_dir.mkdir(parents=True, exist_ok=True)
 
     bars_5m = str(data_cfg.get("bars_5m") or f"{symbol}_5m.parquet")
@@ -105,8 +115,8 @@ def ensure_data(cfg_path: Path, cfg: Dict[str, Any]) -> Tuple[Path, Path]:
     disable_cfg = bool(data_cfg.get("disable_download", False))
     if disable_env or disable_cfg:
         raise RuntimeError(
-            "[DATA] Dataset download is DISABLED (DISABLE_DATASET_DOWNLOAD=1 or data.disable_download=true). "
-            "But parquet files are missing."
+            "[DATA] Dataset download is DISABLED (DISABLE_DATASET_DOWNLOAD=1 or data.disable_download=true), "
+            "but parquet files are missing."
         )
 
     print("[DATA] Missing parquet(s), building dataset now...", flush=True)
@@ -156,6 +166,9 @@ def call_run_strategy_compat(
     broker: BrokerFX,
     params: Dict[str, Any],
 ) -> Any:
+    """
+    Ожидаем, что engine возвращает (summary, trades_df, eq_series).
+    """
     sig = inspect.signature(run_strategy)
     p = sig.parameters
     has_varkw = any(pp.kind == inspect.Parameter.VAR_KEYWORD for pp in p.values())
@@ -304,13 +317,13 @@ def main() -> None:
     combos = iter_product(sweeps)
 
     report_cfg = cfg.get("report") or {}
-    out_dir = Path(str(report_cfg.get("out_dir") or "data/out"))
+    out_dir_raw = str(report_cfg.get("out_dir") or "data/out")
+    out_dir = (APP_ROOT / out_dir_raw).resolve() if out_dir_raw.startswith(".") or out_dir_raw.startswith("data") else Path(out_dir_raw)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(combos)
     print(f"[GRID] total combinations: {total}", flush=True)
-    print(f"[GRID] progress: {out_dir / 'grid_progress.csv'}", flush=True)
-    print(f"[GRID] results:  {out_dir / 'grid_results.csv'}", flush=True)
+    print(f"[GRID] out_dir: {out_dir}", flush=True)
 
     results: List[Dict[str, Any]] = []
 
@@ -353,3 +366,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+EOF
