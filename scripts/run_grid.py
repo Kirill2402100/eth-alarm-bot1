@@ -12,9 +12,6 @@ from typing import Any, Dict, List, Tuple, Optional
 
 
 def ensure_repo_on_syspath() -> Path:
-    """
-    ВАЖНО: это должно выполняться ДО любых `from sim...`
-    """
     app_root = Path(__file__).resolve().parents[1]
     os.chdir(app_root)
     if str(app_root) not in sys.path:
@@ -51,7 +48,6 @@ def load_yaml(path: str) -> Dict[str, Any]:
 
 
 def list_data_dir(data_dir: Path) -> None:
-    # на всякий: создаём data_dir перед листингом
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -83,10 +79,6 @@ def list_data_dir(data_dir: Path) -> None:
 
 
 def ensure_data(cfg_path: Path, cfg: Dict[str, Any]) -> Tuple[Path, Path]:
-    """
-    Гарантирует наличие parquet-файлов.
-    ВАЖНО: если DISABLE_DATASET_DOWNLOAD=1 или data.disable_download=true — НЕ качаем.
-    """
     data_cfg = cfg.get("data") or {}
     symbol = str(cfg.get("symbol") or "").strip()
     if not symbol:
@@ -164,10 +156,6 @@ def call_run_strategy_compat(
     broker: BrokerFX,
     params: Dict[str, Any],
 ) -> Any:
-    """
-    Поддержка разных сигнатур run_strategy.
-    Ожидаем, что твой engine возвращает (summary, trades_df, eq_series).
-    """
     sig = inspect.signature(run_strategy)
     p = sig.parameters
     has_varkw = any(pp.kind == inspect.Parameter.VAR_KEYWORD for pp in p.values())
@@ -175,7 +163,6 @@ def call_run_strategy_compat(
     df5_names = {"df5", "df_5m", "bars_5m", "df_entry", "entry_df"}
     df1h_names = {"df1h", "df_1h", "bars_1h", "df_range", "range_df"}
 
-    # вариант с params=dict
     if "params" in p:
         kwargs: Dict[str, Any] = {}
         for name in p.keys():
@@ -189,13 +176,11 @@ def call_run_strategy_compat(
                 kwargs[name] = broker
             elif name == "params":
                 kwargs[name] = params
-
         try:
             return run_strategy(**kwargs)
         except TypeError:
             return run_strategy(symbol, df_entry, df_range, broker, params)
 
-    # вариант с **kwargs
     if has_varkw:
         try:
             return run_strategy(symbol, df_entry, df_range, broker, **params)
@@ -205,7 +190,6 @@ def call_run_strategy_compat(
             except TypeError:
                 return run_strategy(symbol, df_entry, df_range, broker)
 
-    # позиционные fallback
     try:
         return run_strategy(symbol, df_entry, df_range, broker, params)
     except TypeError:
@@ -235,7 +219,6 @@ def compute_derived_metrics(
     out["win_rate"] = (wins_n / trades_n) if trades_n > 0 else 0.0
     out["roi_pct"] = (net_profit / bank * 100.0) if bank > 0 else 0.0
 
-    # “в месяц” — по фактической длительности теста
     months = 0.0
     if eq_series is not None and len(eq_series) >= 2:
         dt_days = (eq_series.index[-1] - eq_series.index[0]).total_seconds() / 86400.0
@@ -244,7 +227,6 @@ def compute_derived_metrics(
     out["profit_per_month_usd"] = (net_profit / months) if months > 0 else 0.0
     out["roi_per_month_pct"] = (out["roi_pct"] / months) if months > 0 else 0.0
 
-    # статистика по сделкам: усреднения и маржа
     if trades_df is not None and len(trades_df) > 0:
         out["avg_steps"] = float(trades_df["steps"].mean())
         out["p95_steps"] = float(trades_df["steps"].quantile(0.95))
@@ -265,7 +247,6 @@ def compute_derived_metrics(
         out["max_used_margin_pct_of_bank"] = 0.0
         out["min_trade_margin_level"] = float("inf")
 
-    # месячная доходность по equity curve
     if eq_series is not None and len(eq_series) >= 2:
         eq_m = eq_series.resample("M").last()
         if len(eq_m) >= 2:
@@ -294,7 +275,7 @@ def compute_derived_metrics(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--save_every", type=int, default=50)
+    ap.add_argument("--save_every", type=int, default=10)
     args = ap.parse_args()
 
     cfg_path = Path(args.config).resolve()
@@ -304,14 +285,11 @@ def main() -> None:
     if not symbol:
         raise RuntimeError("config missing: symbol")
 
-    # ensure data (локально: ./data)
     p5, p1 = ensure_data(cfg_path, cfg)
 
-    # load data
     df_entry = pd.read_parquet(p5)
     df_range = pd.read_parquet(p1)
 
-    # broker
     bcfg = cfg.get("broker") or {}
     broker = BrokerFX(
         leverage=float(bcfg.get("leverage", 200)),
@@ -321,7 +299,6 @@ def main() -> None:
         stop_out_level=float(bcfg.get("stop_out_level", 0.00)),
     )
 
-    # strategy config
     strat = cfg.get("strategy") or {}
     base_params, sweeps = build_grid(strat)
     combos = iter_product(sweeps)
@@ -332,6 +309,8 @@ def main() -> None:
 
     total = len(combos)
     print(f"[GRID] total combinations: {total}", flush=True)
+    print(f"[GRID] progress: {out_dir / 'grid_progress.csv'}", flush=True)
+    print(f"[GRID] results:  {out_dir / 'grid_results.csv'}", flush=True)
 
     results: List[Dict[str, Any]] = []
 
@@ -345,7 +324,7 @@ def main() -> None:
         row["_i"] = i
 
         try:
-            res = call_run_strategy_compat(
+            summary, trades_df, eq_series = call_run_strategy_compat(
                 symbol=symbol,
                 df_entry=df_entry,
                 df_range=df_range,
@@ -353,7 +332,6 @@ def main() -> None:
                 params=params,
             )
 
-            summary, trades_df, eq_series = res
             sdict = flatten_summary(summary)
             row.update(sdict)
             row.update(compute_derived_metrics(params, sdict, trades_df, eq_series))
@@ -366,7 +344,7 @@ def main() -> None:
 
         results.append(row)
 
-        if i % int(args.save_every) == 0:
+        if i == 1 or i % int(args.save_every) == 0:
             pd.DataFrame(results).to_csv(out_dir / "grid_progress.csv", index=False)
 
     pd.DataFrame(results).to_csv(out_dir / "grid_results.csv", index=False)
