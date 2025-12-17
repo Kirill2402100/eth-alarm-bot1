@@ -2,10 +2,10 @@ symbol: EURUSD
 
 data:
   years: 5
-  # локально (внутри репо на ноуте)
   data_dir: ./data
   bars_5m: EURUSD_5m.parquet
   bars_1h: EURUSD_1h.parquet
+  disable_download: false
 
 provider:
   name: twelvedata
@@ -21,6 +21,7 @@ broker:
 strategy:
   tf_entry: 5m
   tf_range: 1h
+
   strategic_lookback_days: [30, 60, 90]
   tactical_lookback_days: [3]
   q_lower: [0.02, 0.025, 0.05]
