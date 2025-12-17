@@ -2,11 +2,12 @@ symbol: EURUSD
 
 data:
   years: 5
-  # на Railway это не будет использоваться, потому что run_grid/build_dataset не запускаем,
-  # но пусть будет безопасно
   data_dir: /data
   bars_5m: EURUSD_5m.parquet
   bars_1h: EURUSD_1h.parquet
+
+  # ВАЖНО: на Railway выключаем скачивание полностью
+  disable_download: true
 
 provider:
   name: twelvedata
@@ -22,30 +23,8 @@ broker:
 strategy:
   tf_entry: 5m
   tf_range: 1h
-  strategic_lookback_days: [30]
-  tactical_lookback_days: [3]
-  q_lower: [0.02]
-  q_upper: [0.98]
-  range_min_atr_mult: [1.0]
-  entry_long_thr: 0.30
-  entry_short_thr: 0.70
-  break_eps: 0.0025
-  reentry_band: 0.003
-  dca_levels: [4]
-  dca_growth: [1.4]
-  bank_usd: [1500.0]
-  cum_deposit_frac_at_full: [0.66]
-  tactical_pcts: [0.40, 0.80]
-  strategic_pcts: [0.10, 0.45, 0.90]
-  tp_pct: [0.003]
-  trailing_stages:
-    - [0.35, 0.25]
-    - [0.60, 0.50]
-    - [0.85, 0.75]
-  rsi_len: 14
-  adx_len: 14
-  vol_win: 50
+  # тут неважно, потому что run_grid на Railway вообще не должен запускаться
 
 report:
   out_dir: /data/out
-  save_trades: true
+  save_trades: false
